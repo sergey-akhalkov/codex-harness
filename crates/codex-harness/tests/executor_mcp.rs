@@ -981,7 +981,7 @@ fn install_kit(home: &Path, root: &Path) {
     .unwrap();
     fs::write(
         kit.join("global/orchestration.toml"),
-        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 6\nworktree_pool_size = 6\n",
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 6\nworktree_pool_size = 18\n",
     )
     .unwrap();
     fs::write(
@@ -1190,7 +1190,7 @@ fn write_limits(root: &Path, limits: &str) {
     fs::write(
         root.join("kit/global/orchestration.toml"),
         format!(
-            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\n{limits}\nworktree_pool_size = 6\n"
+            "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\n{limits}\nworktree_pool_size = 18\n"
         ),
     )
     .unwrap();
@@ -1564,9 +1564,13 @@ fn installed_kit_source_and_consumer_repository_stay_separate_without_an_owner()
         records.iter().any(|record| {
             record["path"]
                 .as_str()
-                .is_some_and(|path| path.ends_with("consumer-wt1"))
+                .is_some_and(|path| path.ends_with("consumer-de1"))
         }),
         "the claimed pool worktree must be a sibling of the consumer: {records:?}"
+    );
+    assert!(
+        records.iter().any(|record| record["label"] == "de1"),
+        "the direct Executor position records its fixed hierarchy label: {records:?}"
     );
     mcp.finish();
 }
@@ -2118,6 +2122,8 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
     assert_eq!(lead["rootThreadId"], DIRECTOR, "{lead}");
     assert_eq!(lead["leadChange"]["board_task"], issue, "{lead}");
     assert_eq!(lead["profile"]["profile"], "ds", "{lead}");
+    assert_eq!(lead["slotLabel"], "l1", "{lead}");
+    assert_eq!(lead["workspaces"][0]["label"], "l1", "{lead}");
     let lead_thread = lead["executorThreadId"].as_str().unwrap().to_owned();
     let endpoint_path = home
         .path()
@@ -2177,6 +2183,9 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
     assert_eq!(child["parentThreadId"], lead_thread, "{child}");
     assert_eq!(child["rootThreadId"], DIRECTOR, "{child}");
     assert_eq!(child["base"], base, "{child}");
+    assert_eq!(child["slotLabel"], "l1e1", "{child}");
+    assert_eq!(child["workspaces"][0]["label"], "l1e1", "{child}");
+    assert_ne!(child["checkout"], lead["checkout"], "{child}");
     assert_ne!(
         child["executorThreadId"], lead["executorThreadId"],
         "{child}"
@@ -2247,6 +2256,8 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
     assert_eq!(direct["role"], "executor", "{direct}");
     assert_eq!(direct["parentThreadId"], DIRECTOR, "{direct}");
     assert_eq!(direct["rootThreadId"], DIRECTOR, "{direct}");
+    assert_eq!(direct["slotLabel"], "de1", "{direct}");
+    assert_ne!(direct["checkout"], lead["checkout"], "{direct}");
 
     let starts = server.requests_for("thread/start");
     assert_eq!(starts.len(), 3, "{starts:?}");
@@ -2374,6 +2385,9 @@ fn director_lead_dispatch_records_distinct_repository_workspaces() {
     assert_eq!(lead["rootThreadId"], DIRECTOR, "{lead}");
     let workspaces = lead["workspaces"].as_array().unwrap();
     assert_eq!(workspaces.len(), 2, "{lead}");
+    assert_eq!(lead["slotLabel"], "l1", "{lead}");
+    assert_eq!(workspaces[0]["label"], "l1", "{lead}");
+    assert_eq!(workspaces[1]["label"], "l1", "{lead}");
     assert_eq!(workspaces[0]["base"], consumer_base, "{lead}");
     assert_eq!(workspaces[1]["base"], base, "{lead}");
     assert_ne!(workspaces[0]["checkout"], workspaces[1]["checkout"]);
@@ -2431,12 +2445,15 @@ fn director_lead_dispatch_records_distinct_repository_workspaces() {
         declared_roots,
         "the Lead's tool context retained another session's roots"
     );
-    let primary = workspace_slot_record(home.path(), &consumer, 1);
-    let root = workspace_slot_record(home.path(), &repository, 1);
+    let slot = u32::try_from(lead["slot"].as_u64().unwrap()).unwrap();
+    let primary = workspace_slot_record(home.path(), &consumer, slot);
+    let root = workspace_slot_record(home.path(), &repository, slot);
     assert_eq!(primary["owner"], lead["run"], "{primary}");
     assert_eq!(root["owner"], lead["run"], "{root}");
     assert_eq!(primary["base"], consumer_base, "{primary}");
     assert_eq!(root["base"], base, "{root}");
+    assert_eq!(primary["label"], "l1", "{primary}");
+    assert_eq!(root["label"], "l1", "{root}");
     let receipt: Value =
         serde_json::from_slice(&fs::read(lead["receipt"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(receipt["workspaces"], lead["workspaces"], "{receipt}");
@@ -2446,6 +2463,63 @@ fn director_lead_dispatch_records_distinct_repository_workspaces() {
         "{receipt}"
     );
     assert_eq!(receipt["primaryCwd"], lead["primaryCwd"], "{receipt}");
+
+    let lead_thread = lead["executorThreadId"].as_str().unwrap();
+    let child = mcp.call(
+        8,
+        json!({
+            "owner": "lead-multi-child",
+            "requestId": "lead-multi-child-request",
+            "assignment": assignment("Implement the child slice in every Lead repository")
+        }),
+        Some(json!({"threadId": lead_thread})),
+    );
+    let child = result(&child);
+    assert_eq!(child["role"], "executor", "{child}");
+    assert_eq!(child["parentThreadId"], lead_thread, "{child}");
+    assert_eq!(child["slot"], 7, "{child}");
+    assert_eq!(child["slotLabel"], "l1e1", "{child}");
+    let child_workspaces = child["workspaces"].as_array().unwrap();
+    assert_eq!(child_workspaces.len(), 2, "{child}");
+    for (index, workspace) in child_workspaces.iter().enumerate() {
+        assert_eq!(workspace["slot"], 7, "{child}");
+        assert_eq!(workspace["label"], "l1e1", "{child}");
+        assert_ne!(
+            workspace["checkout"], workspaces[index]["checkout"],
+            "{child}"
+        );
+        assert_eq!(workspace["owner"], child["run"], "{child}");
+    }
+    let child_roots: Vec<PathBuf> = child_workspaces
+        .iter()
+        .map(|workspace| PathBuf::from(workspace["checkout"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        child["workspaceRoots"],
+        json!(&child_roots),
+        "the child owns both declared worktrees"
+    );
+    assert_eq!(
+        observed_sim.lock().unwrap().threads[child["executorThreadId"].as_str().unwrap()]
+            .workspace_roots,
+        child_roots
+    );
+    assert_eq!(
+        child["workspaces"][0]["repository"], workspaces[0]["repository"],
+        "{child}"
+    );
+    assert_eq!(
+        child["workspaces"][1]["repository"], workspaces[1]["repository"],
+        "{child}"
+    );
+    assert_eq!(
+        workspace_slot_record(home.path(), &consumer, 7)["label"],
+        "l1e1"
+    );
+    assert_eq!(
+        workspace_slot_record(home.path(), &repository, 7)["label"],
+        "l1e1"
+    );
 
     mcp.finish();
 }
@@ -2507,6 +2581,55 @@ fn simultaneous_lead_workspace_contexts_do_not_retarget() {
         Some(json!({"threadId": OTHER_DIRECTOR})),
     );
     let second = result(&second);
+    assert_eq!(first["slotLabel"], "l1", "{first}");
+    assert_eq!(second["slotLabel"], "l2", "{second}");
+    for workspace in first["workspaces"].as_array().unwrap() {
+        assert_eq!(workspace["label"], "l1", "{first}");
+    }
+    for workspace in second["workspaces"].as_array().unwrap() {
+        assert_eq!(workspace["label"], "l2", "{second}");
+    }
+    let second_thread = second["executorThreadId"].as_str().unwrap();
+    let child = mcp.call(
+        4,
+        json!({
+            "owner": "second-lead-child",
+            "requestId": "second-lead-child-request",
+            "assignment": assignment("Work only in the second Lead's own child worktrees")
+        }),
+        Some(json!({"threadId": second_thread})),
+    );
+    let child = result(&child);
+    assert_eq!(child["slot"], 13, "{child}");
+    assert_eq!(child["slotLabel"], "l2e1", "{child}");
+    let child_roots: Vec<PathBuf> = child["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|workspace| {
+            assert_eq!(workspace["slot"], 13, "{child}");
+            assert_eq!(workspace["label"], "l2e1", "{child}");
+            PathBuf::from(workspace["checkout"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(child_roots.len(), 2, "{child}");
+    assert!(
+        !child_roots
+            .iter()
+            .any(|root| root.canonicalize().unwrap() == second_consumer.canonicalize().unwrap()),
+        "the Executor must not write in its Lead checkout: {child}"
+    );
+    assert!(
+        !child_roots
+            .iter()
+            .any(|root| root.canonicalize().unwrap() == repository.canonicalize().unwrap()),
+        "the Executor must not write in its Lead checkout: {child}"
+    );
+    assert_eq!(
+        observed_sim.lock().unwrap().threads[child["executorThreadId"].as_str().unwrap()]
+            .workspace_roots,
+        child_roots
+    );
 
     let expected = |lead: &Value| -> Vec<PathBuf> {
         lead["workspaces"]
@@ -2540,7 +2663,7 @@ fn simultaneous_lead_workspace_contexts_do_not_retarget() {
     drop(observed);
 
     let starts = server.requests_for("thread/start");
-    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert_eq!(starts.len(), 3, "{starts:?}");
     assert_eq!(
         starts[0]["params"]["runtimeWorkspaceRoots"],
         json!(first_roots),
@@ -2549,6 +2672,11 @@ fn simultaneous_lead_workspace_contexts_do_not_retarget() {
     assert_eq!(
         starts[1]["params"]["runtimeWorkspaceRoots"],
         json!(second_roots),
+        "{starts:?}"
+    );
+    assert_eq!(
+        starts[2]["params"]["runtimeWorkspaceRoots"],
+        json!(&child_roots),
         "{starts:?}"
     );
 
@@ -2608,10 +2736,11 @@ fn lead_dispatch_refuses_a_thread_that_drops_a_declared_workspace() {
         "workspace validation must precede model work"
     );
     for repository in [&repository, &consumer] {
-        let inventory = task_worktree::task_inventory(home.path(), repository, 6).unwrap();
-        assert_ne!(
-            inventory[0].state,
-            task_worktree::TaskState::Free,
+        let inventory = task_worktree::task_inventory(home.path(), repository, 18).unwrap();
+        assert!(
+            inventory
+                .iter()
+                .any(|slot| slot.state != task_worktree::TaskState::Free),
             "an uncertain started thread keeps its workspace: {inventory:?}"
         );
     }
@@ -2626,26 +2755,48 @@ fn lead_second_workspace_failure_releases_the_unused_primary_claim() {
     install_kit(home.path(), root.path());
     fs::write(
         root.path().join("kit/global/orchestration.toml"),
-        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 6\nworktree_pool_size = 1\n",
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 6\nworktree_pool_size = 18\n",
     )
     .unwrap();
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));
     let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
     let consumer = repository.join("consumer");
     let consumer_base = git_repo(&consumer);
-    task_worktree::acquire_task(
+    let startup = task_worktree::current_startup_reservation().unwrap();
+    task_worktree::acquire_hierarchy_task_for_startup(
         home.path(),
         &consumer,
-        1,
+        18,
+        5,
         "prior-review",
         Some(&consumer_base),
+        &startup,
         &|_| false,
     )
     .unwrap();
-    let prior = workspace_slot_record(home.path(), &consumer, 1);
+    let prior = workspace_slot_record(home.path(), &consumer, 5);
     let prior_checkout = PathBuf::from(prior["path"].as_str().unwrap());
     let preserved = prior_checkout.join("keep.txt");
     fs::write(&preserved, "reviewed work\n").unwrap();
+    let dirty_legacy = repository.join("consumer-wt6");
+    let output = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            dirty_legacy.to_str().unwrap(),
+            consumer_base.as_str(),
+        ])
+        .current_dir(&consumer)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git worktree add: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dirty_file = dirty_legacy.join("keep.txt");
+    fs::write(&dirty_file, "unreleased partial work\n").unwrap();
     let sim = Arc::new(Mutex::new(NativeSim::new(
         DIRECTOR,
         "unused",
@@ -2672,23 +2823,25 @@ fn lead_second_workspace_failure_releases_the_unused_primary_claim() {
         }),
         Some(json!({"threadId": DIRECTOR})),
     );
-    assert!(
-        tool_error(&failed).contains("no free slot in the pool of 1"),
-        "{failed}"
-    );
+    assert!(tool_error(&failed).contains("is not clean"), "{failed}");
     assert_eq!(
         server.requests_for("thread/start").len(),
         starts_before,
         "workspace preparation failure must not start a Lead"
     );
-    let primary = task_worktree::task_inventory(home.path(), &repository, 1).unwrap();
+    let primary = task_worktree::task_inventory(home.path(), &repository, 18).unwrap();
+    let primary_position = primary.iter().find(|slot| slot.index == 6).unwrap();
     assert_eq!(
-        primary[0].state,
+        primary_position.state,
         task_worktree::TaskState::Free,
         "the unused primary claim must be returned"
     );
-    assert_eq!(primary[0].owner, None);
-    assert_eq!(workspace_slot_record(home.path(), &consumer, 1), prior);
+    assert_eq!(primary_position.owner, None);
+    assert_eq!(workspace_slot_record(home.path(), &consumer, 5), prior);
+    assert!(
+        dirty_file.is_file(),
+        "the dirty legacy position must be preserved instead of reset"
+    );
     assert!(
         preserved.is_file(),
         "pre-existing reviewed work must remain in its workspace"

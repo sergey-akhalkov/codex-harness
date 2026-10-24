@@ -949,8 +949,19 @@ registered-missing and foreign directories for lead review. Release records
 base for reuse while retaining ignored caches, and preserves a position that
 cannot reset safely with exit 2.
 
+The fixed MCP hierarchy positions are `de1..de4` (direct Director Executors),
+`l1..l2` (Leads), `l1e1..l1e6` (Lead 1 Executors) and `l2e1..l2e6` (Lead 2
+Executors). One assignment uses the same label in every repository pool. These
+commands keep allocating legacy `<repository>-wtN` positions for compatibility;
+the pool recognizes both aliases as one position. A held or active legacy
+worktree is never moved. A clean released legacy position with no commits
+beyond its synchronized base is migrated to its fixed label when hierarchy
+allocation reuses it, while dirty or ambiguous positions are preserved with
+the exact collision or foreign-path refusal.
+
 MCP `executor_dispatch` consumes the same pool and reports the allocated slot,
-checkout, committed base and native executor thread. Dispatch is admitted
+label, checkout, committed base and native executor thread in every selected
+repository. Dispatch is admitted
 against `max_concurrent_executors`, separately from the pool: an active run
 holds concurrency, a held or suspended task keeps only its pool position, and a
 refusal names the active runs without allocating anything. `executor_status`

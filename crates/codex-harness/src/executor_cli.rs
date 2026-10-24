@@ -1197,6 +1197,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
         pool_size,
         max_concurrency: config.max_concurrent_executors,
         named_slot,
+        hierarchy: None,
         owner: &owner,
         base: base.as_deref(),
         task: task.as_deref(),
@@ -1421,6 +1422,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
         pool_size,
         max_concurrency: config.max_concurrent_executors,
         named_slot: None,
+        hierarchy: None,
         owner: &owner,
         base: None,
         task: None,
@@ -1448,49 +1450,48 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
     // preserving its checkout and partial work without a reset. A legacy
     // session record keeps the existing adoption so an interrupted
     // pre-migration session still resumes the same slot.
-    let (index, path, base, task, handle, assignment) = match task_worktree::load_slot_record(
-        &codex_home,
-        &repository,
-        slot,
-    )? {
-        Some(record) if record.task.is_some() => {
-            let task = record.task.clone().unwrap_or_default();
-            let continued = task_worktree::continue_task_for_session(
-                &codex_home,
-                &repository,
-                &task,
-                record.handle.as_deref(),
-                &owner,
-                &live,
-            )?;
-            if continued.index != slot {
-                return Err(invalid(&format!(
-                    "task '{task}' is held in slot {} instead of the requested slot {slot}; continue the recorded slot",
-                    continued.index
-                )));
+    let (index, path, label, base, task, handle, assignment) =
+        match task_worktree::load_slot_record(&codex_home, &repository, slot)? {
+            Some(record) if record.task.is_some() => {
+                let task = record.task.clone().unwrap_or_default();
+                let continued = task_worktree::continue_task_for_session(
+                    &codex_home,
+                    &repository,
+                    &task,
+                    record.handle.as_deref(),
+                    &owner,
+                    &live,
+                )?;
+                if continued.index != slot {
+                    return Err(invalid(&format!(
+                        "task '{task}' is held in slot {} instead of the requested slot {slot}; continue the recorded slot",
+                        continued.index
+                    )));
+                }
+                (
+                    continued.index,
+                    continued.path,
+                    continued.label,
+                    continued.base.clone().unwrap_or_default(),
+                    Some(task),
+                    continued.handle,
+                    record.assignment.as_deref().cloned(),
+                )
             }
-            (
-                continued.index,
-                continued.path,
-                continued.base.clone().unwrap_or_default(),
-                Some(task),
-                continued.handle,
-                record.assignment.as_deref().cloned(),
-            )
-        }
-        _ => {
-            let pool = task_worktree::pool(&repository, pool_size)?;
-            let record = task_worktree::adopt_slot(&codex_home, &pool, slot, &owner, &live)?;
-            (
-                record.index,
-                record.path.clone(),
-                record.base.clone().unwrap_or_default(),
-                None,
-                None,
-                record.assignment.as_deref().cloned(),
-            )
-        }
-    };
+            _ => {
+                let pool = task_worktree::pool(&repository, pool_size)?;
+                let record = task_worktree::adopt_slot(&codex_home, &pool, slot, &owner, &live)?;
+                (
+                    record.index,
+                    record.path.clone(),
+                    record.label.clone(),
+                    record.base.clone().unwrap_or_default(),
+                    None,
+                    None,
+                    record.assignment.as_deref().cloned(),
+                )
+            }
+        };
     task_worktree::hold_startup_reservation(&codex_home, &repository, index, &owner)?;
     drop(admission);
     // Continuation retains its bound base; upstream names are optional
@@ -1498,6 +1499,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
     let (remote, branch) = task_worktree::upstream(&path).unwrap_or_default();
     let binding = SlotBinding {
         index,
+        label,
         path,
         source: source.to_path_buf(),
         repository: Some(repository.clone()),
@@ -1710,6 +1712,9 @@ struct Dispatch<'a> {
     /// `pool_size` counts.
     max_concurrency: u32,
     named_slot: Option<u32>,
+    /// Exact fixed hierarchy position for a role-aware MCP dispatch. The
+    /// compatibility CLI and ordinary task paths leave this unset.
+    hierarchy: Option<task_worktree::HierarchySlot>,
     owner: &'a str,
     base: Option<&'a str>,
     /// Explicit handoff of a held ordinary-task binding to this executor
@@ -1979,6 +1984,8 @@ fn parse_prompt(
 #[serde(rename_all = "camelCase")]
 struct SlotBinding {
     index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     path: PathBuf,
     /// The kit/configuration checkout that dispatched this run.
     source: PathBuf,
@@ -2057,6 +2064,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
     let slot = acquire_pool_slot(request)?;
     let binding = SlotBinding {
         index: slot.index,
+        label: slot.label.clone(),
         path: slot.path.clone(),
         source: request.source.to_path_buf(),
         repository: Some(request.repository.to_path_buf()),
@@ -2125,6 +2133,7 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
 pub(crate) struct McpWorkspace {
     pub repository: PathBuf,
     pub slot: u32,
+    pub label: String,
     pub checkout: PathBuf,
     pub base: String,
     pub owner: String,
@@ -2135,6 +2144,10 @@ impl McpWorkspace {
         Self {
             repository,
             slot: binding.index,
+            label: binding
+                .label
+                .clone()
+                .unwrap_or_else(|| format!("legacy-wt{}", binding.index)),
             checkout: binding.path.clone(),
             base: binding.base.clone(),
             owner: binding.owner.clone(),
@@ -2152,6 +2165,7 @@ pub(crate) struct McpDispatch {
     pub lead_change: Option<executor_assignment::LeadChangeEvidence>,
     pub workspaces: Vec<McpWorkspace>,
     pub slot: u32,
+    pub slot_label: String,
     pub source: PathBuf,
     pub repository: PathBuf,
     pub pool_size: u32,
@@ -2207,6 +2221,8 @@ pub(crate) fn prepare_mcp_dispatch(
     profile: Option<&str>,
     base: Option<&str>,
     assignment: executor_assignment::Assignment,
+    hierarchy_role: task_worktree::HierarchyRole,
+    additional_workspaces: Vec<(PathBuf, String)>,
 ) -> io::Result<McpDispatch> {
     prepare_mcp_dispatch_inner(
         codex_home,
@@ -2217,6 +2233,8 @@ pub(crate) fn prepare_mcp_dispatch(
         base,
         assignment,
         Role::Executor,
+        hierarchy_role,
+        additional_workspaces,
         None,
         None,
     )
@@ -2241,6 +2259,17 @@ pub(crate) fn prepare_mcp_lead_dispatch(
         .ok_or_else(|| invalid("a prepared Lead change declares no repository workspace"))?;
     let primary = declared_workspace_path(repository, &first.path);
     let base = first.base.clone();
+    let additional = evidence
+        .repositories
+        .iter()
+        .skip(1)
+        .map(|declared| {
+            (
+                declared_workspace_path(repository, &declared.path),
+                declared.base.clone(),
+            )
+        })
+        .collect();
     prepare_mcp_dispatch_inner(
         codex_home,
         source,
@@ -2250,6 +2279,8 @@ pub(crate) fn prepare_mcp_lead_dispatch(
         Some(&base),
         assignment,
         Role::DelegatedLead,
+        task_worktree::HierarchyRole::Lead,
+        additional,
         Some(evidence),
         Some(repository),
     )
@@ -2291,6 +2322,7 @@ fn workspace_slot_binding(
     let (remote, branch) = task_worktree::upstream(&slot.path).unwrap_or_default();
     SlotBinding {
         index: slot.index,
+        label: slot.label.clone(),
         path: slot.path.clone(),
         source: source.to_path_buf(),
         repository: Some(repository.to_path_buf()),
@@ -2305,26 +2337,24 @@ fn workspace_slot_binding(
 }
 
 /// Acquire the explicitly declared repositories after the primary checkout.
-/// The pool helper owns all-or-nothing cleanup for this attempt; a failure
-/// therefore never releases the primary or a pre-existing workspace.
-fn acquire_declared_lead_workspaces(
+/// Every repository uses the primary's fixed hierarchy label. The pool helper
+/// owns all-or-nothing cleanup for this attempt; a failure therefore never
+/// releases the primary or a pre-existing workspace.
+fn acquire_additional_workspaces(
     codex_home: &Path,
     source: &Path,
-    repository: &Path,
     pool_size: u32,
     owner: &str,
-    evidence: &executor_assignment::LeadChangeEvidence,
+    slot: u32,
+    selected: Vec<(PathBuf, String)>,
     bindings: &mut Vec<SlotBinding>,
     workspaces: &mut Vec<McpWorkspace>,
 ) -> io::Result<()> {
-    let mut selected = Vec::new();
-    for declared in evidence.repositories.iter().skip(1) {
-        let selected_repository = declared_workspace_path(repository, &declared.path);
-        refuse_recorded_owner(codex_home, &selected_repository, owner, pool_size)?;
-        selected.push((selected_repository, declared.base.clone()));
-    }
     if selected.is_empty() {
         return Ok(());
+    }
+    for (repository, _) in &selected {
+        refuse_recorded_owner(codex_home, repository, owner, pool_size)?;
     }
     let startup = task_worktree::current_startup_reservation()?;
     let requests: Vec<task_worktree::WorkspaceStartupRequest<'_>> = selected
@@ -2341,8 +2371,8 @@ fn acquire_declared_lead_workspaces(
             .iter()
             .any(|(repository, _)| owner_live(codex_home, repository, candidate))
     };
-    let acquired = task_worktree::acquire_workspaces_for_startup(
-        codex_home, pool_size, owner, &requests, &startup, &live,
+    let acquired = task_worktree::acquire_hierarchy_workspaces_at_for_startup(
+        codex_home, pool_size, owner, slot, &requests, &startup, &live,
     )?;
     for (workspace, (selected_repository, _)) in acquired.into_iter().zip(selected) {
         let binding = workspace_slot_binding(source, &selected_repository, owner, &workspace.slot);
@@ -2362,6 +2392,8 @@ fn prepare_mcp_dispatch_inner(
     base: Option<&str>,
     assignment: executor_assignment::Assignment,
     role: Role,
+    hierarchy_role: task_worktree::HierarchyRole,
+    additional_workspaces: Vec<(PathBuf, String)>,
     lead_change: Option<executor_assignment::LeadChangeEvidence>,
     assignment_repository: Option<&Path>,
 ) -> io::Result<McpDispatch> {
@@ -2388,6 +2420,21 @@ fn prepare_mcp_dispatch_inner(
     };
     let pool_size = worktree_pool_size(&config);
     refuse_recorded_owner(codex_home, repository, owner, pool_size)?;
+    for (additional, _) in &additional_workspaces {
+        refuse_recorded_owner(codex_home, additional, owner, pool_size)?;
+    }
+    let mut selected_repositories = vec![repository.to_path_buf()];
+    selected_repositories.extend(
+        additional_workspaces
+            .iter()
+            .map(|(repository, _)| repository.clone()),
+    );
+    let hierarchy = task_worktree::select_hierarchy_slot(
+        codex_home,
+        pool_size,
+        hierarchy_role,
+        &selected_repositories,
+    )?;
     let request = Dispatch {
         codex_home,
         source,
@@ -2402,6 +2449,7 @@ fn prepare_mcp_dispatch_inner(
             u32::MAX
         },
         named_slot: None,
+        hierarchy: Some(hierarchy.clone()),
         owner,
         base,
         task: None,
@@ -2420,19 +2468,16 @@ fn prepare_mcp_dispatch_inner(
         repository.to_path_buf(),
         &prepared.binding,
     )];
-    if role == Role::DelegatedLead
-        && let Some(evidence) = lead_change.as_ref()
-        && let Err(error) = acquire_declared_lead_workspaces(
-            codex_home,
-            source,
-            assignment_repository.unwrap_or(repository),
-            pool_size,
-            owner,
-            evidence,
-            &mut bindings,
-            &mut workspaces,
-        )
-    {
+    if let Err(error) = acquire_additional_workspaces(
+        codex_home,
+        source,
+        pool_size,
+        owner,
+        hierarchy.index,
+        additional_workspaces,
+        &mut bindings,
+        &mut workspaces,
+    ) {
         return Err(release_mcp_claims(codex_home, pool_size, &bindings, error));
     }
     let run = (|| -> io::Result<(Vec<String>, Vec<String>)> {
@@ -2465,6 +2510,7 @@ fn prepare_mcp_dispatch_inner(
         lead_change,
         workspaces,
         slot: prepared.binding.index,
+        slot_label: hierarchy.label,
         source: source.to_path_buf(),
         repository: repository.to_path_buf(),
         pool_size,
@@ -2591,6 +2637,7 @@ pub(crate) fn dispatch_visible_conversation(
         pool_size: worktree_pool_size(&config),
         max_concurrency: config.max_concurrent_executors,
         named_slot: None,
+        hierarchy: None,
         owner: &request.owner,
         base: request.base.as_deref(),
         task: None,
@@ -2735,6 +2782,7 @@ pub(crate) fn dispatch_visible_lead_conversation(
         pool_size: worktree_pool_size(&config),
         max_concurrency: config.max_concurrent_executors,
         named_slot: None,
+        hierarchy: None,
         owner: &request.owner,
         base: request.base.as_deref(),
         task: None,
@@ -4129,6 +4177,7 @@ fn display_paths(paths: &[PathBuf]) -> String {
 struct BoundSlot {
     index: u32,
     path: PathBuf,
+    label: Option<String>,
     base: String,
     remote: String,
     branch: Option<String>,
@@ -4149,9 +4198,13 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
     refuse_a_live_owner(request.codex_home, request.repository, request.owner)?;
     let inventory =
         task_worktree::task_inventory(request.codex_home, request.repository, request.pool_size)?;
-    let free_position = inventory
-        .iter()
-        .any(|slot| slot.state == task_worktree::TaskState::Free);
+    let free_position = inventory.iter().any(|slot| {
+        slot.state == task_worktree::TaskState::Free
+            && request
+                .hierarchy
+                .as_ref()
+                .is_none_or(|position| slot.index == position.index)
+    });
     if let (Some(task), Some(handle)) = (request.task, request.handle) {
         // The handoff rebinds the task's held position to this session: it
         // starts an executor run, so it is admitted like any other; the
@@ -4216,16 +4269,28 @@ fn acquire_pool_slot(request: &Dispatch) -> io::Result<BoundSlot> {
     // preparation runs under the shared guard, while the position this
     // dispatch claims is still materialized by `prepare_task_startup` after
     // the guard is released.
-    let begin = task_worktree::begin_task_startup(
-        request.codex_home,
-        request.repository,
-        request.pool_size,
-        request.owner,
-        base.as_deref(),
-        Some(&startup),
-        false,
-        &live,
-    )?;
+    let begin = match request.hierarchy.as_ref() {
+        Some(position) => task_worktree::begin_hierarchy_task_startup(
+            request.codex_home,
+            request.repository,
+            request.pool_size,
+            position.index,
+            request.owner,
+            base.as_deref(),
+            Some(&startup),
+            &live,
+        )?,
+        None => task_worktree::begin_task_startup(
+            request.codex_home,
+            request.repository,
+            request.pool_size,
+            request.owner,
+            base.as_deref(),
+            Some(&startup),
+            false,
+            &live,
+        )?,
+    };
     // A continued binding records no startup reservation through the claim
     // path, so every successful begin holds one here, still under the guard:
     // the interval before the host lease can never be reclaimed by another
@@ -4259,6 +4324,7 @@ fn bound_slot(slot: task_worktree::TaskSlot, fetched: Option<(String, String)>) 
     };
     BoundSlot {
         index: slot.index,
+        label: slot.label,
         path: slot.path,
         base: slot.base.unwrap_or_default(),
         remote,
@@ -9538,6 +9604,7 @@ mod tests {
             pool_size: 2,
             max_concurrency: 1,
             named_slot: None,
+            hierarchy: None,
             owner: "exec-ds-7",
             base: None,
             task: None,
@@ -9552,6 +9619,7 @@ mod tests {
         };
         let binding = SlotBinding {
             index: 1,
+            label: None,
             path: root.clone(),
             source: root.clone(),
             repository: None,

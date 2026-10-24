@@ -163,8 +163,86 @@ pub fn is_git_checkout(path: &Path) -> io::Result<bool> {
 /// Largest supported pool; matches the orchestration `worktree_pool_size`
 /// bound, so a configured value is always a valid pool size.
 pub const MAX_POOL_SLOTS: u32 = 32;
+/// Fixed hierarchy positions in every repository pool.
+pub const HIERARCHY_POOL_SIZE: u32 = 18;
 const SLOT_STATE_SCHEMA: u32 = 2;
 const CLAIM_ATTEMPTS: u32 = 4;
+
+const HIERARCHY_LABELS: [&str; HIERARCHY_POOL_SIZE as usize] = [
+    "de1", "de2", "de3", "de4", "l1", "l2", "l1e1", "l1e2", "l1e3", "l1e4", "l1e5", "l1e6", "l2e1",
+    "l2e2", "l2e3", "l2e4", "l2e5", "l2e6",
+];
+
+/// Directory naming used when a pool position is created or reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotNaming {
+    /// Compatibility naming: `<repository>-wtN`.
+    Legacy,
+    /// Fixed hierarchy naming: `<repository>-de1`, `<repository>-l1`, and so on.
+    Hierarchy,
+}
+
+/// The fixed hierarchy range a dispatch may allocate from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchyRole {
+    DirectorExecutor,
+    Lead,
+    LeadExecutor { lead: u8 },
+}
+
+impl HierarchyRole {
+    pub fn range(self) -> io::Result<std::ops::RangeInclusive<u32>> {
+        match self {
+            Self::DirectorExecutor => Ok(1..=4),
+            Self::Lead => Ok(5..=6),
+            Self::LeadExecutor { lead: 1 } => Ok(7..=12),
+            Self::LeadExecutor { lead: 2 } => Ok(13..=18),
+            Self::LeadExecutor { lead } => Err(pool_error(&format!(
+                "Lead executor positions require Lead ordinal 1 or 2, not {lead}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for HierarchyRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DirectorExecutor => formatter.write_str("direct Director Executor"),
+            Self::Lead => formatter.write_str("Lead"),
+            Self::LeadExecutor { lead } => write!(formatter, "Lead {lead} Executor"),
+        }
+    }
+}
+
+/// One selected hierarchy position and its fixed label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HierarchySlot {
+    pub index: u32,
+    pub label: String,
+}
+
+/// Fixed label of one hierarchy position. Positions outside the fixed
+/// eighteen-slot topology have no hierarchy label and remain legacy-only.
+pub fn hierarchy_label(index: u32) -> Option<&'static str> {
+    index
+        .checked_sub(1)
+        .and_then(|offset| HIERARCHY_LABELS.get(offset as usize))
+        .copied()
+}
+
+/// Reverse lookup of a fixed hierarchy label.
+pub fn hierarchy_index(label: &str) -> Option<u32> {
+    HIERARCHY_LABELS
+        .iter()
+        .position(|candidate| *candidate == label)
+        .map(|offset| offset as u32 + 1)
+}
+
+fn hierarchy_label_of_path(path: &Path, index: u32) -> Option<String> {
+    let file = path.file_name()?.to_str()?;
+    let (_, suffix) = file.rsplit_once('-')?;
+    (hierarchy_index(suffix) == Some(index)).then(|| suffix.to_owned())
+}
 
 /// Where a pool position stands in the source checkout's worktree registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,8 +261,29 @@ pub enum SlotPresence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSlot {
     pub index: u32,
+    /// The alias currently registered or, when neither alias exists, the
+    /// compatibility legacy path.
     pub path: PathBuf,
+    /// Fixed hierarchy alias of this position, when the topology defines one.
+    pub hierarchy_path: Option<PathBuf>,
     pub presence: SlotPresence,
+}
+
+impl PoolSlot {
+    /// Path to use for a new claim. An existing registered alias wins; an
+    /// absent position uses the naming requested by the caller.
+    fn claim_path(&self, naming: SlotNaming) -> PathBuf {
+        if self.presence == SlotPresence::Registered {
+            return self.path.clone();
+        }
+        match naming {
+            SlotNaming::Legacy => self.path.clone(),
+            SlotNaming::Hierarchy => self
+                .hierarchy_path
+                .clone()
+                .unwrap_or_else(|| self.path.clone()),
+        }
+    }
 }
 
 /// Deterministic sibling slot layout of one source checkout.
@@ -235,6 +334,22 @@ pub fn slot_path(source: &Path, index: u32) -> io::Result<PathBuf> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| pool_error("repository name must be unicode"))?;
     Ok(parent.join(format!("{name}-wt{index}")))
+}
+
+/// Deterministic hierarchy path of a fixed pool position, if the position has
+/// a hierarchy label. The path may not exist yet.
+pub fn hierarchy_slot_path(source: &Path, index: u32) -> io::Result<Option<PathBuf>> {
+    let Some(label) = hierarchy_label(index) else {
+        return Ok(None);
+    };
+    let parent = source
+        .parent()
+        .ok_or_else(|| pool_error("source checkout has no parent directory"))?;
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| pool_error("repository name must be unicode"))?;
+    Ok(Some(parent.join(format!("{name}-{label}"))))
 }
 
 /// One repository's pool identity: the Git common directory shared by every
@@ -327,20 +442,57 @@ pub fn pool(source: &Path, size: u32) -> io::Result<Pool> {
     let registered = registered_trees(&source)?;
     let mut slots = Vec::new();
     for index in 1..=size {
-        let path = slot_path(&source, index)?;
-        let presence = match slot_presence(&path, &registered) {
-            SlotPresence::Foreign => {
+        let legacy = slot_path(&source, index)?;
+        let hierarchy = hierarchy_slot_path(&source, index)?;
+        let legacy_presence = slot_presence(&legacy, &registered);
+        let hierarchy_presence = hierarchy
+            .as_deref()
+            .map(|path| slot_presence(path, &registered))
+            .unwrap_or(SlotPresence::Absent);
+        for (label, path, presence) in [
+            ("legacy", Some(legacy.as_path()), legacy_presence),
+            ("hierarchy", hierarchy.as_deref(), hierarchy_presence),
+        ] {
+            if presence == SlotPresence::Foreign {
+                let path = path.expect("foreign presence has a path");
                 return Err(pool_error(&format!(
-                    "slot {index} {} exists but is not a registered worktree of {}; refusing to adopt or replace a foreign path",
+                    "slot {index} {}{} exists but is not a registered worktree of {}; refusing to adopt or replace a foreign path",
+                    if label == "legacy" {
+                        ""
+                    } else {
+                        "hierarchy path "
+                    },
                     path.display(),
                     source.display()
                 )));
             }
-            presence => presence,
+        }
+        let (path, presence) = match (legacy_presence, hierarchy_presence) {
+            (SlotPresence::Registered, SlotPresence::Registered) => {
+                return Err(pool_error(&format!(
+                    "slot {index} has both legacy {} and hierarchy {} registered; refusing to choose between two checkouts for one position",
+                    legacy.display(),
+                    hierarchy.as_deref().unwrap_or(&legacy).display()
+                )));
+            }
+            (_, SlotPresence::Registered) => (
+                hierarchy
+                    .clone()
+                    .expect("registered hierarchy alias has a path"),
+                SlotPresence::Registered,
+            ),
+            (_, SlotPresence::RegisteredMissing) => (
+                hierarchy
+                    .clone()
+                    .expect("missing hierarchy alias has a path"),
+                SlotPresence::RegisteredMissing,
+            ),
+            (presence, _) => (legacy.clone(), presence),
         };
         slots.push(PoolSlot {
             index,
             path,
+            hierarchy_path: hierarchy,
             presence,
         });
     }
@@ -382,39 +534,94 @@ fn slot_presence(path: &Path, registered: &[RegisteredTree]) -> SlotPresence {
     }
 }
 
+/// The registered alias of one configured position, or the compatibility path
+/// when neither alias exists. This is the tolerant view used by inventories;
+/// allocation still refuses a foreign or duplicate alias explicitly.
+fn slot_alias(
+    source: &Path,
+    index: u32,
+    registered: &[RegisteredTree],
+) -> io::Result<(PathBuf, SlotPresence)> {
+    let legacy = slot_path(source, index)?;
+    let hierarchy = hierarchy_slot_path(source, index)?;
+    let legacy_presence = slot_presence(&legacy, registered);
+    match hierarchy
+        .as_deref()
+        .map(|path| slot_presence(path, registered))
+    {
+        Some(SlotPresence::Registered) => Ok((
+            hierarchy.expect("registered hierarchy alias has a path"),
+            SlotPresence::Registered,
+        )),
+        Some(SlotPresence::RegisteredMissing) => Ok((
+            hierarchy.expect("missing hierarchy alias has a path"),
+            SlotPresence::RegisteredMissing,
+        )),
+        Some(SlotPresence::Foreign) if legacy_presence == SlotPresence::Absent => Ok((
+            hierarchy.expect("foreign hierarchy alias has a path"),
+            SlotPresence::Foreign,
+        )),
+        _ => Ok((legacy, legacy_presence)),
+    }
+}
+
+fn recorded_slot_alias(
+    source: &Path,
+    index: u32,
+    record: &SlotRecord,
+    registered: &[RegisteredTree],
+) -> io::Result<PathBuf> {
+    let (current, _) = slot_alias(source, index, registered)?;
+    if same_path(&current, &record.path) || current.exists() {
+        return Ok(current);
+    }
+    Ok(record.path.clone())
+}
+
 /// Create the slot at its pool position when it does not exist yet. Creation
 /// never exceeds the pool: the position is fixed by the configured size.
 pub fn create_slot(pool: &Pool, index: u32) -> io::Result<PathBuf> {
     let slot = pool.slot(index)?;
-    match slot.presence {
-        SlotPresence::Registered => Ok(slot.path.clone()),
+    create_slot_at(pool, index, &slot.path, slot.presence)?;
+    Ok(slot.path.clone())
+}
+
+fn create_slot_at(pool: &Pool, index: u32, path: &Path, presence: SlotPresence) -> io::Result<()> {
+    match presence {
+        SlotPresence::Registered => Ok(()),
         SlotPresence::RegisteredMissing => Err(pool_error(&format!(
             "slot {index} {} is registered but missing; run `git worktree prune` in {} and retry",
-            slot.path.display(),
+            path.display(),
             pool.source.display()
         ))),
         SlotPresence::Foreign => Err(pool_error(&format!(
             "slot {index} {} exists but is not a worktree of {}; it is never replaced, move it aside or reconfigure the pool",
-            slot.path.display(),
+            path.display(),
             pool.source.display()
         ))),
         SlotPresence::Absent => {
-            let path = slot
-                .path
+            if path.exists() {
+                return Err(pool_error(&format!(
+                    "slot {index} path {} already exists but is not a registered worktree of {}; it is never adopted or replaced",
+                    path.display(),
+                    pool.source.display()
+                )));
+            }
+            let checkout = path
                 .to_str()
                 .ok_or_else(|| pool_error("slot path must be unicode"))?;
             let out = Command::new(git_program())
-                .args(["worktree", "add", "--detach", path, "HEAD"])
+                .args(["worktree", "add", "--detach", checkout, "HEAD"])
                 .current_dir(&pool.source)
                 .output()?;
             if !out.status.success() {
                 return Err(pool_error(&format!(
                     "slot {index} could not be created at {}: {}",
-                    slot.path.display(),
+                    path.display(),
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
             }
-            Ok(slot.path.clone())
+            Ok(())
         }
     }
 }
@@ -437,7 +644,13 @@ pub fn slot_index(source: &Path, path: &Path) -> io::Result<Option<u32>> {
     let Some(file) = path.file_name().and_then(|file| file.to_str()) else {
         return Ok(None);
     };
-    let Some(digits) = file.strip_prefix(&format!("{name}-wt")) else {
+    let Some(suffix) = file.strip_prefix(&format!("{name}-")) else {
+        return Ok(None);
+    };
+    if let Some(index) = hierarchy_index(suffix) {
+        return Ok(Some(index));
+    }
+    let Some(digits) = suffix.strip_prefix("wt") else {
         return Ok(None);
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -608,6 +821,11 @@ pub struct SlotRecord {
     pub source: PathBuf,
     pub index: u32,
     pub path: PathBuf,
+    /// Fixed hierarchy label of this position, when it was created or migrated
+    /// under the labeled topology. Legacy records and legacy-held positions
+    /// keep `None` until an explicit safe reuse migrates them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub state: SlotState,
     /// Executor session identity that holds the slot while its session is live.
     pub owner: Option<String>,
@@ -1427,6 +1645,14 @@ fn validate_slot_record(path: &Path, index: u32, record: &SlotRecord) -> io::Res
             record.index
         )));
     }
+    if let Some(label) = record.label.as_deref() {
+        if hierarchy_index(label) != Some(index) {
+            return Err(pool_error(&format!(
+                "slot record {} declares hierarchy label {label:?} that does not belong to position {index}; the lead resolves or removes the record",
+                path.display()
+            )));
+        }
+    }
     match (record.task.as_deref(), record.handle.as_deref()) {
         (Some(task), Some(handle)) => {
             if task.trim().is_empty() || handle.trim().is_empty() {
@@ -1723,6 +1949,7 @@ pub fn claim_slot_for(
             source: pool.source.clone(),
             index,
             path: slot.path.clone(),
+            label: hierarchy_label_of_path(&slot.path, index),
             state: SlotState::Synchronizing,
             owner: Some(owner.to_owned()),
             task: None,
@@ -2146,7 +2373,8 @@ fn release_slot_with(
             "slot {index} is still owned by live session {owner}; stop it before release"
         )));
     }
-    let checkout = slot_path(layout_root, index)?;
+    let checkout =
+        recorded_slot_alias(layout_root, index, &record, &registered_trees(layout_root)?)?;
     let commit = git(
         &checkout,
         &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
@@ -2380,7 +2608,7 @@ pub fn synchronize_slot(
             })?
         }
     };
-    let previous_head = reset_slot_to(codex_home, pool, index, &commit)?;
+    let previous_head = reset_slot_to(codex_home, pool, index, &checkout, &commit)?;
     Ok(SynchronizedSlot {
         base: commit,
         remote,
@@ -2444,9 +2672,9 @@ fn reset_slot_to(
     codex_home: &Path,
     pool: &Pool,
     index: u32,
+    checkout: &Path,
     commit: &str,
 ) -> io::Result<Option<String>> {
-    let checkout = slot_worktree(pool, index)?;
     let record = load_slot_record(codex_home, &pool.caller, index)?;
     if !record
         .as_ref()
@@ -2469,23 +2697,23 @@ fn reset_slot_to(
             )));
         }
     }
-    let previous_head = git(&checkout, &["rev-parse", "HEAD"])
+    let previous_head = git(checkout, &["rev-parse", "HEAD"])
         .ok()
         .map(|text| text.trim().to_owned());
-    git(&checkout, &["reset", "--hard", commit]).map_err(|error| {
+    git(checkout, &["reset", "--hard", commit]).map_err(|error| {
         pool_error(&format!(
             "slot {index} could not reset to {commit}: {error}"
         ))
     })?;
-    git(&checkout, &["clean", "-fd", "-e", ".serena"]).map_err(|error| {
+    git(checkout, &["clean", "-fd", "-e", ".serena"]).map_err(|error| {
         pool_error(&format!(
             "slot {index} could not remove untracked files: {error}"
         ))
     })?;
-    let head = git(&checkout, &["rev-parse", "HEAD"])
+    let head = git(checkout, &["rev-parse", "HEAD"])
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
-    let status = slot_status(&checkout)?;
+    let status = slot_status(checkout)?;
     if head != commit || !only_serena_tool_state(&status) {
         return Err(pool_error(&format!(
             "slot {index} did not reach a clean synchronized state at {commit} (HEAD {head})"
@@ -2713,6 +2941,8 @@ pub enum TaskState {
 pub struct TaskSlot {
     pub index: u32,
     pub path: PathBuf,
+    /// Fixed hierarchy label when this position is named or recorded under it.
+    pub label: Option<String>,
     /// Registry position of the path; `Foreign` is reported, never adopted.
     pub presence: SlotPresence,
     pub state: TaskState,
@@ -2756,6 +2986,10 @@ impl TaskSlot {
     ) -> TaskSlot {
         TaskSlot {
             index,
+            label: record
+                .label
+                .clone()
+                .or_else(|| hierarchy_label_of_path(&path, index)),
             path,
             presence,
             state: task_state(record),
@@ -2771,6 +3005,7 @@ impl TaskSlot {
     fn free(index: u32, path: PathBuf, presence: SlotPresence) -> TaskSlot {
         TaskSlot {
             index,
+            label: hierarchy_label_of_path(&path, index),
             path,
             presence,
             state: TaskState::Free,
@@ -2861,6 +3096,33 @@ pub fn acquire_task_for_startup(
     acquire_task_with(codex_home, source, size, task, base, is_live, Some(startup))
 }
 
+/// Acquire one exact hierarchy position with this process's startup
+/// reservation. The position and fixed label are shared by every repository in
+/// one multi-repository workspace set.
+#[allow(clippy::too_many_arguments)]
+pub fn acquire_hierarchy_task_for_startup(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    index: u32,
+    task: &str,
+    base: Option<&str>,
+    startup: &StartupReservation,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskSlot> {
+    let begin = begin_hierarchy_task_startup(
+        codex_home,
+        source,
+        size,
+        index,
+        task,
+        base,
+        Some(startup),
+        is_live,
+    )?;
+    prepare_task_startup(codex_home, source, size, begin)
+}
+
 /// One repository and exact committed base in a multi-repository workspace
 /// set. The caller has already resolved and validated both.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2890,6 +3152,161 @@ pub fn acquire_workspaces_for_startup(
     requests: &[WorkspaceStartupRequest<'_>],
     startup: &StartupReservation,
     is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<Vec<StartupWorkspace>> {
+    acquire_workspaces_inner(codex_home, size, owner, requests, startup, is_live, None)
+}
+
+/// Select the first fixed hierarchy position available in every selected
+/// repository. No claim is made here; the exact acquisition below repeats the
+/// decision under each repository's pool lock and refuses a raced collision.
+pub fn select_hierarchy_slot(
+    codex_home: &Path,
+    size: u32,
+    role: HierarchyRole,
+    repositories: &[PathBuf],
+) -> io::Result<HierarchySlot> {
+    validate_pool_size(size)?;
+    if repositories.is_empty() {
+        return Err(pool_error(
+            "hierarchy allocation requires at least one repository",
+        ));
+    }
+    let range = role.range()?;
+    let mut refused = Vec::new();
+    for index in range.clone() {
+        if index > size {
+            refused.push(format!(
+                "position {index} ({}) is outside configured worktree_pool_size {size}",
+                hierarchy_label(index).unwrap_or("unlabeled")
+            ));
+            continue;
+        }
+        let label = hierarchy_label(index).expect("role ranges carry hierarchy labels");
+        let mut reason = None;
+        for repository in repositories {
+            pool(repository, size)?;
+            let inventory = task_inventory(codex_home, repository, size)?;
+            let Some(slot) = inventory.iter().find(|slot| slot.index == index) else {
+                reason = Some(format!(
+                    "{} has no configured position {index}",
+                    repository.display()
+                ));
+                break;
+            };
+            if slot.state != TaskState::Free {
+                reason = Some(format!(
+                    "{} position {index} is {} for {}",
+                    repository.display(),
+                    match slot.state {
+                        TaskState::Held => "held",
+                        TaskState::AwaitingReview => "awaiting review",
+                        TaskState::Free => unreachable!(),
+                    },
+                    slot.task.as_deref().unwrap_or("a legacy owner")
+                ));
+                break;
+            }
+            if matches!(
+                slot.presence,
+                SlotPresence::RegisteredMissing | SlotPresence::Foreign
+            ) {
+                reason = Some(format!(
+                    "{} position {index} is {:?} at {}",
+                    repository.display(),
+                    slot.presence,
+                    slot.path.display()
+                ));
+                break;
+            }
+        }
+        if let Some(reason) = reason {
+            refused.push(format!("{label}: {reason}"));
+            continue;
+        }
+        return Ok(HierarchySlot {
+            index,
+            label: label.to_owned(),
+        });
+    }
+    Err(pool_error(&format!(
+        "no free hierarchy label for {role} in the pool of {size}; {}",
+        if refused.is_empty() {
+            format!(
+                "the role range {}..={} is empty or outside the configured pool",
+                range.start(),
+                range.end()
+            )
+        } else {
+            refused.join("; ")
+        }
+    )))
+}
+
+/// Acquire one role-aware hierarchy label, identical in every requested
+/// repository. A position already holding any owner or review state is skipped
+/// rather than shared.
+pub fn acquire_hierarchy_workspaces_for_startup(
+    codex_home: &Path,
+    size: u32,
+    owner: &str,
+    role: HierarchyRole,
+    requests: &[WorkspaceStartupRequest<'_>],
+    startup: &StartupReservation,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<Vec<StartupWorkspace>> {
+    let repositories: Vec<PathBuf> = requests
+        .iter()
+        .map(|request| request.source.to_path_buf())
+        .collect();
+    let slot = select_hierarchy_slot(codex_home, size, role, &repositories)?;
+    acquire_workspaces_inner(
+        codex_home,
+        size,
+        owner,
+        requests,
+        startup,
+        is_live,
+        Some(slot.index),
+    )
+}
+
+/// Acquire one already selected hierarchy position in every requested
+/// repository. Used after a primary workspace has been claimed so additions
+/// cannot drift to another label.
+pub fn acquire_hierarchy_workspaces_at_for_startup(
+    codex_home: &Path,
+    size: u32,
+    owner: &str,
+    slot: u32,
+    requests: &[WorkspaceStartupRequest<'_>],
+    startup: &StartupReservation,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<Vec<StartupWorkspace>> {
+    if hierarchy_label(slot).is_none() {
+        return Err(pool_error(&format!(
+            "position {slot} has no fixed hierarchy label"
+        )));
+    }
+    acquire_workspaces_inner(
+        codex_home,
+        size,
+        owner,
+        requests,
+        startup,
+        is_live,
+        Some(slot),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_workspaces_inner(
+    codex_home: &Path,
+    size: u32,
+    owner: &str,
+    requests: &[WorkspaceStartupRequest<'_>],
+    startup: &StartupReservation,
+    is_live: &dyn Fn(&str) -> bool,
+    exact_index: Option<u32>,
 ) -> io::Result<Vec<StartupWorkspace>> {
     let mut ordered = requests
         .iter()
@@ -2939,15 +3356,28 @@ pub fn acquire_workspaces_for_startup(
                 )),
             ));
         }
-        match acquire_task_for_startup(
-            codex_home,
-            request.source,
-            size,
-            owner,
-            Some(request.base),
-            startup,
-            is_live,
-        ) {
+        let acquired_slot = match exact_index {
+            Some(index) => acquire_hierarchy_task_for_startup(
+                codex_home,
+                request.source,
+                size,
+                index,
+                owner,
+                Some(request.base),
+                startup,
+                is_live,
+            ),
+            None => acquire_task_for_startup(
+                codex_home,
+                request.source,
+                size,
+                owner,
+                Some(request.base),
+                startup,
+                is_live,
+            ),
+        };
+        match acquired_slot {
             Ok(slot) => {
                 acquired[index] = Some(StartupWorkspace {
                     repository: request.source.to_path_buf(),
@@ -3069,6 +3499,7 @@ pub enum TaskStartup {
         slot: PoolSlot,
         exact: String,
         handle: String,
+        naming: SlotNaming,
     },
 }
 
@@ -3096,6 +3527,66 @@ pub fn begin_task_startup(
     startup: Option<&StartupReservation>,
     repair_walked_slots: bool,
     is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskStartup> {
+    begin_task_startup_with(
+        codex_home,
+        source,
+        size,
+        task,
+        base,
+        startup,
+        repair_walked_slots,
+        is_live,
+        None,
+        SlotNaming::Legacy,
+    )
+}
+
+/// Begin one exact hierarchy startup. The label fixes the numeric position, so
+/// a multi-repository dispatch can claim the same label in every selected
+/// repository instead of walking each pool independently.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_hierarchy_task_startup(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    index: u32,
+    task: &str,
+    base: Option<&str>,
+    startup: Option<&StartupReservation>,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<TaskStartup> {
+    if hierarchy_label(index).is_none() {
+        return Err(pool_error(&format!(
+            "position {index} has no fixed hierarchy label"
+        )));
+    }
+    begin_task_startup_with(
+        codex_home,
+        source,
+        size,
+        task,
+        base,
+        startup,
+        false,
+        is_live,
+        Some(index),
+        SlotNaming::Hierarchy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn begin_task_startup_with(
+    codex_home: &Path,
+    source: &Path,
+    size: u32,
+    task: &str,
+    base: Option<&str>,
+    startup: Option<&StartupReservation>,
+    repair_walked_slots: bool,
+    is_live: &dyn Fn(&str) -> bool,
+    requested_index: Option<u32>,
+    naming: SlotNaming,
 ) -> io::Result<TaskStartup> {
     if task.trim().is_empty() {
         return Err(pool_error(
@@ -3132,7 +3623,11 @@ pub fn begin_task_startup(
     }
     let layout = slot_state_layout(codex_home, &pool.caller)?;
     let mut refusals = Vec::new();
-    for slot in &pool.slots {
+    let selected: Vec<&PoolSlot> = match requested_index {
+        Some(index) => vec![pool.slot(index)?],
+        None => pool.slots.iter().collect(),
+    };
+    for slot in selected {
         // Positions walked before the claimed one keep their existing presence
         // handling and recovery: a missing registered position is refused with
         // its prune remedy, and a recorded position is materialized so a held
@@ -3168,7 +3663,8 @@ pub fn begin_task_startup(
         if recorded && repair_walked_slots {
             create_slot(&pool, slot.index)?;
         }
-        match claim_task_slot(codex_home, &pool, slot.index, task, is_live, startup)? {
+        let path = slot.claim_path(naming);
+        match claim_task_slot(codex_home, &pool, slot.index, &path, task, is_live, startup)? {
             TaskSlotClaim::Claimed(record) => {
                 let Some(handle) = record.handle.clone() else {
                     let _ = abort_task_claim(
@@ -3206,11 +3702,13 @@ pub fn begin_task_startup(
                     task: task.to_owned(),
                     slot: PoolSlot {
                         index: slot.index,
-                        path: slot.path.clone(),
+                        path,
                         presence: slot.presence,
+                        hierarchy_path: slot.hierarchy_path.clone(),
                     },
                     exact,
                     handle,
+                    naming,
                 });
             }
             // The same task is already acquiring or holding a position; it
@@ -3238,14 +3736,15 @@ pub fn prepare_task_startup(
     size: u32,
     startup: TaskStartup,
 ) -> io::Result<TaskSlot> {
-    let (task, slot, exact, handle) = match startup {
+    let (task, slot, exact, handle, naming) = match startup {
         TaskStartup::Held(slot) => return Ok(slot),
         TaskStartup::Reserved {
             task,
             slot,
             exact,
             handle,
-        } => (task, slot, exact, handle),
+            naming,
+        } => (task, slot, exact, handle, naming),
     };
     // The pool is re-read so the receipt reports the position's current
     // presence; positions are fixed by the configured size, so this only
@@ -3256,7 +3755,21 @@ pub fn prepare_task_startup(
     // within the allowance. A failed preparation aborts this claim so the
     // position is not advertised as free while it still holds unverified
     // state, and the preparation failure stays the reported cause.
-    if let Err(error) = create_slot(&pool, slot.index) {
+    let checkout = match prepare_reserved_checkout(codex_home, &pool, slot.index, naming) {
+        Ok(checkout) => checkout,
+        Err(error) => {
+            let _ = abort_task_claim(
+                codex_home,
+                &pool,
+                slot.index,
+                &task,
+                &handle,
+                error.to_string(),
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = reset_slot_to(codex_home, &pool, slot.index, &checkout, &exact) {
         let _ = abort_task_claim(
             codex_home,
             &pool,
@@ -3267,24 +3780,115 @@ pub fn prepare_task_startup(
         );
         return Err(error);
     }
-    if let Err(error) = reset_slot_to(codex_home, &pool, slot.index, &exact) {
-        let _ = abort_task_claim(
-            codex_home,
-            &pool,
-            slot.index,
-            &task,
-            &handle,
-            error.to_string(),
-        );
-        return Err(error);
-    }
-    let bound = bind_task_slot(codex_home, &pool, slot.index, &task, &handle, &exact)?;
+    let bound = bind_task_slot(
+        codex_home, &pool, slot.index, &task, &handle, &exact, &checkout,
+    )?;
+    let presence = slot_presence(&checkout, &registered_trees(&pool.source)?);
     Ok(TaskSlot::from_record(
-        &bound,
-        slot.index,
-        slot.path,
-        slot.presence,
+        &bound, slot.index, checkout, presence,
     ))
+}
+
+/// Materialize the claimed position under the requested naming. A clean,
+/// released legacy checkout is moved to its fixed hierarchy path only while
+/// this dispatch owns the new claim and before its reset; held legacy paths
+/// are never selected by hierarchy allocation and therefore never moved here.
+fn prepare_reserved_checkout(
+    codex_home: &Path,
+    pool: &Pool,
+    index: u32,
+    naming: SlotNaming,
+) -> io::Result<PathBuf> {
+    let slot = pool.slot(index)?;
+    if naming == SlotNaming::Legacy {
+        create_slot(pool, index)?;
+        return Ok(slot.path.clone());
+    }
+    let legacy = slot_path(&pool.source, index)?;
+    let target = hierarchy_slot_path(&pool.source, index)?
+        .ok_or_else(|| pool_error(&format!("position {index} has no fixed hierarchy label")))?;
+    let registered = registered_trees(&pool.source)?;
+    match slot_presence(&target, &registered) {
+        SlotPresence::Registered => return Ok(target),
+        SlotPresence::Absent => {}
+        SlotPresence::RegisteredMissing => {
+            return Err(pool_error(&format!(
+                "hierarchy slot {index} {} is registered but missing; run `git worktree prune` in {} and retry",
+                target.display(),
+                pool.source.display()
+            )));
+        }
+        SlotPresence::Foreign => {
+            return Err(pool_error(&format!(
+                "hierarchy slot {index} {} exists but is not a registered worktree of {}; it is never replaced",
+                target.display(),
+                pool.source.display()
+            )));
+        }
+    }
+    if target.exists() {
+        return Err(pool_error(&format!(
+            "hierarchy slot {index} {} exists but is not a registered worktree of {}; it is never adopted or replaced",
+            target.display(),
+            pool.source.display()
+        )));
+    }
+    match slot_presence(&legacy, &registered) {
+        SlotPresence::Registered => {
+            let status = slot_status(&legacy)?;
+            if !only_serena_tool_state(&status) {
+                return Err(pool_error(&format!(
+                    "legacy slot {index} {} is not clean; its work is preserved and the position stays legacy until safe release and reuse: {}",
+                    legacy.display(),
+                    status.trim()
+                )));
+            }
+            let record = load_slot_record(codex_home, &pool.source, index)?;
+            let expected = match record.as_ref().and_then(|record| record.base.as_deref()) {
+                Some(base) => resolve_commit(&pool.source, base)?,
+                None => resolve_commit(&pool.source, "HEAD")?,
+            };
+            let head = resolve_commit(&legacy, "HEAD")?;
+            let ancestor = Command::new(git_program())
+                .args(["merge-base", "--is-ancestor", &head, &expected])
+                .current_dir(&pool.source)
+                .status()?
+                .success();
+            if !ancestor {
+                return Err(pool_error(&format!(
+                    "legacy slot {index} {} holds commits beyond {expected}; merge or explicitly discard them before hierarchy reuse",
+                    legacy.display()
+                )));
+            }
+            git(
+                &pool.source,
+                &[
+                    "worktree",
+                    "move",
+                    legacy
+                        .to_str()
+                        .ok_or_else(|| pool_error("legacy slot path must be unicode"))?,
+                    target
+                        .to_str()
+                        .ok_or_else(|| pool_error("hierarchy slot path must be unicode"))?,
+                ],
+            )?;
+            Ok(target)
+        }
+        SlotPresence::RegisteredMissing => Err(pool_error(&format!(
+            "legacy slot {index} {} is registered but missing; resolve it before hierarchy reuse",
+            legacy.display()
+        ))),
+        SlotPresence::Foreign => Err(pool_error(&format!(
+            "legacy slot {index} {} exists but is not a registered worktree of {}; it is never migrated",
+            legacy.display(),
+            pool.source.display()
+        ))),
+        SlotPresence::Absent => {
+            create_slot_at(pool, index, &target, SlotPresence::Absent)?;
+            Ok(target)
+        }
+    }
 }
 
 pub fn continue_task(
@@ -3336,7 +3940,7 @@ pub fn continue_task(
             "task '{task}' in slot {index} is bound to session {owner}; continue it as that session or hand it to another session explicitly"
         )));
     }
-    let path = slot_path(&root, index)?;
+    let path = recorded_slot_alias(&root, index, &record, &registered)?;
     if !path.is_dir() {
         return Err(pool_error(&format!(
             "slot {index} directory {} is missing; recover the worktree before continuing task '{task}'",
@@ -3412,7 +4016,7 @@ pub fn continue_task_for_session(
         )));
     }
     validate_session_binding(index, task, &record, session, is_live)?;
-    let path = slot_path(&root, index)?;
+    let path = recorded_slot_alias(&root, index, &record, &registered)?;
     if !path.is_dir() {
         return Err(pool_error(&format!(
             "slot {index} directory {} is missing; recover the worktree before continuing task '{task}'",
@@ -3542,7 +4146,7 @@ pub fn handoff_task_to_session(
             ..record
         };
         write_slot_record(&layout.resolved(index), &handed)?;
-        let path = slot_path(&root, index)?;
+        let path = recorded_slot_alias(&root, index, &handed, &registered)?;
         let presence = slot_presence(&path, &registered);
         return Ok(TaskSlot::from_record(&handed, index, path, presence));
     }
@@ -3657,8 +4261,7 @@ pub fn task_inventory(codex_home: &Path, source: &Path, size: u32) -> io::Result
     indexes.sort_unstable();
     let mut slots = Vec::new();
     for index in indexes {
-        let path = slot_path(&root, index)?;
-        let presence = slot_presence(&path, &registered);
+        let (mut path, mut presence) = slot_alias(&root, index, &registered)?;
         let Some(record) = load_record_at(&layout, index)? else {
             slots.push(TaskSlot::free(index, path, presence));
             continue;
@@ -3669,6 +4272,8 @@ pub fn task_inventory(codex_home: &Path, source: &Path, size: u32) -> io::Result
                 record.source.display()
             )));
         }
+        path = recorded_slot_alias(&root, index, &record, &registered)?;
+        presence = slot_presence(&path, &registered);
         let mut slot = TaskSlot::from_record(&record, index, path, presence);
         if let Some(conflict) = layout_record_conflict(&layout, index)? {
             slot.reason = Some(conflict);
@@ -3881,7 +4486,12 @@ fn find_task_binding(
             }
             SlotState::Released => unreachable!("released records are skipped above"),
         }
-        let path = slot_path(&pool.source, index)?;
+        let path = recorded_slot_alias(
+            &pool.source,
+            index,
+            &record,
+            &registered_trees(&pool.source)?,
+        )?;
         let presence = if let Some(slot) = pool.slots.iter().find(|slot| slot.index == index) {
             slot.presence
         } else {
@@ -3914,6 +4524,7 @@ fn claim_task_slot(
     codex_home: &Path,
     pool: &Pool,
     index: u32,
+    path: &Path,
     task: &str,
     is_live: &dyn Fn(&str) -> bool,
     startup: Option<&StartupReservation>,
@@ -3929,7 +4540,8 @@ fn claim_task_slot(
             schema: SLOT_STATE_SCHEMA,
             source: pool.source.clone(),
             index,
-            path: slot.path.clone(),
+            path: path.to_path_buf(),
+            label: hierarchy_label_of_path(path, index),
             state: SlotState::Synchronizing,
             owner: Some(task.to_owned()),
             task: Some(task.to_owned()),
@@ -4088,6 +4700,7 @@ fn bind_task_slot(
     task: &str,
     handle: &str,
     base: &str,
+    checkout: &Path,
 ) -> io::Result<SlotRecord> {
     let layout = slot_state_layout(codex_home, &pool.caller)?;
     let _lock = lock_slot(codex_home, &pool.source, index)?;
@@ -4110,6 +4723,8 @@ fn bind_task_slot(
     }
     let bound = SlotRecord {
         state: SlotState::Occupied,
+        path: checkout.to_path_buf(),
+        label: hierarchy_label_of_path(checkout, index),
         base: Some(base.to_owned()),
         disposition: None,
         reason: None,
@@ -4421,6 +5036,7 @@ fn free_slot_record(pool: &Pool, slot: &PoolSlot) -> SlotRecord {
         source: pool.source.clone(),
         index: slot.index,
         path: slot.path.clone(),
+        label: hierarchy_label_of_path(&slot.path, slot.index),
         state: SlotState::Free,
         owner: None,
         task: None,
@@ -6686,6 +7302,7 @@ mod tests {
             source: up.source.clone(),
             index: 1,
             path: slot_one.clone(),
+            label: None,
             state: SlotState::Occupied,
             owner: Some("task-1".into()),
             task: Some("task-1".into()),
@@ -7564,6 +8181,7 @@ mod tests {
             source: up.source.clone(),
             index: 1,
             path: slot,
+            label: None,
             state: SlotState::Synchronizing,
             owner: Some("task-1".into()),
             task: Some("task-1".into()),
@@ -7611,6 +8229,7 @@ mod tests {
             source: up.source.clone(),
             index: 1,
             path: slot,
+            label: None,
             state: SlotState::Synchronizing,
             owner: Some("dead-task".into()),
             task: Some("dead-task".into()),

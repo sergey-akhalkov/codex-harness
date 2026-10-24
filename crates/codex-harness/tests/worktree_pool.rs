@@ -1756,6 +1756,240 @@ fn workspace_set_acquires_independent_repositories_at_exact_bases() {
 }
 
 #[test]
+fn hierarchy_labels_cover_the_fixed_four_two_six_six_topology() {
+    let labels: Vec<&str> = (1..=18)
+        .map(|index| harness_core::task_worktree::hierarchy_label(index).unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "de1", "de2", "de3", "de4", "l1", "l2", "l1e1", "l1e2", "l1e3", "l1e4", "l1e5", "l1e6",
+            "l2e1", "l2e2", "l2e3", "l2e4", "l2e5", "l2e6",
+        ]
+    );
+    assert_eq!(
+        harness_core::task_worktree::hierarchy_label(19),
+        None,
+        "sixteen Executors plus two Leads is the complete fixed topology"
+    );
+    use harness_core::task_worktree::HierarchyRole;
+    assert_eq!(HierarchyRole::DirectorExecutor.range().unwrap(), 1..=4);
+    assert_eq!(HierarchyRole::Lead.range().unwrap(), 5..=6);
+    assert_eq!(
+        HierarchyRole::LeadExecutor { lead: 1 }.range().unwrap(),
+        7..=12
+    );
+    assert_eq!(
+        HierarchyRole::LeadExecutor { lead: 2 }.range().unwrap(),
+        13..=18
+    );
+    assert!(HierarchyRole::LeadExecutor { lead: 3 }.range().is_err());
+}
+
+#[test]
+fn hierarchy_workspace_set_uses_one_label_and_refuses_a_duplicate_claim() {
+    let fixture = Fixture::new("hierarchy-set", 18, 16);
+    let app = fixture.consumer("app");
+    let web = fixture.consumer("web");
+    let base = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    let startup = harness_core::task_worktree::current_startup_reservation().unwrap();
+    let requests = [
+        harness_core::task_worktree::WorkspaceStartupRequest {
+            source: &app,
+            base: &base,
+        },
+        harness_core::task_worktree::WorkspaceStartupRequest {
+            source: &web,
+            base: &base,
+        },
+    ];
+    let acquired = harness_core::task_worktree::acquire_hierarchy_workspaces_for_startup(
+        &fixture.home,
+        18,
+        "role-child",
+        harness_core::task_worktree::HierarchyRole::DirectorExecutor,
+        &requests,
+        &startup,
+        &|_| false,
+    )
+    .unwrap();
+    assert_eq!(acquired.len(), 2);
+    for workspace in &acquired {
+        assert_eq!(workspace.slot.index, 1);
+        assert_eq!(workspace.slot.label.as_deref(), Some("de1"));
+    }
+    assert_eq!(acquired[0].slot.path, fixture.root.join("app-de1"));
+    assert_eq!(acquired[1].slot.path, fixture.root.join("web-de1"));
+    assert_eq!(
+        git_output(&acquired[1].slot.path, &["rev-parse", "HEAD"]),
+        base
+    );
+
+    let duplicate = harness_core::task_worktree::acquire_hierarchy_workspaces_at_for_startup(
+        &fixture.home,
+        18,
+        "duplicate",
+        1,
+        &requests,
+        &startup,
+        &|_| false,
+    )
+    .unwrap_err();
+    assert!(
+        duplicate.to_string().contains("held by task 'role-child'"),
+        "{duplicate}"
+    );
+    assert_eq!(
+        harness_core::task_worktree::select_hierarchy_slot(
+            &fixture.home,
+            18,
+            harness_core::task_worktree::HierarchyRole::DirectorExecutor,
+            &[app, web],
+        )
+        .unwrap()
+        .label,
+        "de2",
+        "the occupied label is skipped instead of duplicated"
+    );
+    fixture.drop();
+}
+
+#[test]
+fn held_legacy_worktree_stays_put_and_safe_reuse_migrates_to_its_label() {
+    let fixture = Fixture::new("hierarchy-migrate", 18, 16);
+    let base = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    let ordinary = harness_core::task_worktree::acquire_task(
+        &fixture.home,
+        &fixture.source,
+        18,
+        "legacy-task",
+        Some(&base),
+        &|_| false,
+    )
+    .unwrap();
+    let legacy = fixture.root.join("proj-wt1");
+    assert_eq!(ordinary.path, legacy);
+    assert!(legacy.is_dir());
+
+    let startup = harness_core::task_worktree::current_startup_reservation().unwrap();
+    let request = [harness_core::task_worktree::WorkspaceStartupRequest {
+        source: &fixture.source,
+        base: &base,
+    }];
+    let held = harness_core::task_worktree::acquire_hierarchy_workspaces_for_startup(
+        &fixture.home,
+        18,
+        "held-hierarchy",
+        harness_core::task_worktree::HierarchyRole::DirectorExecutor,
+        &request,
+        &startup,
+        &|_| false,
+    )
+    .unwrap();
+    assert_eq!(held[0].slot.label.as_deref(), Some("de2"));
+    assert!(
+        legacy.is_dir(),
+        "a held legacy worktree must not be renamed"
+    );
+
+    harness_core::task_worktree::release_task(
+        &fixture.home,
+        &fixture.source,
+        "legacy-task",
+        harness_core::task_worktree::SlotDisposition::Discarded,
+        "test release before hierarchy reuse",
+        &base,
+        ordinary.handle.as_deref(),
+        &|_| false,
+    )
+    .unwrap();
+    assert!(legacy.is_dir(), "release alone preserves the legacy path");
+
+    let migrated = harness_core::task_worktree::acquire_hierarchy_workspaces_for_startup(
+        &fixture.home,
+        18,
+        "migrated-hierarchy",
+        harness_core::task_worktree::HierarchyRole::DirectorExecutor,
+        &request,
+        &startup,
+        &|_| false,
+    )
+    .unwrap();
+    let de1 = fixture.root.join("proj-de1");
+    assert_eq!(migrated[0].slot.label.as_deref(), Some("de1"));
+    assert_eq!(migrated[0].slot.path, de1);
+    assert!(de1.is_dir());
+    assert!(
+        !legacy.exists(),
+        "safe reuse moved the released legacy tree"
+    );
+    fixture.drop();
+}
+
+#[test]
+fn hierarchy_allocation_refuses_a_foreign_labeled_path() {
+    let fixture = Fixture::new("hierarchy-foreign", 18, 16);
+    let foreign = fixture.root.join("proj-de1");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("keep.txt"), "unrelated directory\n").unwrap();
+    let error = harness_core::task_worktree::select_hierarchy_slot(
+        &fixture.home,
+        18,
+        harness_core::task_worktree::HierarchyRole::DirectorExecutor,
+        &[fixture.source.clone()],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("hierarchy path"), "{error}");
+    assert!(foreign.join("keep.txt").is_file());
+    fixture.drop();
+}
+
+#[test]
+fn hierarchy_reuse_preserves_a_legacy_commit_beyond_its_base() {
+    let fixture = Fixture::new("hierarchy-commit", 18, 16);
+    let base = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    let legacy = fixture.root.join("proj-wt1");
+    git(
+        &fixture.source,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            legacy.to_str().unwrap(),
+            base.as_str(),
+        ],
+    );
+    fs::write(legacy.join("reviewed.txt"), "committed work\n").unwrap();
+    git(&legacy, &["add", "reviewed.txt"]);
+    git(
+        &legacy,
+        &["commit", "-qm", "work beyond the synchronized base"],
+    );
+    let startup = harness_core::task_worktree::current_startup_reservation().unwrap();
+    let request = [harness_core::task_worktree::WorkspaceStartupRequest {
+        source: &fixture.source,
+        base: &base,
+    }];
+    let error = harness_core::task_worktree::acquire_hierarchy_workspaces_for_startup(
+        &fixture.home,
+        18,
+        "hierarchy-commit",
+        harness_core::task_worktree::HierarchyRole::DirectorExecutor,
+        &request,
+        &startup,
+        &|_| false,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("commits beyond"),
+        "the hierarchy reuse must prove no committed work is stranded: {error}"
+    );
+    assert!(legacy.is_dir(), "the legacy worktree must remain readable");
+    assert!(!fixture.root.join("proj-de1").exists());
+    fixture.drop();
+}
+
+#[test]
 fn workspace_set_failure_releases_only_its_new_workspace() {
     let fixture = Fixture::new("workspace-set-failure", 1, 8);
     let app = fixture.consumer("app");

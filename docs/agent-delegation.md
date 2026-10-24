@@ -220,8 +220,9 @@ does not. Quota succession looks up the root successor profile's model in the
 native catalog; the verified handoff seed stays a configured binding, not a
 hardcoded provider role.
 
-Dispatch returns the run id, child thread and role, checkout, slot and committed
-base after the first turn is accepted. Inspect the child in `/agents`;
+Dispatch returns the run id, child thread and role, checkout, slot, fixed label
+and committed base after the first turn is accepted. Inspect the child in
+`/agents`;
 `executor_status` is the compact machine-readable view and `executor_wait` is
 the blocking result or question path. Assignments live on the beads board;
 executors set `lead_review` when done instead of closing. Their immediate parent
@@ -482,14 +483,45 @@ describe a failed preparation as an empty assignment.
 isolation through one durable task owner: one pool per repository, shared by
 executor threads and ordinary tasks so neither can bypass or overwrite the
 other's held position. Slots are sibling directories
-`<repository-name>-wt1..wtN` bounded by `worktree_pool_size` (the legacy
-executor-derived capacity when the configuration omits it). MCP dispatch resolves
-the installed kit/configuration source and the calling thread's target repository;
-the target needs only to be a Git checkout, not a kit configuration of its own.
+`<repository-name>-<label>` bounded by `worktree_pool_size` (the legacy
+executor-derived capacity when the configuration omits it). The fixed hierarchy
+labels occupy these positions in every repository pool:
+
+| Positions | Label | Owner |
+| --- | --- | --- |
+| 1-4 | `de1..de4` | Direct Director Executors |
+| 5-6 | `l1..l2` | Leads |
+| 7-12 | `l1e1..l1e6` | Executors under Lead 1 |
+| 13-18 | `l2e1..l2e6` | Executors under Lead 2 |
+
+The ordinal is the label's position in its role range, not an authority claim.
+MCP hierarchy dispatch selects the first free label in the caller's range and
+uses that same label in every repository selected by the assignment. A
+multi-repository Executor therefore receives its own worktree in every
+repository, for example `<repo-a>-l1e2` and `<repo-b>-l1e2`; it never writes in
+the Lead's `l1` or `l2` checkouts. Slot records and receipts carry both the
+numeric position and this label.
+
+Compatibility CLI and ordinary task allocation keep the legacy
+`<repository-name>-wt1..wtN` names until a position is migrated. Both names are
+recognized as the same position, and a held or active legacy worktree is never
+moved. Hierarchy reuse migrates a clean released legacy position to its fixed
+label only after the pool has proved it has no owner, local work or commits
+beyond its synchronized base. A duplicate alias, a foreign labeled path, or a
+legacy checkout with local work is refused with the exact path; release or
+merge that work before retrying.
+
+A legacy Lead receipt with no recorded label keeps the compatibility `l1`
+executor range; its worktrees remain readable, and the separate `l2` range is
+never inferred from a legacy position.
+
+MCP dispatch resolves the installed kit/configuration source and the calling
+thread's target repositories; the targets need only be Git checkouts, not kit
+configurations of their own.
 
 Managed ordinary, lead and executor sessions suppress the competing native `codex_worktrees` tool surface through the shared configuration and the forwarded `features.worktrees=false` leaf; [native commands](rust-native.md#native-worktree-tool-suppression) owns the precedence rules, the conflict report and the model-free catalogue checks. A conversation that was already running when the suppression arrived keeps the tools it registered, and no in-place update exists: end it and start a fresh session through the normal route. A higher-precedence explicit `features.worktrees=true` keeps the tools; the managed start reports that configuration conflict with its removal remedy rather than successful managed-pool delivery.
 
-A fresh dispatch claims the first free position and binds it to the owner as a durable task with its exact committed base before the first model request: the refreshed upstream default branch by default, or the explicit `base` commit resolved locally without a fetch. The claim stays exclusively owned and a competing dispatch cannot reclaim the position or replace its pending assignment. Two free positions still start independently. Dispatch is also admitted against `max_concurrent_executors`, independently of the pool: free positions alone do not grant another active executor run, and a held or suspended task keeps its position without consuming concurrency. A confirmed-dead clean unused reservation can be recovered, but a durable task binding is never freed by process exit alone and a former owner cannot continue a reassigned task. Ad-hoc worktrees are refused, and a position holding unreviewed work is preserved rather than reset.
+A fresh hierarchy dispatch claims the first free label in the caller's fixed range and binds it to the owner as a durable task with its exact committed base before the first model request; compatibility CLI and ordinary tasks continue to walk positions with legacy naming. The claim uses the refreshed upstream default branch by default, or the explicit `base` commit resolved locally without a fetch. The claim stays exclusively owned and a competing dispatch cannot reclaim the position or replace its pending assignment. Two free positions still start independently. Dispatch is also admitted against `max_concurrent_executors`, independently of the pool: free positions alone do not grant another active executor run, and a held or suspended task keeps its position without consuming concurrency. A confirmed-dead clean unused reservation can be recovered, but a durable task binding is never freed by process exit alone and a former owner cannot continue a reassigned task. Ad-hoc worktrees are refused, and a position holding unreviewed work is preserved rather than reset.
 
 A fresh preparation fetches the configured remote once before the claim and resets the position to the resolved base, removing untracked files while retaining ignored caches such as `cache/`; a fetch failure aborts before any mutation, and a continued binding is never fetched or reset. MCP completion does not release a slot. The lead merges accepted work, then explicitly records `merged` or `discarded` with its reason through the owning pool lifecycle. Release freezes the observed generation of the exact binding, so a superseded release refuses instead of resetting whatever holds the position later. It resets only a clean, reviewed position and retains ignored caches. Generated `.serena/` project state is tool state: release preserves it and excludes it from the cleanliness decision, while any other local or untracked work still preserves the position. A live owner is never released or reset. A position that cannot reset safely is preserved with its reason rather than reported free.
 

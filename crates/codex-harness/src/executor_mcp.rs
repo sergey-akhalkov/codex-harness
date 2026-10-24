@@ -1198,6 +1198,18 @@ enum CallerRole {
 struct CallerAuthority {
     role: CallerRole,
     root_thread: String,
+    /// Repositories and committed bases from the calling Lead's workspace
+    /// receipt, in declared order. A legacy receipt without a workspace set
+    /// contributes its single recorded repository.
+    workspaces: Vec<ParentWorkspace>,
+    /// Fixed Lead ordinal for a delegated Lead, used to select its executor
+    /// range. Legacy unlabeled Leads map to the compatibility l1 range.
+    lead_ordinal: Option<u8>,
+}
+
+struct ParentWorkspace {
+    repository: PathBuf,
+    base: String,
 }
 
 /// Resolve the caller from Codex-injected identity and retained receipts. A
@@ -1236,6 +1248,8 @@ fn caller_authority(home: &Path, caller: &str) -> io::Result<CallerAuthority> {
                 Ok(CallerAuthority {
                     role: CallerRole::DelegatedLead,
                     root_thread: root.to_owned(),
+                    workspaces: lead_parent_workspaces(receipt)?,
+                    lead_ordinal: Some(lead_ordinal(receipt)?),
                 })
             }
             "executor" => Ok(CallerAuthority {
@@ -1244,6 +1258,8 @@ fn caller_authority(home: &Path, caller: &str) -> io::Result<CallerAuthority> {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
+                workspaces: Vec::new(),
+                lead_ordinal: None,
             }),
             other => Err(invalid(format!(
                 "the recorded run has unsupported child role {other:?}; refusing to infer authority"
@@ -1262,11 +1278,121 @@ fn caller_authority(home: &Path, caller: &str) -> io::Result<CallerAuthority> {
         RegisteredLead::Live(_) => Ok(CallerAuthority {
             role: CallerRole::Director,
             root_thread: caller.to_owned(),
+            workspaces: Vec::new(),
+            lead_ordinal: None,
         }),
         RegisteredLead::Unavailable(reason) => Err(invalid(format!(
             "{reason}; no app-server was contacted. Remedy: restart this lead through the installed codex-harness launcher so its native thread endpoint is registered, then retry"
         ))),
     }
+}
+
+/// Lead ordinal from the recorded hierarchy label, falling back to the fixed
+/// l1/l2 slots and finally to l1 for legacy unlabeled Leads.
+fn lead_ordinal(receipt: &Value) -> io::Result<u8> {
+    let label = receipt["slotLabel"].as_str().or_else(|| {
+        receipt["workspaces"]
+            .as_array()
+            .and_then(|workspaces| workspaces.first())
+            .and_then(|workspace| workspace["label"].as_str())
+    });
+    if let Some(label) = label {
+        return match label {
+            "l1" => Ok(1),
+            "l2" => Ok(2),
+            other => Err(invalid(format!(
+                "the calling Lead records hierarchy label {other:?}, not l1 or l2; no executor range can be selected"
+            ))),
+        };
+    }
+    match receipt["slot"].as_u64() {
+        Some(5) => Ok(1),
+        Some(6) => Ok(2),
+        _ => Ok(1),
+    }
+}
+
+/// Repositories and exact bases from one Lead receipt. Every named workspace
+/// must carry the same label, because a multi-repository assignment uses one
+/// hierarchy position across all selected pools.
+fn lead_parent_workspaces(receipt: &Value) -> io::Result<Vec<ParentWorkspace>> {
+    let mut workspaces = Vec::new();
+    let mut label = receipt["slotLabel"].as_str().map(str::to_owned);
+    if let Some(values) = receipt["workspaces"].as_array() {
+        for (index, workspace) in values.iter().enumerate() {
+            let repository = workspace["repository"]
+                .as_str()
+                .or_else(|| workspace["checkout"].as_str())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "the calling Lead workspace {index} records no repository path"
+                    ))
+                })?;
+            let base = workspace["base"]
+                .as_str()
+                .or_else(|| receipt["base"].as_str())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "the calling Lead workspace {index} records no committed base"
+                    ))
+                })?;
+            if let Some(recorded) = workspace["label"].as_str() {
+                match label.as_deref() {
+                    Some(existing) if existing != recorded => {
+                        return Err(invalid(format!(
+                            "the calling Lead workspace {index} records label {recorded:?} while another records {existing:?}; one assignment must use the same label in every repository"
+                        )));
+                    }
+                    None => label = Some(recorded.to_owned()),
+                    _ => {}
+                }
+            } else if label.is_some() {
+                return Err(invalid(format!(
+                    "the calling Lead workspace {index} records no label while another repository records {:?}; one assignment must label every repository alike",
+                    label.as_deref().unwrap_or_default()
+                )));
+            }
+            let repository = PathBuf::from(repository);
+            if !workspaces
+                .iter()
+                .any(|current: &ParentWorkspace| current.repository == repository)
+            {
+                workspaces.push(ParentWorkspace {
+                    repository,
+                    base: base.to_owned(),
+                });
+            }
+        }
+        if let Some(expected) = label.as_deref() {
+            for (index, workspace) in values.iter().enumerate() {
+                if workspace["label"].as_str() != Some(expected) {
+                    return Err(invalid(format!(
+                        "the calling Lead workspace {index} does not record hierarchy label {expected:?}; one assignment must label every repository alike"
+                    )));
+                }
+            }
+        }
+    }
+    if workspaces.is_empty() {
+        let repository = receipt["repository"]
+            .as_str()
+            .or_else(|| receipt["checkout"].as_str())
+            .ok_or_else(|| {
+                invalid(
+                    "the calling Lead receipt records no repository workspace; no child worktree can be allocated",
+                )
+            })?;
+        let base = receipt["base"].as_str().ok_or_else(|| {
+            invalid(
+                "the calling Lead receipt records no committed base; no child worktree can be allocated",
+            )
+        })?;
+        workspaces.push(ParentWorkspace {
+            repository: PathBuf::from(repository),
+            base: base.to_owned(),
+        });
+    }
+    Ok(workspaces)
 }
 
 #[derive(Deserialize)]
@@ -1371,14 +1497,54 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         }
         RequestState::New { path, request } => (path, request),
     };
+    let (hierarchy_role, primary_repository, primary_base, additional_workspaces) = match authority
+        .role
+    {
+        CallerRole::Director => (
+            task_worktree::HierarchyRole::DirectorExecutor,
+            repository,
+            args.base.clone(),
+            Vec::new(),
+        ),
+        CallerRole::DelegatedLead => {
+            let lead = authority.lead_ordinal.unwrap_or(1);
+            let mut workspaces = authority.workspaces;
+            let primary = workspaces.first().ok_or_else(|| {
+                invalid("the calling Lead receipt records no repository workspace")
+            })?;
+            if !task_worktree::same_repository(&repository, &primary.repository) {
+                return Err(invalid(format!(
+                    "the calling Lead receipt names primary workspace {} but its thread runs in {}; refusing to retarget the repository set",
+                    primary.repository.display(),
+                    repository.display()
+                )));
+            }
+            let primary_repository = repository.clone();
+            let primary_base = args.base.clone().or_else(|| Some(primary.base.clone()));
+            let additional = workspaces
+                .drain(..)
+                .skip(1)
+                .map(|workspace| (workspace.repository, workspace.base))
+                .collect();
+            (
+                task_worktree::HierarchyRole::LeadExecutor { lead },
+                primary_repository,
+                primary_base,
+                additional,
+            )
+        }
+        CallerRole::Executor => unreachable!("recorded executors cannot dispatch"),
+    };
     let prepared = match executor_cli::prepare_mcp_dispatch(
         &codex_home,
         &source,
-        &repository,
+        &primary_repository,
         &owner,
         args.profile.as_deref(),
-        args.base.as_deref(),
+        primary_base.as_deref(),
         assignment,
+        hierarchy_role,
+        additional_workspaces,
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1426,6 +1592,25 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     if let Some(sandbox) = lead_thread["sandbox"].as_str() {
         plan.sandbox = Some(sandbox.to_owned());
     }
+    if prepared.workspaces.len() > 1
+        && let Err(error) = plan.declare_workspace_roots(
+            prepared
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.checkout.clone()),
+        )
+    {
+        let _ = update_request(
+            &request_path,
+            &mut request_value,
+            "failed",
+            None,
+            None,
+            Some(&error.to_string()),
+        );
+        return Err(prepared.release(error));
+    }
+    let workspace_roots = plan.workspace_roots.clone();
 
     if let Err(error) = update_request(
         &request_path,
@@ -1566,6 +1751,20 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     )
     .err()
     .map(|error| error.to_string());
+    let workspace_receipt: Vec<Value> = prepared
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            json!({
+                "repository": workspace.repository,
+                "slot": workspace.slot,
+                "label": workspace.label,
+                "checkout": workspace.checkout,
+                "base": workspace.base,
+                "owner": workspace.owner
+            })
+        })
+        .collect();
     let receipt = json!({
         "schema": 1,
         "run": prepared.owner,
@@ -1581,6 +1780,10 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         "prompt": prepared.prompt,
         "title": prepared.title,
         "slot": prepared.slot,
+        "slotLabel": prepared.slot_label,
+        "workspaces": workspace_receipt,
+        "workspaceRoots": workspace_roots,
+        "primaryCwd": prepared.checkout,
         "source": prepared.source,
         "repository": prepared.repository,
         "poolSize": prepared.pool_size,
@@ -1961,6 +2164,7 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
             json!({
                 "repository": workspace.repository,
                 "slot": workspace.slot,
+                "label": workspace.label,
                 "checkout": workspace.checkout,
                 "base": workspace.base,
                 "owner": workspace.owner
@@ -1986,6 +2190,7 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
         "workspaceRoots": plan.workspace_roots,
         "primaryCwd": prepared.checkout,
         "slot": prepared.slot,
+        "slotLabel": prepared.slot_label,
         "source": prepared.source,
         "repository": prepared.repository,
         "poolSize": prepared.pool_size,
