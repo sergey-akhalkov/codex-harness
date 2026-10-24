@@ -17,9 +17,18 @@ pub struct CheckReport {
     pub mutated: bool,
     pub lead_profile: Option<String>,
     pub successor_lead_profile: Option<String>,
+    /// Effective route for Leads dispatched by the Director.
+    pub delegated_lead_profile: Option<String>,
     pub executor_profiles: Vec<String>,
+    pub director_max_leads: Option<u32>,
+    pub director_max_executors: Option<u32>,
+    pub lead_max_executors: Option<u32>,
     pub max_concurrent_executors: Option<u32>,
     pub worktree_pool_size: Option<u32>,
+    /// Effective Executor admission for each parent role, including the
+    /// smallest binding limit for a local override or shared capacity.
+    pub director_executor_capacity: Option<EffectiveCapacity>,
+    pub lead_executor_capacity: Option<EffectiveCapacity>,
     pub vote_threshold: Option<u32>,
     pub worktree_limit: Option<u32>,
     /// Responsibility roles resolved from the kit checkout's owned sources.
@@ -31,6 +40,27 @@ pub struct CheckReport {
     pub guidance_missing: Vec<String>,
     /// Board tool version when the board component is connected.
     pub board_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EffectiveCapacity {
+    pub parent_limit: u32,
+    pub max_concurrent_executors: u32,
+    pub worktree_pool_size: u32,
+    pub effective_limit: u32,
+    pub bottlenecks: Vec<&'static str>,
+}
+
+impl From<orchestration_config::ExecutorCapacityReport> for EffectiveCapacity {
+    fn from(report: orchestration_config::ExecutorCapacityReport) -> Self {
+        Self {
+            parent_limit: report.parent_limit,
+            max_concurrent_executors: report.max_concurrent_executors,
+            worktree_pool_size: report.worktree_pool_size,
+            effective_limit: report.effective_limit,
+            bottlenecks: report.bottlenecks,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +130,16 @@ pub fn check(
         Err(error) => return Err(error),
         Ok(bytes) => Some(orchestration_config::parse(&bytes)?),
     };
+    let delegated_lead_profile = config
+        .as_ref()
+        .map(orchestration_config::delegated_lead_profile)
+        .transpose()?;
+    let director_executor_capacity = config.as_ref().map(|value| {
+        orchestration_config::executor_capacity(value, value.director_max_executors).into()
+    });
+    let lead_executor_capacity = config.as_ref().map(|value| {
+        orchestration_config::executor_capacity(value, value.lead_max_executors).into()
+    });
     let root = user_home.join(".agents/skills");
     let mut guidance = Vec::new();
     let mut guidance_missing = Vec::new();
@@ -124,14 +164,20 @@ pub fn check(
         successor_lead_profile: config
             .as_ref()
             .map(|value| value.successor_lead_profile.clone()),
+        delegated_lead_profile,
         executor_profiles: config
             .as_ref()
             .map(|value| value.executor_profiles.clone())
             .unwrap_or_default(),
+        director_max_leads: config.as_ref().map(|value| value.director_max_leads),
+        director_max_executors: config.as_ref().map(|value| value.director_max_executors),
+        lead_max_executors: config.as_ref().map(|value| value.lead_max_executors),
         max_concurrent_executors: config.as_ref().map(|value| value.max_concurrent_executors),
         worktree_pool_size: config
             .as_ref()
             .map(orchestration_config::worktree_pool_size),
+        director_executor_capacity,
+        lead_executor_capacity,
         vote_threshold: config.as_ref().map(|value| value.vote_threshold),
         worktree_limit: config.as_ref().map(|value| value.worktree_limit),
         roles: role_states(source),
@@ -364,9 +410,21 @@ mod tests {
         assert_eq!(walkdir(&home), before);
         let connected = check(&source, &home, &user, false).unwrap();
         assert_eq!(connected.status, "Orchestration connected");
+        assert_eq!(connected.delegated_lead_profile.as_deref(), Some("ds"));
         assert_eq!(connected.executor_profiles, ["ds"]);
+        assert_eq!(connected.director_max_leads, Some(2));
+        assert_eq!(connected.director_max_executors, Some(4));
+        assert_eq!(connected.lead_max_executors, Some(6));
         assert_eq!(connected.max_concurrent_executors, Some(2));
         assert_eq!(connected.worktree_pool_size, Some(4));
+        let director_capacity = connected.director_executor_capacity.as_ref().unwrap();
+        assert_eq!(director_capacity.parent_limit, 4);
+        assert_eq!(director_capacity.effective_limit, 2);
+        assert_eq!(director_capacity.bottlenecks, ["max_concurrent_executors"]);
+        let lead_capacity = connected.lead_executor_capacity.as_ref().unwrap();
+        assert_eq!(lead_capacity.parent_limit, 6);
+        assert_eq!(lead_capacity.effective_limit, 2);
+        assert_eq!(lead_capacity.bottlenecks, ["max_concurrent_executors"]);
         assert_eq!(connected.vote_threshold, Some(3));
         assert_eq!(connected.guidance, ["team-lead", "board-workflow"]);
         assert!(connected.guidance_missing.is_empty());
@@ -411,6 +469,147 @@ mod tests {
             b"keep\n"
         );
         assert!(home.join("ds.config.toml").is_file());
+    }
+
+    #[test]
+    fn check_reports_shipped_hierarchy_and_effective_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let source = kit_source(root.path());
+        let home = root.path().join("home");
+        let user = root.path().join("user");
+        installed_profiles(&home);
+
+        let report = check(&source, &home, &user, false).unwrap();
+        assert_eq!(report.lead_profile.as_deref(), Some("default"));
+        assert_eq!(report.successor_lead_profile.as_deref(), Some("default"));
+        assert_eq!(report.delegated_lead_profile.as_deref(), Some("ds"));
+        assert_eq!(report.director_max_leads, Some(2));
+        assert_eq!(report.director_max_executors, Some(4));
+        assert_eq!(report.lead_max_executors, Some(6));
+        let director_capacity = report.director_executor_capacity.as_ref().unwrap();
+        assert_eq!(director_capacity.effective_limit, 4);
+        assert_eq!(director_capacity.bottlenecks, ["parent allowance"]);
+        let lead_capacity = report.lead_executor_capacity.as_ref().unwrap();
+        assert_eq!(lead_capacity.effective_limit, 6);
+        assert_eq!(lead_capacity.bottlenecks, ["parent allowance"]);
+    }
+
+    #[test]
+    fn prior_shipped_defaults_materialize_and_resolve_the_delegated_route() {
+        let root = tempfile::tempdir().unwrap();
+        let source = kit_source(root.path());
+        let path = source.join("global/orchestration.toml");
+        fs::write(&path, legacy_text(6)).unwrap();
+        let home = root.path().join("home");
+        let user = root.path().join("user");
+        installed_profiles(&home);
+
+        assert_eq!(materialize_pool_capacity(&source).unwrap(), Some(6));
+        let report = check(&source, &home, &user, false).unwrap();
+        assert_eq!(report.lead_profile.as_deref(), Some("default"));
+        assert_eq!(report.successor_lead_profile.as_deref(), Some("default"));
+        assert_eq!(report.delegated_lead_profile.as_deref(), Some("ds"));
+        assert_eq!(report.director_max_leads, Some(2));
+        assert_eq!(report.director_max_executors, Some(4));
+        assert_eq!(report.lead_max_executors, Some(6));
+        assert_eq!(report.worktree_pool_size, Some(6));
+        assert_eq!(
+            report
+                .director_executor_capacity
+                .as_ref()
+                .unwrap()
+                .effective_limit,
+            4
+        );
+        assert_eq!(
+            report
+                .lead_executor_capacity
+                .as_ref()
+                .unwrap()
+                .effective_limit,
+            6
+        );
+    }
+
+    #[test]
+    fn local_hierarchy_overrides_are_reported_without_rewriting_root_profiles() {
+        let root = tempfile::tempdir().unwrap();
+        let source = kit_source(root.path());
+        let path = source.join("global/orchestration.toml");
+        let overridden = br#"
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+delegated_lead_profile = "lead-alt"
+executor_profiles = ["ds"]
+director_max_leads = 1
+director_max_executors = 3
+lead_max_executors = 5
+max_concurrent_executors = 9
+worktree_pool_size = 11
+"#;
+        fs::write(&path, overridden).unwrap();
+        let home = root.path().join("home");
+        let user = root.path().join("user");
+        installed_profiles(&home);
+        fs::write(home.join("lead-alt.config.toml"), "model = 'alternate'\n").unwrap();
+
+        let report = check(&source, &home, &user, false).unwrap();
+        assert_eq!(report.lead_profile.as_deref(), Some("default"));
+        assert_eq!(report.successor_lead_profile.as_deref(), Some("default"));
+        assert_eq!(report.delegated_lead_profile.as_deref(), Some("lead-alt"));
+        assert_eq!(report.director_max_leads, Some(1));
+        assert_eq!(report.director_max_executors, Some(3));
+        assert_eq!(report.lead_max_executors, Some(5));
+        assert_eq!(report.max_concurrent_executors, Some(9));
+        assert_eq!(report.worktree_pool_size, Some(11));
+        assert_eq!(
+            report
+                .director_executor_capacity
+                .as_ref()
+                .unwrap()
+                .effective_limit,
+            3
+        );
+        assert_eq!(
+            report
+                .lead_executor_capacity
+                .as_ref()
+                .unwrap()
+                .effective_limit,
+            5
+        );
+        assert_eq!(fs::read(&path).unwrap(), overridden);
+    }
+
+    #[test]
+    fn non_positive_hierarchy_limit_fails_check_without_writes() {
+        for field in [
+            "director_max_leads",
+            "director_max_executors",
+            "lead_max_executors",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let source = kit_source(root.path());
+            let path = source.join("global/orchestration.toml");
+            let mut config: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+            config.insert(field.into(), 0.into());
+            fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+            let home = root.path().join("home");
+            let user = root.path().join("user");
+            installed_profiles(&home);
+
+            let error = check(&source, &home, &user, false).unwrap_err();
+            assert!(
+                error.to_string().contains(field),
+                "{field} refusal: {error}"
+            );
+            assert!(
+                error.to_string().contains("must be a positive integer"),
+                "{field} refusal: {error}"
+            );
+            assert!(!user.exists(), "{field} refusal must not write");
+        }
     }
 
     #[test]

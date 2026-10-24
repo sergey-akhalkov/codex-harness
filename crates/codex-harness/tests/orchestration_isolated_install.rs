@@ -7,7 +7,7 @@
 
 use harness_core::{
     board_lifecycle, build_identity, core_disconnect, core_install, installation_state::PathScope,
-    orchestration_config, orchestration_lifecycle, role_context, task_worktree,
+    orchestration_config, orchestration_lifecycle, role_context, task_store, task_worktree,
 };
 use std::{
     collections::BTreeMap,
@@ -203,7 +203,10 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     // profile files a real installation would have.
     fs::write(
         codex_home.join("ds.config.toml"),
-        "model = 'deepseek-flash'\n",
+        "model = 'deepseek-flash'\nmodel_provider = 'deepseek'\n\n\
+         [model_providers.deepseek]\nname = 'DeepSeek'\n\
+         base_url = 'http://127.0.0.1:9/v1'\nwire_api = 'responses'\n\
+         requires_openai_auth = false\n",
     )
     .unwrap();
     let delivery = orchestration_lifecycle::check(&source, &codex_home, &user_home, false).unwrap();
@@ -211,7 +214,11 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert_eq!(delivery.status, "Orchestration connected");
     assert_eq!(delivery.guidance, ["team-lead", "board-workflow"]);
     assert!(delivery.guidance_missing.is_empty());
+    assert_eq!(delivery.delegated_lead_profile.as_deref(), Some("ds"));
     assert_eq!(delivery.executor_profiles, ["ds"]);
+    assert_eq!(delivery.director_max_leads, Some(2));
+    assert_eq!(delivery.director_max_executors, Some(4));
+    assert_eq!(delivery.lead_max_executors, Some(6));
     assert_eq!(
         delivery
             .roles
@@ -220,6 +227,7 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
             .collect::<Vec<_>>(),
         [
             ("lead", "resolved"),
+            ("delegated-lead", "resolved"),
             ("executor", "resolved"),
             ("executor-self-reflection", "resolved"),
             ("lead-self-reflection", "resolved"),
@@ -235,10 +243,12 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
             .unwrap()
     };
     let lead_revision = role_revision("lead");
+    let delegated_lead_revision = role_revision("delegated-lead");
     let executor_revision = role_revision("executor");
     let executor_reflection_revision = role_revision("executor-self-reflection");
     let lead_reflection_revision = role_revision("lead-self-reflection");
     assert!(!lead_revision.is_empty());
+    assert!(!delegated_lead_revision.is_empty());
     assert!(!executor_revision.is_empty());
     assert!(!executor_reflection_revision.is_empty());
     assert!(!lead_reflection_revision.is_empty());
@@ -275,6 +285,13 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         delivery.worktree_pool_size,
         Some(orchestration_config::worktree_pool_size(&configured))
     );
+    let director_capacity = delivery.director_executor_capacity.as_ref().unwrap();
+    assert_eq!(director_capacity.parent_limit, 4);
+    assert_eq!(director_capacity.effective_limit, 4);
+    assert_eq!(director_capacity.bottlenecks, ["parent allowance"]);
+    let lead_capacity = delivery.lead_executor_capacity.as_ref().unwrap();
+    assert_eq!(lead_capacity.parent_limit, 6);
+    assert_eq!(lead_capacity.effective_limit, 6);
     assert_eq!(
         delivery.board_version, None,
         "the board is a separate component"
@@ -526,29 +543,23 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert!(enabled(&executor_catalogue, "board-workflow", "user"));
     assert!(enabled(&executor_catalogue, "foreign-project", "repo"));
 
-    // Drafted reflection skills stay outside ordinary discovery until their
-    // evaluation gate accepts them: neither role's catalogue may expose them.
-    for candidate in ["executor-self-reflection", "lead-self-reflection"] {
+    // Reflection skills are delivered for their own lifecycle-selected roles.
+    for reflection in ["executor-self-reflection", "lead-self-reflection"] {
         assert!(
             source
-                .join(".agents/skill-candidates")
-                .join(candidate)
+                .join(".agents/skills")
+                .join(reflection)
                 .join("SKILL.md")
                 .is_file(),
-            "candidate {candidate} is retained as an inactive draft"
+            "reflection role skill {reflection} is not delivered"
         );
         assert!(
-            !source.join(".agents/skills").join(candidate).exists()
-                && !user_home.join(".agents/skills").join(candidate).exists(),
-            "candidate {candidate} must not be installed into a discovery root"
-        );
-        let listed = format!("name={candidate};");
-        assert!(
-            !lead_catalogue.lines().any(|line| line.starts_with(&listed))
-                && !executor_catalogue
-                    .lines()
-                    .any(|line| line.starts_with(&listed)),
-            "catalogue exposed the unevaluated candidate {candidate}"
+            user_home
+                .join(".agents/skills")
+                .join(reflection)
+                .join("SKILL.md")
+                .is_file(),
+            "installed user root omits reflection role skill {reflection}"
         );
     }
 
@@ -641,6 +652,22 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     assert_eq!(orchestration["mutated"], false);
     assert_eq!(orchestration["lead_profile"], "default");
     assert_eq!(orchestration["successor_lead_profile"], "default");
+    assert_eq!(orchestration["delegated_lead_profile"], "ds");
+    assert_eq!(orchestration["director_max_leads"], 2);
+    assert_eq!(orchestration["director_max_executors"], 4);
+    assert_eq!(orchestration["lead_max_executors"], 6);
+    assert_eq!(
+        orchestration["director_executor_capacity"]["effective_limit"],
+        4
+    );
+    assert_eq!(
+        orchestration["director_executor_capacity"]["bottlenecks"],
+        serde_json::json!(["parent allowance"])
+    );
+    assert_eq!(
+        orchestration["lead_executor_capacity"]["effective_limit"],
+        6
+    );
     assert_eq!(
         orchestration["executor_profiles"],
         serde_json::json!(["ds"])
@@ -703,9 +730,16 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
         assert_eq!(status["lifecycle"], "inactive", "repeat {repeat}: {status}");
         assert_eq!(status["pending"], 0, "repeat {repeat}: {status}");
         assert_eq!(
-            status.as_object().unwrap().len(),
-            2,
+            status["selfReflectionEnabled"], true,
             "inactive status reports no invented lifecycle state: {status}"
+        );
+        assert_eq!(status["modelWork"], "stopped", "repeat {repeat}: {status}");
+        assert!(
+            status["modelWorkReason"]
+                .as_str()
+                .unwrap()
+                .contains("no reflection lifecycle"),
+            "repeat {repeat}: {status}"
         );
         assert!(
             !state_dir.exists(),
@@ -1095,6 +1129,295 @@ fn isolated_core_and_board_install_loads_orchestration_outside_checkout() {
     eprintln!(
         "rollback preserved: {:?}",
         disconnected.orchestration.preserved
+    );
+}
+
+#[test]
+fn isolated_lifecycle_check_reports_fresh_prior_and_overridden_hierarchy() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let config_path = source.join("global/orchestration.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(
+        &config_path,
+        include_bytes!("../../../global/orchestration.toml"),
+    )
+    .unwrap();
+    let codex_home = root.path().join("codex");
+    let user_home = root.path().join("user");
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(
+        codex_home.join("ds.config.toml"),
+        "model = 'deepseek-flash'\n",
+    )
+    .unwrap();
+    fs::write(
+        codex_home.join("lead-alt.config.toml"),
+        "model = 'alternate'\n",
+    )
+    .unwrap();
+
+    let fresh = orchestration_lifecycle::check(&source, &codex_home, &user_home, false).unwrap();
+    assert_eq!(fresh.lead_profile.as_deref(), Some("default"));
+    assert_eq!(fresh.successor_lead_profile.as_deref(), Some("default"));
+    assert_eq!(fresh.delegated_lead_profile.as_deref(), Some("ds"));
+    assert_eq!(fresh.director_max_leads, Some(2));
+    assert_eq!(fresh.director_max_executors, Some(4));
+    assert_eq!(fresh.lead_max_executors, Some(6));
+    assert_eq!(
+        fresh
+            .director_executor_capacity
+            .as_ref()
+            .unwrap()
+            .effective_limit,
+        4
+    );
+    assert_eq!(
+        fresh
+            .lead_executor_capacity
+            .as_ref()
+            .unwrap()
+            .effective_limit,
+        6
+    );
+
+    // A configuration from before hierarchy settings keeps its root route,
+    // gains only the materialized pool setting, and reports compatible
+    // defaults without writing user choices.
+    let prior = br#"schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+executor_profiles = ["ds"]
+max_concurrent_executors = 6
+vote_threshold = 3
+incubator_size_cap = 32
+feedback_batch_limit = 8
+worktree_limit = 6
+"#;
+    fs::write(&config_path, prior).unwrap();
+    assert_eq!(
+        orchestration_lifecycle::materialize_pool_capacity(&source).unwrap(),
+        Some(6)
+    );
+    let prior_report =
+        orchestration_lifecycle::check(&source, &codex_home, &user_home, false).unwrap();
+    assert_eq!(prior_report.lead_profile.as_deref(), Some("default"));
+    assert_eq!(
+        prior_report.successor_lead_profile.as_deref(),
+        Some("default")
+    );
+    assert_eq!(prior_report.delegated_lead_profile.as_deref(), Some("ds"));
+    assert_eq!(prior_report.director_max_leads, Some(2));
+    assert_eq!(prior_report.director_max_executors, Some(4));
+    assert_eq!(prior_report.lead_max_executors, Some(6));
+    assert_eq!(prior_report.worktree_pool_size, Some(6));
+
+    let overridden = br#"schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+delegated_lead_profile = "lead-alt"
+executor_profiles = ["ds"]
+director_max_leads = 1
+director_max_executors = 3
+lead_max_executors = 5
+max_concurrent_executors = 9
+worktree_pool_size = 11
+"#;
+    fs::write(&config_path, overridden).unwrap();
+    let override_report =
+        orchestration_lifecycle::check(&source, &codex_home, &user_home, false).unwrap();
+    assert_eq!(override_report.lead_profile.as_deref(), Some("default"));
+    assert_eq!(
+        override_report.successor_lead_profile.as_deref(),
+        Some("default")
+    );
+    assert_eq!(
+        override_report.delegated_lead_profile.as_deref(),
+        Some("lead-alt")
+    );
+    assert_eq!(override_report.director_max_leads, Some(1));
+    assert_eq!(override_report.director_max_executors, Some(3));
+    assert_eq!(override_report.lead_max_executors, Some(5));
+    assert_eq!(override_report.max_concurrent_executors, Some(9));
+    assert_eq!(override_report.worktree_pool_size, Some(11));
+    assert_eq!(
+        override_report
+            .director_executor_capacity
+            .as_ref()
+            .unwrap()
+            .effective_limit,
+        3
+    );
+    assert_eq!(
+        override_report
+            .lead_executor_capacity
+            .as_ref()
+            .unwrap()
+            .effective_limit,
+        5
+    );
+    assert_eq!(fs::read(&config_path).unwrap(), overridden);
+}
+
+#[test]
+fn isolated_lifecycle_check_rejects_non_positive_hierarchy_limits() {
+    for field in [
+        "director_max_leads",
+        "director_max_executors",
+        "lead_max_executors",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let config_path = source.join("global/orchestration.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let config = format!(
+            "schema = 1\nlead_profile = \"default\"\n\
+             successor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\n\
+             max_concurrent_executors = 6\n{field} = 0\n"
+        );
+        fs::write(&config_path, &config).unwrap();
+        let codex_home = root.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("ds.config.toml"),
+            "model = 'deepseek-flash'\n",
+        )
+        .unwrap();
+        let user_home = root.path().join("user");
+
+        let error =
+            orchestration_lifecycle::check(&source, &codex_home, &user_home, false).unwrap_err();
+        assert!(error.to_string().contains(field), "{field}: {error}");
+        assert!(
+            error.to_string().contains("must be a positive integer"),
+            "{field}: {error}"
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+        assert!(!user_home.exists(), "{field} refusal must not write");
+    }
+}
+
+#[test]
+fn isolated_rollback_preserves_legacy_run_and_refuses_unsupported_hierarchy_record() {
+    let root = tempfile::tempdir().unwrap();
+    let codex_home = root.path().join("codex");
+    let user_home = root.path().join("user");
+    let repository = root.path().join("retained-hierarchy");
+    fs::create_dir_all(&repository).unwrap();
+    board_git(&repository, &["init", "-q"]);
+    board_git(
+        &repository,
+        &["config", "user.email", "hierarchy@example.test"],
+    );
+    board_git(&repository, &["config", "user.name", "Hierarchy Fixture"]);
+    fs::write(repository.join("owned.txt"), b"base\n").unwrap();
+    board_git(&repository, &["add", "owned.txt"]);
+    board_git(&repository, &["commit", "-qm", "hierarchy base"]);
+
+    let held = task_worktree::acquire_task(
+        &codex_home,
+        &repository,
+        2,
+        "retained-hierarchy",
+        None,
+        &|_| false,
+    )
+    .unwrap();
+    fs::write(held.path.join("partial.txt"), b"preserve\n").unwrap();
+    let record_path =
+        task_worktree::slot_record_path(&codex_home, &repository, held.index).unwrap();
+    let record = fs::read(&record_path).unwrap();
+    let mut unsupported: serde_json::Value = serde_json::from_slice(&record).unwrap();
+    unsupported["ownershipSchema"] = serde_json::json!(999);
+    let unsupported = serde_json::to_vec(&unsupported).unwrap();
+    fs::write(&record_path, &unsupported).unwrap();
+    let refused =
+        task_worktree::continue_task(&codex_home, &repository, "retained-hierarchy", None)
+            .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("declares ownership schema 999"),
+        "{refused}"
+    );
+
+    let legacy = task_store::TaskRecord {
+        schema: 1,
+        id: "legacy-run".into(),
+        workspace: repository.clone(),
+        worktree: Some(held.path.clone()),
+        lead_profile: "default".into(),
+        authorization: "full".into(),
+        requirements: "synthetic retained run".into(),
+        stopped: true,
+        active_lead: "default".into(),
+        purpose: None,
+        assignments: vec![task_store::Assignment {
+            id: "legacy-executor".into(),
+            profile: "ds".into(),
+            owner_thread: Some("legacy-thread".into()),
+            worktree: Some(held.path.clone()),
+            attempt: 1,
+            accepted: None,
+            defect: None,
+            purpose: None,
+        }],
+    };
+    task_store::save(&codex_home, &legacy).unwrap();
+
+    let preserved =
+        orchestration_lifecycle::disconnect_preserves_private(&codex_home, &user_home).unwrap();
+    for expected in ["task-store", "executor-pool"] {
+        assert!(
+            preserved.preserved.contains(&expected),
+            "rollback omitted {expected}: {:?}",
+            preserved.preserved
+        );
+    }
+    assert_eq!(
+        fs::read(&record_path).unwrap(),
+        unsupported,
+        "rollback must retain the unsupported hierarchy record byte-for-byte"
+    );
+    assert_eq!(
+        fs::read(held.path.join("partial.txt")).unwrap(),
+        b"preserve\n"
+    );
+    let retained = task_store::load(&codex_home, "legacy-run").unwrap();
+    assert_eq!(retained.schema, 1);
+    assert!(retained.stopped);
+    assert_eq!(retained.assignments.len(), 1);
+
+    fs::write(&record_path, &record).unwrap();
+    let continued =
+        task_worktree::continue_task(&codex_home, &repository, "retained-hierarchy", None).unwrap();
+    assert_eq!(continued.path, held.path);
+}
+
+#[test]
+fn tracked_executor_plugin_names_both_routes_and_preserves_the_server_command() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(repository.join(".agents/plugins/executors/.codex-plugin/plugin.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["mcpServers"], "./.mcp.json");
+    let long = manifest["interface"]["longDescription"].as_str().unwrap();
+    for required in ["lead_dispatch", "executor_dispatch", "Director", "Lead"] {
+        assert!(long.contains(required), "plugin interface omits {required}");
+    }
+    assert!(
+        long.contains("One shared plugin server"),
+        "plugin interface must not imply a plugin identity per thread"
+    );
+    let mcp: serde_json::Value = serde_json::from_slice(
+        &fs::read(repository.join(".agents/plugins/executors/.mcp.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mcp["mcpServers"]["executors"]["command"], "codex-harness");
+    assert_eq!(
+        mcp["mcpServers"]["executors"]["args"],
+        serde_json::json!(["mcp", "executors"])
     );
 }
 

@@ -249,6 +249,14 @@ must therefore resolve `codex-harness` from PATH; core delivery links it under
 Starting the server directly does not use a generated wrapper or per-task
 endpoint.
 
+The manifest's interface names the two supported delivery routes:
+Director-to-Lead-to-Executor through `lead_dispatch` and then
+`executor_dispatch`, and direct Director-to-Executor through
+`executor_dispatch`. It is one shared plugin and one MCP server entry;
+role-specific tool visibility is enforced for each session rather than by
+separate plugin identities. The installed command remains
+`codex-harness mcp executors`.
+
 The plugin transport resolves the Codex home through `CODEX_HOME` or, when the
 native child does not inherit it, the default `USERPROFILE\.codex`. An isolated
 test home must therefore present that default path, for example through a
@@ -291,6 +299,14 @@ If a disconnect was interrupted while core was still connected, rerun the core
 disconnect; recovery does not remove the plugin while the core installation
 still exists. Once core removal is committed, `recover` can finish a pending
 plugin removal.
+
+Rollback does not delete hierarchy records or worktrees. An older harness
+refuses an ownership record whose schema it does not understand; that refusal
+is protective, not a reason to remove or rewrite the record. Keep the affected
+records and worktrees, restore a harness version that understands them through
+install or update, and then continue or explicitly release the work. The
+model-free lifecycle test exercises an unknown hierarchy record and verifies
+that rollback leaves its bytes and partial files intact.
 
 Known limits: Codex 0.164.0 refuses to re-add the same marketplace name from a
 different checkout. The lifecycle fails closed when that happens and preserves
@@ -694,6 +710,15 @@ the exact missing input. A gap describes what that role's sessions would not
 receive; it fails nothing else, and a managed dispatch or resume refuses
 before any launcher or model request while those inputs are missing, keeping
 its pool slot bound and recoverable.
+
+The same report exposes `delegated_lead_profile`, `director_max_leads`,
+`director_max_executors`, `lead_max_executors`, the installation-wide Executor
+limit and pool capacity. `director_executor_capacity` and
+`lead_executor_capacity` give the effective limit and every binding bottleneck
+for their parent role, so a local override or shared capacity is visible
+without reading the configuration again. A missing route profile or a
+non-positive hierarchy limit fails the check with that field named; no
+substitute route is selected.
 
 Both Codex commands must resolve under `CODEX_HOME/harness/bin`, and the MCP
 list must show enabled `serena` and `nuphus` when code tools were requested.

@@ -137,38 +137,54 @@ reusable. Lower local limits are valid operating choices and never stop healthy
 runs; larger role limits require a deliberate increase of the separate shared
 envelope and pool capacity.
 
-The installed `executors` plugin supplies the ordinary workflow:
-`executor_dispatch`, `executor_status`, `executor_wait`, `executor_message`,
-`executor_reply`, `executor_ask_lead`, `executor_stop`, `executor_resume` and
-`executor_release`. `executor_release` records the lead's explicit
-`merged`/`discarded` disposition; completion, stop, archive or a new dispatch
-never frees a slot.
+The model-free installation check reports `delegated_lead_profile`, all three
+parent limits, the shared Executor and pool limits, and an effective-capacity
+entry for Director and Lead Executors. Each entry names its binding
+bottlenecks. A missing profile or non-positive limit is a concrete check error;
+it is not replaced by another route. A configuration written before these
+settings keeps its root profiles and resolves the omitted delegated route from
+its existing Executor profiles. Install/update materializes only the missing
+pool capacity and preserves explicit local values.
+
+The installed `executors` plugin supplies the ordinary workflow. A Director
+uses `lead_dispatch` for a prepared OpenSpec change and `executor_dispatch` for
+a direct Executor; a verified delegated Lead uses `executor_dispatch` for its
+own Executors. Both routes expose `executor_status`, `executor_wait`,
+`executor_message`, `executor_reply`, `executor_ask_lead`, `executor_stop`,
+`executor_resume` and `executor_release` with the role boundaries described
+below. `executor_release` records the lead's explicit `merged`/`discarded`
+disposition; completion, stop, archive or a new dispatch never frees a slot.
+The plugin is one shared server and one installed command; role-specific tool
+visibility is applied per session, not by separate plugin identities.
 Start a fresh lead session after installing or updating the plugin so its MCP
-tools and role guidance are loaded. `executor_dispatch` uses the calling
-thread's repository, the installed kit configuration and a pooled checkout, and
-creates the executor thread on that same app-server. It accepts `base`, an
-allowed `profile` and a fresh `owner`; it does not accept a thread, endpoint,
-model, provider or effort as authority.
+tools and role guidance are loaded. Dispatch uses the calling thread's
+repository, the installed kit configuration and a pooled checkout, and creates
+the child thread on that same app-server. `executor_dispatch` accepts `base`, an
+allowed `profile` and a fresh `owner`; `lead_dispatch` additionally requires
+the prepared OpenSpec change and its declared planning, repository and board
+inputs. Neither tool accepts a thread, endpoint, model, provider or effort as
+authority.
 
-The configured executor profile from the example is the complete model/effort
-selection; an unlisted requested profile is an error, and the tool accepts no
-per-assignment model or effort override. An explicit user `codex --profile <id>`
-keeps native precedence over role configuration. A missing plugin/tool,
-unavailable endpoint, missing profile or role input, no free slot, or fetch or
-startup failure blocks dispatch with its exact cause and remedy. There is no
-silent fallback to another provider, raw `codex exec`, terminal automation,
-in-session subagents or a second tracker. Only an MCP- or installation-reported
-failure blocks dispatch; a routing-rule interpretation, the single executor
-profile or unknown quota does not. Quota succession looks up the successor
-profile's model in the native catalog; the verified handoff seed stays a
-configured binding, not a hardcoded provider role.
+The configured Executor profile or `delegated_lead_profile` from the example is
+the complete model/effort selection for its route; an unlisted requested
+profile is an error, and the tools accept no per-assignment model or effort
+override. An explicit user `codex --profile <id>` keeps native precedence over
+role configuration. A missing plugin/tool, unavailable endpoint, missing
+profile or role input, no free slot, or fetch or startup failure blocks
+dispatch with its exact cause and remedy. There is no silent fallback to
+another provider, raw `codex exec`, terminal automation, in-session subagents
+or a second tracker. Only an MCP- or installation-reported failure blocks
+dispatch; a routing-rule interpretation, the single profile or unknown quota
+does not. Quota succession looks up the root successor profile's model in the
+native catalog; the verified handoff seed stays a configured binding, not a
+hardcoded provider role.
 
-`executor_dispatch` returns the run id, executor thread, checkout, slot and
-committed base after the first turn is accepted. Inspect that thread in
-`/agents`; `executor_status` is the compact machine-readable view and
-`executor_wait` is the blocking result or question path. Assignments live on the
-beads board; executors set `lead_review` when done instead of closing. The lead
-reviews that inbox and its own `assignee=lead` tasks. No separate mailbox,
+Dispatch returns the run id, child thread and role, checkout, slot and committed
+base after the first turn is accepted. Inspect the child in `/agents`;
+`executor_status` is the compact machine-readable view and `executor_wait` is
+the blocking result or question path. Assignments live on the beads board;
+executors set `lead_review` when done instead of closing. Their immediate parent
+reviews that inbox and its own assigned tasks. No separate mailbox,
 per-executor console or result file is part of the workflow.
 
 A structured assignment's brief carries the result consumer, the standing
@@ -183,17 +199,18 @@ to the exact request through `executor_reply`.
 The schema, optional fields, defaults and limits live in
 [native commands](rust-native.md#structured-executor-assignments).
 
-Every executor session runs as a single-agent worker. MCP dispatch and
-continuation pass Codex CLI's built-in `agents.enabled=false` configuration, so
-the executor thread has no built-in agent-spawning or agent-messaging tools even
-though the `ds` model catalog advertises multi-agent v2. The installed launcher
-applies the same setting to every Codex process started inside an executor, so a
-raw nested `codex` invocation is still single-agent. Executor sessions must not
-call `executor_dispatch`; ephemeral `spawn_agent` helpers are lead-only. An
-executor that needs another agent or executor reports the need instead of
-creating one. Clearing the marker and calling the registered upstream Codex
-executable directly is outside the supported entry points; the guards are not a
-sandbox.
+Every delegated Lead and Executor session runs as a single-agent worker. MCP
+dispatch and continuation pass Codex CLI's built-in `agents.enabled=false`
+configuration, so the child thread has no built-in agent-spawning or
+agent-messaging tools even though the `ds` model catalog advertises multi-agent
+v2. The installed launcher applies the same setting to every Codex process
+started inside those sessions, so a raw nested `codex` invocation is still
+single-agent. A delegated Lead may create only its assigned Executors through
+`executor_dispatch`; an Executor must not call it. Ephemeral `spawn_agent`
+helpers are root-Director-only. A child that needs another agent or executor
+reports the need instead of creating one. Clearing the marker and calling the
+registered upstream Codex executable directly is outside the supported entry
+points; the guards are not a sandbox.
 
 The `team-lead` skill owns lead activation, briefs, steering, acceptance and
 stop. Activation comes from a user request or from the main session's own
@@ -391,13 +408,14 @@ are neither adopted nor deleted automatically: preserve their work, merge or
 record a discard, then remove them only by an authorized explicit Git operation.
 
 An older harness reports upgraded pool records as unreadable with a missing
-`schema` field. This is a compatibility refusal that protects held work during
-rollback. Keep the records and worktrees, including released positions, and
-restore a compatible harness through the installation lifecycle before using
-that pool. Deleting records or rewriting their discriminator can expose held
-tasks to the older host's expired-session cleanup. The current reader accepts
-legacy records without rewriting them during inspection; an authorized state
-transition writes the protected format.
+`schema` field, and the current reader refuses an `ownershipSchema` value it
+does not support. Both are compatibility refusals that protect held hierarchy
+work during rollback. Keep the records and worktrees, including released
+positions, and restore a compatible harness through the installation lifecycle
+before using that pool. Deleting records or rewriting their discriminator can
+expose held tasks to the older host's expired-session cleanup. The current
+reader accepts supported legacy records without rewriting them during
+inspection; an authorized state transition writes the protected format.
 
 Reducing `worktree_pool_size` below a held position refuses new acquisition;
 status and continuation keep the held task visible and recoverable. Restore

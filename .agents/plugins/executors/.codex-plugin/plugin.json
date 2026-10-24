@@ -1,7 +1,7 @@
 {
   "name": "executors",
   "version": "0.1.0",
-  "description": "Dispatch one executor thread on the calling lead's Codex app-server.",
+  "description": "Dispatch delegated Lead and Executor threads on the calling Director's Codex app-server.",
   "author": {
     "name": "coding-agents-harness"
   },
@@ -9,13 +9,14 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Executors",
-    "shortDescription": "Run a configured executor on the lead's runtime",
-    "longDescription": "Adds the executor_dispatch MCP tool. It binds the caller from Codex request metadata, allocates the existing worktree pool, and starts one executor thread with the configured ds profile on the same app-server as the lead.",
+    "shortDescription": "Run a configured Lead or Executor on the Director's runtime",
+    "longDescription": "Adds lead_dispatch for Directors and executor_dispatch for Directors or delegated Leads. The two supported routes are Director to Lead to Executor and direct Director to Executor. Each operation binds the verified caller, uses the configured route, allocates the existing worktree pool, and starts the child on the same app-server. One shared plugin server serves every role; per-session tool visibility is enforced by the installed MCP server, not by separate plugin identities.",
     "developerName": "coding-agents-harness",
     "category": "Engineering",
     "capabilities": ["Write", "Interactive"],
     "defaultPrompt": [
-      "Dispatch this assignment to a configured executor"
+      "Dispatch this prepared change to a configured delegated Lead",
+      "Dispatch this assignment to a configured Executor"
     ]
   }
 }
