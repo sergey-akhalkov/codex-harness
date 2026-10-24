@@ -1,14 +1,14 @@
 //! Explicit plan-action dispatcher for native dependency candidates.
-//! Check and preview stay read-only. Mutation stages and selects only the
-//! native slots and shared npm MCP installations; remaining backends stay
-//! pending for their owning migration tasks.
+//! Check and preview stay read-only. Mutation stages and selects the native
+//! slots, shared npm MCP installations and the pinned Serena/Python runtime;
+//! remaining backends stay pending for their owning migration tasks.
 #![cfg(windows)]
 
 use crate::{
     build_identity,
     dependency_discovery::{self, Request as DiscoveryRequest, local_path},
     dependency_npm_install, dependency_plan, dependency_releases, dependency_rust_component,
-    dependency_selection, dependency_stage, inventory,
+    dependency_selection, dependency_stage, inventory, serena_setup,
 };
 use serde_json::{Value, json};
 use std::{
@@ -189,6 +189,40 @@ fn apply_native(request: &Request, item: &Value, activating: bool) -> io::Result
                 .unwrap_or("Required backend-specific provisioning/update remains unfinished."),
             item,
         )),
+        "install-required" if id == "serena" => {
+            if !activating {
+                return Ok(result_item(
+                    id,
+                    "previewed",
+                    json!({
+                        "action": action,
+                        "packages_acquired": false,
+                        "reason": "Check and preview do not stage, install or acquire packages."
+                    }),
+                ));
+            }
+            let owned = serena_setup::Request {
+                catalogue: request.source.join("global/code-tools.json"),
+                user_home: request.user_home.clone(),
+                state: request.state.clone(),
+            };
+            match serena_setup::prepare(&owned) {
+                Ok(mut value) => {
+                    value["id"] = json!(id);
+                    value["state"] = if value["mutated"] == true {
+                        json!("updated")
+                    } else {
+                        json!("reused")
+                    };
+                    Ok(value)
+                }
+                Err(error) => Ok(result_item(
+                    id,
+                    "failed",
+                    json!({"reason": error.to_string(), "packages_acquired": false}),
+                )),
+            }
+        }
         "install-required" if id == "nuphus" => {
             if !activating {
                 return Ok(result_item(
@@ -263,6 +297,21 @@ fn apply_native(request: &Request, item: &Value, activating: bool) -> io::Result
                         "action": action,
                         "packages_acquired": false,
                         "reason": "Check and preview do not stage, select or acquire packages."
+                    }),
+                ));
+            }
+            if id == "python"
+                && action == "install-required"
+                && let Some(row) = serena_setup::prepared_language(&request.state, id)?
+            {
+                return Ok(result_item(
+                    id,
+                    "reused",
+                    json!({
+                        "version": row["version"],
+                        "paths": row["paths"],
+                        "packages_acquired": false,
+                        "selection": "serena-setup-registry"
                     }),
                 ));
             }
@@ -427,7 +476,7 @@ pub fn apply(request: &Request) -> io::Result<Value> {
         "results": results,
         "complete": complete,
         "all_updates_applied": all_updates_applied,
-        "note": "Missing shared npm MCP packages install through the native journaled path; serena and shared-tree replacements stay pending for their owning tasks. Installed-unverified records require real consumer checks."
+        "note": "Missing shared npm MCP packages install through the native journaled path; Serena/Python prerequisites install through serena_setup with pinned integrity. Shared-tree replacements stay pending for their owning tasks. Installed-unverified records require real consumer checks."
     }))
 }
 
@@ -485,8 +534,9 @@ mod tests {
 
     #[test]
     fn apply_native_helper_does_not_stop_shared_consumers_or_claim_python_backends() {
+        let owned = tempfile::tempdir().unwrap();
         let rust = apply_native(
-            &request(Path::new("D:/unused"), false, false),
+            &request(owned.path(), false, false),
             &json!({
                 "id":"rust",
                 "action":"install-required",
@@ -500,7 +550,7 @@ mod tests {
         assert_eq!(rust["state"], "prerequisite-missing");
         assert_eq!(rust["packages_acquired"], false);
         let consumers = apply_native(
-            &request(Path::new("D:/unused"), false, false),
+            &request(owned.path(), false, false),
             &json!({
                 "id":"nuphus",
                 "action":"update-pending-consumers",
@@ -545,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn nuphus_routes_to_native_install_and_serena_stays_pending() {
+    fn nuphus_routes_to_native_install_and_unavailable_serena_reports_failure() {
         let result = apply_native(
             &request(Path::new("D:/unused"), false, false),
             &json!({
@@ -584,8 +634,10 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| !reason.is_empty())
         );
+        let mut missing_source = request(Path::new("D:/unused"), false, false);
+        missing_source.source = PathBuf::from("D:/unused");
         let serena = apply_native(
-            &request(Path::new("D:/unused"), false, false),
+            &missing_source,
             &json!({
                 "id":"serena",
                 "action":"install-required",
@@ -595,8 +647,13 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(serena["state"], "pending");
+        assert_eq!(serena["state"], "failed");
         assert_eq!(serena["packages_acquired"], false);
+        assert!(
+            serena["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
     }
 
     #[test]
@@ -616,6 +673,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(absent["state"], "conditional-absent");
+    }
+
+    #[test]
+    fn prepared_serena_registry_reuses_python_without_staging_a_duplicate() {
+        let root = tempfile::tempdir().unwrap();
+        let request = request(root.path(), false, false);
+        fs::create_dir_all(&request.state).unwrap();
+        let serena = root.path().join("serena.exe");
+        let node = root.path().join("node.exe");
+        let entry = root.path().join("langserver.index.js");
+        fs::write(&serena, b"inert").unwrap();
+        fs::write(&node, b"inert").unwrap();
+        fs::write(&entry, b"inert").unwrap();
+        fs::write(
+            serena_setup::registry_path(&request.state),
+            serde_json::to_vec(&json!({
+                "mcp":[{"id":"serena","status":"adopted","version":"1.7.0",
+                    "paths":{"console_entrypoint":serena}}],
+                "languages":[{"id":"python","serena_id":"python_basedpyright",
+                    "status":"adopted","version":"1.40.2",
+                    "paths":{"node":node,"entrypoint":entry}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let result = apply_native(
+            &request,
+            &json!({
+                "id":"python",
+                "action":"install-required",
+                "release":{"state":"checked","version":"1.40.2"}
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(result["state"], "reused");
+        assert_eq!(result["version"], "1.40.2");
+        assert_eq!(result["packages_acquired"], false);
+        assert!(!request.state.join("dependency-staging").exists());
+    }
+
+    #[test]
+    fn prepared_serena_registry_reuses_serena_without_acquisition() {
+        let root = tempfile::tempdir().unwrap();
+        let request = request(root.path(), false, false);
+        fs::create_dir_all(&request.state).unwrap();
+        let serena = root.path().join("serena.exe");
+        let node = root.path().join("node.exe");
+        let entry = root.path().join("langserver.index.js");
+        fs::write(&serena, b"inert").unwrap();
+        fs::write(&node, b"inert").unwrap();
+        fs::write(&entry, b"inert").unwrap();
+        fs::write(
+            serena_setup::registry_path(&request.state),
+            serde_json::to_vec(&json!({
+                "mcp":[{"id":"serena","status":"adopted","version":"1.7.0",
+                    "paths":{"console_entrypoint":serena}}],
+                "languages":[{"id":"python","serena_id":"python_basedpyright",
+                    "status":"adopted","version":"1.40.2",
+                    "paths":{"node":node,"entrypoint":entry}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let result = apply_native(
+            &request,
+            &json!({
+                "id":"serena",
+                "action":"install-required",
+                "release":{"state":"checked","version":"1.7.0"}
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(result["state"], "reused");
+        assert_eq!(result["packages_acquired"], false);
     }
 
     #[test]

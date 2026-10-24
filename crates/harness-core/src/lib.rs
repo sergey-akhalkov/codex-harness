@@ -49,6 +49,7 @@ mod dependency_probe;
 pub mod dependency_process;
 pub mod dependency_python_stage;
 pub mod dependency_releases;
+pub mod dependency_runtime;
 pub mod dependency_rust_component;
 pub mod dependency_selection;
 pub mod dependency_stage;
