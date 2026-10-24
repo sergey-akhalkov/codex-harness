@@ -294,6 +294,27 @@ fn git_repo(root: &Path) -> String {
         .to_owned()
 }
 
+fn git_head(repository: &Path) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repository)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git rev-parse: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn workspace_slot_record(home: &Path, repository: &Path, index: u32) -> Value {
+    let path = task_worktree::pool_state_dir(home, repository)
+        .unwrap()
+        .join(format!("slot-{index}.json"));
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
 #[derive(Clone)]
 struct SimThread {
     id: String,
@@ -1037,6 +1058,10 @@ fn write_limits(root: &Path, limits: &str) {
 }
 
 fn prepared_lead_assignment(issue: &str, base: &str) -> Value {
+    prepared_lead_assignment_with(issue, base, json!([{"path": ".", "base": base}]))
+}
+
+fn prepared_lead_assignment_with(issue: &str, base: &str, repositories: Value) -> Value {
     json!({
         "schema": 1,
         "objective": "Lead the prepared sample change",
@@ -1049,7 +1074,7 @@ fn prepared_lead_assignment(issue: &str, base: &str) -> Value {
             "planning_root": ".",
             "base": base,
             "directory": "openspec/changes/lead-sample",
-            "repositories": [{"path": ".", "base": base}]
+            "repositories": repositories
         }
     })
 }
@@ -2003,6 +2028,218 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
     );
     assert!(tool_error(&refused).contains("lead_change"), "{refused}");
     assert_eq!(server.requests_for("thread/start").len(), starts_before);
+
+    mcp.finish();
+}
+
+#[test]
+fn director_lead_dispatch_records_distinct_repository_workspaces() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
+    let consumer = repository.join("consumer");
+    let consumer_base = git_repo(&consumer);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let starts_before = server.requests_for("thread/start").len();
+    let duplicate = mcp.call_tool(
+        2,
+        "lead_dispatch",
+        json!({
+            "assignment": prepared_lead_assignment_with(
+                &issue,
+                &base,
+                json!([
+                    {"path": ".", "base": base},
+                    {"path": "./", "base": base}
+                ])
+            )
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&duplicate).contains("repeats the already declared repository"),
+        "{duplicate}"
+    );
+    let foreign = mcp.call_tool(
+        3,
+        "lead_dispatch",
+        json!({
+            "assignment": prepared_lead_assignment_with(
+                &issue,
+                &base,
+                json!([
+                    {"path": ".", "base": base},
+                    {"path": "../outside", "base": base}
+                ])
+            )
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&foreign).contains("must not traverse with '..'"),
+        "{foreign}"
+    );
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        starts_before,
+        "invalid repository declarations must not start a Lead"
+    );
+
+    let lead = mcp.call_tool(
+        4,
+        "lead_dispatch",
+        json!({
+            "requestId": "lead-multi-repository",
+            "assignment": prepared_lead_assignment_with(
+                &issue,
+                &base,
+                json!([
+                    {"path": "consumer", "base": consumer_base},
+                    {"path": ".", "base": base}
+                ])
+            )
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let lead = result(&lead);
+    assert_eq!(lead["role"], "lead", "{lead}");
+    assert_eq!(lead["parentThreadId"], DIRECTOR, "{lead}");
+    assert_eq!(lead["rootThreadId"], DIRECTOR, "{lead}");
+    let workspaces = lead["workspaces"].as_array().unwrap();
+    assert_eq!(workspaces.len(), 2, "{lead}");
+    assert_eq!(workspaces[0]["base"], consumer_base, "{lead}");
+    assert_eq!(workspaces[1]["base"], base, "{lead}");
+    assert_ne!(workspaces[0]["checkout"], workspaces[1]["checkout"]);
+    assert_eq!(
+        PathBuf::from(workspaces[0]["repository"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        consumer.canonicalize().unwrap()
+    );
+    assert_eq!(
+        PathBuf::from(workspaces[1]["repository"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        repository.canonicalize().unwrap()
+    );
+    for workspace in workspaces {
+        assert_eq!(workspace["owner"], lead["run"], "{lead}");
+        assert_eq!(
+            git_head(Path::new(workspace["checkout"].as_str().unwrap())),
+            workspace["base"].as_str().unwrap()
+        );
+    }
+    assert_eq!(lead["primaryCwd"], workspaces[0]["checkout"], "{lead}");
+    assert_eq!(lead["checkout"], workspaces[0]["checkout"], "{lead}");
+    let starts = server.requests_for("thread/start");
+    assert_eq!(starts.len(), starts_before + 1, "{starts:?}");
+    assert_eq!(
+        PathBuf::from(starts[0]["params"]["cwd"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        PathBuf::from(workspaces[0]["checkout"].as_str().unwrap())
+            .canonicalize()
+            .unwrap()
+    );
+    let primary = workspace_slot_record(home.path(), &consumer, 1);
+    let root = workspace_slot_record(home.path(), &repository, 1);
+    assert_eq!(primary["owner"], lead["run"], "{primary}");
+    assert_eq!(root["owner"], lead["run"], "{root}");
+    assert_eq!(primary["base"], consumer_base, "{primary}");
+    assert_eq!(root["base"], base, "{root}");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(lead["receipt"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(receipt["workspaces"], lead["workspaces"], "{receipt}");
+    assert_eq!(receipt["primaryCwd"], lead["primaryCwd"], "{receipt}");
+
+    mcp.finish();
+}
+
+#[test]
+fn lead_second_workspace_failure_releases_the_unused_primary_claim() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    fs::write(
+        root.path().join("kit/global/orchestration.toml"),
+        "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 6\nworktree_pool_size = 1\n",
+    )
+    .unwrap();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
+    let consumer = repository.join("consumer");
+    let consumer_base = git_repo(&consumer);
+    task_worktree::acquire_task(
+        home.path(),
+        &consumer,
+        1,
+        "prior-review",
+        Some(&consumer_base),
+        &|_| false,
+    )
+    .unwrap();
+    let prior = workspace_slot_record(home.path(), &consumer, 1);
+    let prior_checkout = PathBuf::from(prior["path"].as_str().unwrap());
+    let preserved = prior_checkout.join("keep.txt");
+    fs::write(&preserved, "reviewed work\n").unwrap();
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let starts_before = server.requests_for("thread/start").len();
+    let failed = mcp.call_tool(
+        2,
+        "lead_dispatch",
+        json!({
+            "assignment": prepared_lead_assignment_with(
+                &issue,
+                &base,
+                json!([
+                    {"path": ".", "base": base},
+                    {"path": "consumer", "base": consumer_base}
+                ])
+            )
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&failed).contains("no free slot in the pool of 1"),
+        "{failed}"
+    );
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        starts_before,
+        "workspace preparation failure must not start a Lead"
+    );
+    let primary = task_worktree::task_inventory(home.path(), &repository, 1).unwrap();
+    assert_eq!(
+        primary[0].state,
+        task_worktree::TaskState::Free,
+        "the unused primary claim must be returned"
+    );
+    assert_eq!(primary[0].owner, None);
+    assert_eq!(workspace_slot_record(home.path(), &consumer, 1), prior);
+    assert!(
+        preserved.is_file(),
+        "pre-existing reviewed work must remain in its workspace"
+    );
 
     mcp.finish();
 }

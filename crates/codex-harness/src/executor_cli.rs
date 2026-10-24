@@ -1193,6 +1193,7 @@ fn spawn(args: &[OsString]) -> io::Result<i32> {
         codex_home: &codex_home,
         source: &source,
         repository: &repository,
+        assignment_repository: None,
         pool_size,
         max_concurrency: config.max_concurrent_executors,
         named_slot,
@@ -1416,6 +1417,7 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
         codex_home: &codex_home,
         source: &source,
         repository: &repository,
+        assignment_repository: None,
         pool_size,
         max_concurrency: config.max_concurrent_executors,
         named_slot: None,
@@ -1697,6 +1699,11 @@ struct Dispatch<'a> {
     /// dispatch uses; it equals `source` unless `--repository` selected an
     /// independent consuming repository.
     repository: &'a Path,
+    /// The repository that owns a structured board assignment when it differs
+    /// from the selected primary workspace. Lead dispatch validates the board
+    /// against the Director checkout while the first declared code repository
+    /// remains the conversation cwd.
+    assignment_repository: Option<&'a Path>,
     pool_size: u32,
     /// Executor concurrency: active runs are admitted against
     /// `max_concurrent_executors`, independently of the directory capacity
@@ -2033,7 +2040,12 @@ fn resolve_assignment_binding(
             "board task '{issue}' is declared but the consumer board executable is unavailable: {error}"
         ))
     })?;
-    executor_assignment::bind_board_task(assignment, request.repository, &bd).map(Some)
+    executor_assignment::bind_board_task(
+        assignment,
+        request.assignment_repository.unwrap_or(request.repository),
+        &bd,
+    )
+    .map(Some)
 }
 
 fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
@@ -2106,6 +2118,30 @@ fn prepare_dispatch(request: &Dispatch) -> io::Result<PreparedDispatch> {
     })
 }
 
+/// One repository workspace held by a prepared Lead run. The pool binding is
+/// separate for every selected repository; the first workspace remains the
+/// Lead conversation's primary cwd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpWorkspace {
+    pub repository: PathBuf,
+    pub slot: u32,
+    pub checkout: PathBuf,
+    pub base: String,
+    pub owner: String,
+}
+
+impl McpWorkspace {
+    fn from_binding(repository: PathBuf, binding: &SlotBinding) -> Self {
+        Self {
+            repository,
+            slot: binding.index,
+            checkout: binding.path.clone(),
+            base: binding.base.clone(),
+            owner: binding.owner.clone(),
+        }
+    }
+}
+
 /// One pool dispatch prepared for the same-runtime MCP path. It carries the
 /// same slot/profile/assignment validation as the visible CLI route, plus the
 /// owned role and profile overrides the attached app-server needs on
@@ -2114,6 +2150,7 @@ pub(crate) struct McpDispatch {
     pub owner: String,
     pub title: String,
     pub lead_change: Option<executor_assignment::LeadChangeEvidence>,
+    pub workspaces: Vec<McpWorkspace>,
     pub slot: u32,
     pub source: PathBuf,
     pub repository: PathBuf,
@@ -2126,19 +2163,34 @@ pub(crate) struct McpDispatch {
     pub profile_overrides: Vec<String>,
     pub receipt: PathBuf,
     codex_home: PathBuf,
-    binding: SlotBinding,
+    bindings: Vec<SlotBinding>,
 }
 
 impl McpDispatch {
-    /// Returns a claim whose thread was refused before any turn started.
+    /// Returns every claim whose thread was refused before any turn started.
     pub(crate) fn release(self, error: io::Error) -> io::Error {
-        release_mcp_claim(
-            &self.codex_home,
-            &self.repository,
-            self.pool_size,
-            &self.binding,
-            error,
-        )
+        release_mcp_claims(&self.codex_home, self.pool_size, &self.bindings, error)
+    }
+
+    /// Drop every workspace's startup reservation after the host accepts the
+    /// turn. Errors are returned as bounded notes; no lease is released here.
+    pub(crate) fn release_startup_reservations(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for workspace in self.workspaces.iter().rev() {
+            if let Err(error) = task_worktree::release_startup_reservation(
+                &self.codex_home,
+                &workspace.repository,
+                workspace.slot,
+                &workspace.owner,
+            ) {
+                errors.push(format!(
+                    "workspace {} slot {}: {error}",
+                    workspace.repository.display(),
+                    workspace.slot
+                ));
+            }
+        }
+        errors
     }
 }
 
@@ -2166,12 +2218,14 @@ pub(crate) fn prepare_mcp_dispatch(
         assignment,
         Role::Executor,
         None,
+        None,
     )
 }
 
 /// Prepares one Director-requested delegated Lead run. The assignment's
 /// change reference must already have been validated against the Director's
-/// repository; its exact repository base becomes the Lead workspace base.
+/// repository; the first selected repository is the native cwd and every
+/// selected repository's exact base becomes an independently owned workspace.
 /// The profile is fixed to the configured delegated Lead route.
 pub(crate) fn prepare_mcp_lead_dispatch(
     codex_home: &Path,
@@ -2181,22 +2235,121 @@ pub(crate) fn prepare_mcp_lead_dispatch(
     assignment: executor_assignment::Assignment,
     evidence: executor_assignment::LeadChangeEvidence,
 ) -> io::Result<McpDispatch> {
-    let base = evidence
+    let first = evidence
         .repositories
         .first()
-        .map(|repository| repository.base.clone())
-        .unwrap_or_else(|| evidence.planning_base.clone());
+        .ok_or_else(|| invalid("a prepared Lead change declares no repository workspace"))?;
+    let primary = declared_workspace_path(repository, &first.path);
+    let base = first.base.clone();
     prepare_mcp_dispatch_inner(
         codex_home,
         source,
-        repository,
+        &primary,
         owner,
         None,
         Some(&base),
         assignment,
         Role::DelegatedLead,
         Some(evidence),
+        Some(repository),
     )
+}
+
+/// MCP dispatch creates a fresh run: an existing same-owner binding is never
+/// silently continued from a model-visible tool call.
+fn refuse_recorded_owner(
+    codex_home: &Path,
+    repository: &Path,
+    owner: &str,
+    pool_size: u32,
+) -> io::Result<()> {
+    let inventory = task_worktree::task_inventory(codex_home, repository, pool_size)?;
+    if inventory.iter().any(|slot| {
+        slot.owner.as_deref() == Some(owner) && slot.state != task_worktree::TaskState::Free
+    }) {
+        return Err(invalid(&format!(
+            "owner '{owner}' already has a recorded run; MCP dispatch creates a fresh run and never continues another lead's binding"
+        )));
+    }
+    refuse_a_live_owner(codex_home, repository, owner)
+}
+
+fn declared_workspace_path(repository: &Path, declared: &str) -> PathBuf {
+    if declared == "." {
+        repository.to_path_buf()
+    } else {
+        repository.join(declared)
+    }
+}
+
+fn workspace_slot_binding(
+    source: &Path,
+    repository: &Path,
+    owner: &str,
+    slot: &task_worktree::TaskSlot,
+) -> SlotBinding {
+    let (remote, branch) = task_worktree::upstream(&slot.path).unwrap_or_default();
+    SlotBinding {
+        index: slot.index,
+        path: slot.path.clone(),
+        source: source.to_path_buf(),
+        repository: Some(repository.to_path_buf()),
+        owner: owner.to_owned(),
+        base: slot.base.clone().unwrap_or_default(),
+        remote,
+        branch,
+        task: slot.task.clone(),
+        handle: slot.handle.clone(),
+        assignment: None,
+    }
+}
+
+/// Acquire the explicitly declared repositories after the primary checkout.
+/// The pool helper owns all-or-nothing cleanup for this attempt; a failure
+/// therefore never releases the primary or a pre-existing workspace.
+fn acquire_declared_lead_workspaces(
+    codex_home: &Path,
+    source: &Path,
+    repository: &Path,
+    pool_size: u32,
+    owner: &str,
+    evidence: &executor_assignment::LeadChangeEvidence,
+    bindings: &mut Vec<SlotBinding>,
+    workspaces: &mut Vec<McpWorkspace>,
+) -> io::Result<()> {
+    let mut selected = Vec::new();
+    for declared in evidence.repositories.iter().skip(1) {
+        let selected_repository = declared_workspace_path(repository, &declared.path);
+        refuse_recorded_owner(codex_home, &selected_repository, owner, pool_size)?;
+        selected.push((selected_repository, declared.base.clone()));
+    }
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let startup = task_worktree::current_startup_reservation()?;
+    let requests: Vec<task_worktree::WorkspaceStartupRequest<'_>> = selected
+        .iter()
+        .map(
+            |(repository, base)| task_worktree::WorkspaceStartupRequest {
+                source: repository,
+                base,
+            },
+        )
+        .collect();
+    let live = |candidate: &str| {
+        selected
+            .iter()
+            .any(|(repository, _)| owner_live(codex_home, repository, candidate))
+    };
+    let acquired = task_worktree::acquire_workspaces_for_startup(
+        codex_home, pool_size, owner, &requests, &startup, &live,
+    )?;
+    for (workspace, (selected_repository, _)) in acquired.into_iter().zip(selected) {
+        let binding = workspace_slot_binding(source, &selected_repository, owner, &workspace.slot);
+        workspaces.push(McpWorkspace::from_binding(selected_repository, &binding));
+        bindings.push(binding);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2210,6 +2363,7 @@ fn prepare_mcp_dispatch_inner(
     assignment: executor_assignment::Assignment,
     role: Role,
     lead_change: Option<executor_assignment::LeadChangeEvidence>,
+    assignment_repository: Option<&Path>,
 ) -> io::Result<McpDispatch> {
     let owner = owner.trim();
     if owner.is_empty()
@@ -2233,18 +2387,12 @@ fn prepare_mcp_dispatch_inner(
         }
     };
     let pool_size = worktree_pool_size(&config);
-    let inventory = task_worktree::task_inventory(codex_home, repository, pool_size)?;
-    if inventory.iter().any(|slot| {
-        slot.owner.as_deref() == Some(owner) && slot.state != task_worktree::TaskState::Free
-    }) {
-        return Err(invalid(&format!(
-            "owner '{owner}' already has a recorded run; MCP dispatch creates a fresh run and never continues another lead's binding"
-        )));
-    }
+    refuse_recorded_owner(codex_home, repository, owner, pool_size)?;
     let request = Dispatch {
         codex_home,
         source,
         repository,
+        assignment_repository,
         pool_size,
         // Delegated Leads use the shared pool but not the Executor
         // concurrency allowance; parent-scoped admission is a later task.
@@ -2267,6 +2415,26 @@ fn prepare_mcp_dispatch_inner(
         terminal_window: None,
     };
     let prepared = prepare_dispatch(&request)?;
+    let mut bindings = vec![prepared.binding.clone()];
+    let mut workspaces = vec![McpWorkspace::from_binding(
+        repository.to_path_buf(),
+        &prepared.binding,
+    )];
+    if role == Role::DelegatedLead
+        && let Some(evidence) = lead_change.as_ref()
+        && let Err(error) = acquire_declared_lead_workspaces(
+            codex_home,
+            source,
+            assignment_repository.unwrap_or(repository),
+            pool_size,
+            owner,
+            evidence,
+            &mut bindings,
+            &mut workspaces,
+        )
+    {
+        return Err(release_mcp_claims(codex_home, pool_size, &bindings, error));
+    }
     let run = (|| -> io::Result<(Vec<String>, Vec<String>)> {
         let profile_config = orchestration_config::profile_config(codex_home, &profile)?;
         let role = native_launcher::role_launch(
@@ -2284,13 +2452,7 @@ fn prepare_mcp_dispatch_inner(
     let (role_args, profile_overrides) = match run {
         Ok(run) => run,
         Err(error) => {
-            return Err(release_mcp_claim(
-                codex_home,
-                repository,
-                pool_size,
-                &prepared.binding,
-                error,
-            ));
+            return Err(release_mcp_claims(codex_home, pool_size, &bindings, error));
         }
     };
     Ok(McpDispatch {
@@ -2301,6 +2463,7 @@ fn prepare_mcp_dispatch_inner(
             _ => unreachable!("MCP dispatch role checked above"),
         },
         lead_change,
+        workspaces,
         slot: prepared.binding.index,
         source: source.to_path_buf(),
         repository: repository.to_path_buf(),
@@ -2316,7 +2479,7 @@ fn prepare_mcp_dispatch_inner(
             .receipt
             .with_file_name(format!("mcp-{}.json", prepared.binding.index)),
         codex_home: codex_home.to_path_buf(),
-        binding: prepared.binding,
+        bindings,
     })
 }
 
@@ -2345,6 +2508,22 @@ fn release_mcp_claim(
         ),
         None => error,
     }
+}
+
+/// Return every workspace claim from one failed preparation attempt. Claims
+/// are independent pool bindings; each follows the normal reuse/preservation
+/// rules and a failure in one cleanup is reported without skipping the rest.
+fn release_mcp_claims(
+    codex_home: &Path,
+    pool_size: u32,
+    bindings: &[SlotBinding],
+    error: io::Error,
+) -> io::Error {
+    let mut error = error;
+    for binding in bindings.iter().rev() {
+        error = release_mcp_claim(codex_home, binding.repository(), pool_size, binding, error);
+    }
+    error
 }
 
 fn dispatch(request: &Dispatch) -> io::Result<i32> {
@@ -2408,6 +2587,7 @@ pub(crate) fn dispatch_visible_conversation(
         codex_home: &request.codex_home,
         source: &request.source,
         repository: &request.source,
+        assignment_repository: None,
         pool_size: worktree_pool_size(&config),
         max_concurrency: config.max_concurrent_executors,
         named_slot: None,
@@ -2551,6 +2731,7 @@ pub(crate) fn dispatch_visible_lead_conversation(
         codex_home: &request.codex_home,
         source: &request.source,
         repository: &request.source,
+        assignment_repository: None,
         pool_size: worktree_pool_size(&config),
         max_concurrency: config.max_concurrent_executors,
         named_slot: None,
@@ -9353,6 +9534,7 @@ mod tests {
             codex_home: &root,
             source: &root,
             repository: &root,
+            assignment_repository: None,
             pool_size: 2,
             max_concurrency: 1,
             named_slot: None,

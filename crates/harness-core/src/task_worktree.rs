@@ -2861,6 +2861,134 @@ pub fn acquire_task_for_startup(
     acquire_task_with(codex_home, source, size, task, base, is_live, Some(startup))
 }
 
+/// One repository and exact committed base in a multi-repository workspace
+/// set. The caller has already resolved and validated both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceStartupRequest<'a> {
+    pub source: &'a Path,
+    pub base: &'a str,
+}
+
+/// One acquired repository workspace, retained with its independent pool
+/// binding for the dispatch receipt and later release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupWorkspace {
+    pub repository: PathBuf,
+    pub slot: TaskSlot,
+}
+
+/// Acquire a fresh workspace for each requested repository under one startup
+/// reservation. If a later repository cannot be prepared, only the leases
+/// created by this call are handed back through the normal release rules;
+/// pre-existing work and uncertain effects are preserved.
+pub fn acquire_workspaces_for_startup(
+    codex_home: &Path,
+    size: u32,
+    owner: &str,
+    requests: &[WorkspaceStartupRequest<'_>],
+    startup: &StartupReservation,
+    is_live: &dyn Fn(&str) -> bool,
+) -> io::Result<Vec<StartupWorkspace>> {
+    let mut acquired = Vec::with_capacity(requests.len());
+    for request in requests {
+        let inventory = match task_inventory(codex_home, request.source, size) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                return Err(release_started_workspaces(
+                    codex_home, owner, acquired, is_live, error,
+                ));
+            }
+        };
+        if inventory
+            .iter()
+            .any(|slot| slot.owner.as_deref() == Some(owner) && slot.state != TaskState::Free)
+        {
+            return Err(release_started_workspaces(
+                codex_home,
+                owner,
+                acquired,
+                is_live,
+                pool_error(&format!(
+                    "workspace {} already has a recorded run for owner '{owner}'; a workspace set acquires fresh bindings only",
+                    request.source.display()
+                )),
+            ));
+        }
+        match acquire_task_for_startup(
+            codex_home,
+            request.source,
+            size,
+            owner,
+            Some(request.base),
+            startup,
+            is_live,
+        ) {
+            Ok(slot) => acquired.push(StartupWorkspace {
+                repository: request.source.to_path_buf(),
+                slot,
+            }),
+            Err(error) => {
+                return Err(release_started_workspaces(
+                    codex_home, owner, acquired, is_live, error,
+                ));
+            }
+        }
+    }
+    Ok(acquired)
+}
+
+fn release_started_workspaces(
+    codex_home: &Path,
+    owner: &str,
+    acquired: Vec<StartupWorkspace>,
+    is_live: &dyn Fn(&str) -> bool,
+    error: io::Error,
+) -> io::Error {
+    let mut notes = Vec::new();
+    for workspace in acquired.into_iter().rev() {
+        let base = workspace.slot.base.as_deref().unwrap_or_default();
+        if let Err(release) = release_startup_reservation(
+            codex_home,
+            &workspace.repository,
+            workspace.slot.index,
+            owner,
+        ) {
+            notes.push(format!(
+                "workspace {} slot {} startup reservation cleanup failed: {release}",
+                workspace.repository.display(),
+                workspace.slot.index
+            ));
+        }
+        match release_task(
+            codex_home,
+            &workspace.repository,
+            owner,
+            SlotDisposition::Discarded,
+            "workspace-set preparation did not complete before model work",
+            base,
+            workspace.slot.handle.as_deref(),
+            is_live,
+        ) {
+            Ok(LaneDisposition::Reused { .. }) => {}
+            Ok(LaneDisposition::Preserved { limitation }) => notes.push(format!(
+                "workspace {} slot {} is preserved for lead review: {limitation}",
+                workspace.repository.display(),
+                workspace.slot.index
+            )),
+            Err(release) => notes.push(format!(
+                "workspace {} slot {} could not be released: {release}",
+                workspace.repository.display(),
+                workspace.slot.index
+            )),
+        }
+    }
+    if notes.is_empty() {
+        error
+    } else {
+        io::Error::new(error.kind(), format!("{error}; {}", notes.join("; ")))
+    }
+}
+
 fn acquire_task_with(
     codex_home: &Path,
     source: &Path,

@@ -1462,6 +1462,14 @@ fn prepared_openspec_change_validates_and_returns_exact_evidence() {
         .join("openspec/changes/add-director-led-orchestration");
     copy_tree(&source_change, &target);
     let head = commit_change(&fixture.base.source, "prepare the lead change");
+    let consumer = fixture.base.source.join("consumer");
+    fs::create_dir_all(&consumer).unwrap();
+    git(&consumer, &["init", "-q"]);
+    configure(&consumer);
+    fs::write(consumer.join("README.md"), "consumer\n").unwrap();
+    git(&consumer, &["add", "README.md"]);
+    git(&consumer, &["commit", "-qm", "consumer base"]);
+    let consumer_head = git_output(&consumer, &["rev-parse", "HEAD"]);
     let issue = fixture.create_issue("Prepared Lead change", "task", None);
     let assignment = lead_assignment(
         &fixture,
@@ -1471,7 +1479,10 @@ fn prepared_openspec_change_validates_and_returns_exact_evidence() {
             "planning_root": ".",
             "base": head,
             "directory": "openspec/changes/add-director-led-orchestration",
-            "repositories": [{"path": ".", "base": head}],
+            "repositories": [
+                {"path": ".", "base": head},
+                {"path": "consumer", "base": consumer_head}
+            ],
         }),
     );
     let status_before = git_output(
@@ -1492,10 +1503,16 @@ fn prepared_openspec_change_validates_and_returns_exact_evidence() {
     assert_eq!(evidence.board_task, issue);
     assert_eq!(
         evidence.repositories,
-        vec![executor_assignment::LeadRepositoryEvidence {
-            path: ".".to_owned(),
-            base: head.clone(),
-        }]
+        vec![
+            executor_assignment::LeadRepositoryEvidence {
+                path: ".".to_owned(),
+                base: head.clone(),
+            },
+            executor_assignment::LeadRepositoryEvidence {
+                path: "consumer".to_owned(),
+                base: consumer_head,
+            }
+        ]
     );
     for artifact in [
         "proposal.md",

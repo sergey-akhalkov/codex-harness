@@ -1694,6 +1694,129 @@ fn target_repository_stands_alone_from_the_configuration_source() {
 }
 
 #[test]
+fn workspace_set_acquires_independent_repositories_at_exact_bases() {
+    let fixture = Fixture::new("workspace-set", 1, 8);
+    let app = fixture.consumer("app");
+    let web = fixture.consumer("web");
+    fs::write(app.join("app.txt"), "app base\n").unwrap();
+    git(&app, &["add", "app.txt"]);
+    git(&app, &["commit", "-qm", "app base"]);
+    fs::write(web.join("web.txt"), "web base\n").unwrap();
+    git(&web, &["add", "web.txt"]);
+    git(&web, &["commit", "-qm", "web base"]);
+    let app_base = git_output(&app, &["rev-parse", "HEAD"]);
+    let web_base = git_output(&web, &["rev-parse", "HEAD"]);
+    let startup = harness_core::task_worktree::current_startup_reservation().unwrap();
+    let requests = [
+        harness_core::task_worktree::WorkspaceStartupRequest {
+            source: &app,
+            base: &app_base,
+        },
+        harness_core::task_worktree::WorkspaceStartupRequest {
+            source: &web,
+            base: &web_base,
+        },
+    ];
+
+    let acquired = harness_core::task_worktree::acquire_workspaces_for_startup(
+        &fixture.home,
+        1,
+        "lead-workspace-set",
+        &requests,
+        &startup,
+        &|_| false,
+    )
+    .unwrap();
+
+    assert_eq!(acquired.len(), 2);
+    assert_eq!(acquired[0].repository, app);
+    assert_eq!(acquired[1].repository, web);
+    assert_eq!(acquired[0].slot.path, fixture.root.join("app-wt1"));
+    assert_eq!(acquired[1].slot.path, fixture.root.join("web-wt1"));
+    assert_ne!(acquired[0].slot.path, acquired[1].slot.path);
+    assert_eq!(
+        git_output(&acquired[0].slot.path, &["rev-parse", "HEAD"]),
+        app_base
+    );
+    assert_eq!(
+        git_output(&acquired[1].slot.path, &["rev-parse", "HEAD"]),
+        web_base
+    );
+    for (repository, base, slot) in [
+        (&app, &app_base, &acquired[0].slot.path),
+        (&web, &web_base, &acquired[1].slot.path),
+    ] {
+        let record = fixture.record(repository, 1);
+        assert_eq!(record["owner"], "lead-workspace-set");
+        assert_eq!(record["task"], "lead-workspace-set");
+        assert_eq!(record["base"], base.as_str());
+        assert_eq!(record["path"], slot.to_string_lossy().as_ref());
+    }
+    fixture.drop();
+}
+
+#[test]
+fn workspace_set_failure_releases_only_its_new_workspace() {
+    let fixture = Fixture::new("workspace-set-failure", 1, 8);
+    let app = fixture.consumer("app");
+    let web = fixture.consumer("web");
+    let app_base = git_output(&app, &["rev-parse", "HEAD"]);
+    let web_base = git_output(&web, &["rev-parse", "HEAD"]);
+    harness_core::task_worktree::acquire_task(
+        &fixture.home,
+        &web,
+        1,
+        "prior-review",
+        Some(&web_base),
+        &|_| false,
+    )
+    .unwrap();
+    let preserved = fixture.root.join("web-wt1/keep.txt");
+    fs::write(&preserved, "reviewed work\n").unwrap();
+    let startup = harness_core::task_worktree::current_startup_reservation().unwrap();
+    let requests = [
+        harness_core::task_worktree::WorkspaceStartupRequest {
+            source: &app,
+            base: &app_base,
+        },
+        harness_core::task_worktree::WorkspaceStartupRequest {
+            source: &web,
+            base: &web_base,
+        },
+    ];
+
+    let error = harness_core::task_worktree::acquire_workspaces_for_startup(
+        &fixture.home,
+        1,
+        "lead-workspace-set",
+        &requests,
+        &startup,
+        &|_| false,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("no free slot"), "{error}");
+    let app_inventory =
+        harness_core::task_worktree::task_inventory(&fixture.home, &app, 1).unwrap();
+    assert_eq!(app_inventory.len(), 1);
+    assert_eq!(
+        app_inventory[0].state,
+        harness_core::task_worktree::TaskState::Free
+    );
+    assert_eq!(app_inventory[0].owner, None);
+    let web_record = fixture.record(&web, 1);
+    assert_eq!(web_record["owner"], "prior-review");
+    assert_eq!(web_record["task"], "prior-review");
+    assert_eq!(web_record["base"], web_base.as_str());
+    assert!(
+        preserved.is_file(),
+        "pre-existing work must survive cleanup"
+    );
+    fixture.drop();
+}
+
+#[test]
 fn stale_generations_and_superseded_releases_are_refused() {
     let fixture = Fixture::new("stale", 2, 8);
     succeeded(fixture.worktree(&["acquire", "--task", "t1"]));

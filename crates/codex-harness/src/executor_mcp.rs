@@ -1845,14 +1845,20 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
             ));
         }
     };
-    let startup_release = task_worktree::release_startup_reservation(
-        &codex_home,
-        &prepared.repository,
-        prepared.slot,
-        &prepared.owner,
-    )
-    .err()
-    .map(|error| error.to_string());
+    let startup_release = prepared.release_startup_reservations();
+    let workspace_receipt: Vec<Value> = prepared
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            json!({
+                "repository": workspace.repository,
+                "slot": workspace.slot,
+                "checkout": workspace.checkout,
+                "base": workspace.base,
+                "owner": workspace.owner
+            })
+        })
+        .collect();
     let receipt = json!({
         "schema": 1,
         "run": prepared.owner,
@@ -1868,6 +1874,8 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
         "leadChange": prepared.lead_change,
         "prompt": prepared.prompt,
         "title": prepared.title,
+        "workspaces": workspace_receipt,
+        "primaryCwd": prepared.checkout,
         "slot": prepared.slot,
         "source": prepared.source,
         "repository": prepared.repository,
@@ -1884,7 +1892,7 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
             "roleArgs": prepared.role_args,
             "profileOverrides": prepared.profile_overrides
         },
-        "startupReservationReleased": startup_release.is_none(),
+        "startupReservationReleased": startup_release.is_empty(),
         "lease": {
             "slot": prepared.slot,
             "owner": prepared.owner,
@@ -1902,8 +1910,8 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     if let Some(error) = receipt_error {
         result["receiptError"] = json!(error);
     }
-    if let Some(error) = startup_release {
-        result["startupReleaseError"] = json!(error);
+    if !startup_release.is_empty() {
+        result["startupReleaseError"] = json!(startup_release.join("; "));
     }
     let request_update = if result["receiptError"].is_null() {
         update_request(
