@@ -424,6 +424,11 @@ contention. An uncertain process identity preserves the reservation until its
 owner is resolved. A failed launch keeps its original error, and only a
 confirmed-dead, clean unused reservation can be recovered automatically.
 
+`executor_release` refuses a delegated Lead while any child run under it is
+unreleased, naming the remaining runs. Review and release each child through its
+own parent first, then release the Lead workspace. Acceptance, completion or a
+stopped parent never authorizes resetting a child's workspace.
+
 Ordinary tasks use the same pool without a conversation:
 
 ```powershell
@@ -524,20 +529,28 @@ unanswered request keeps the thread, slot, worktree and partial work live; it is
 not completion or a reason to resume. The executor continues independent work
 and does not poll.
 
-`executor_stop` interrupts only the exact executor thread and its recorded
-background commands. It preserves files, checkout, slot and partial work and
-reports whether containment is complete; no shared app-server or sibling
-conversation is targeted. Stop only for explicit cancellation or a concrete
+`executor_stop` interrupts only the addressed run and its recorded background
+commands. For a delegated Lead it stops the verified subtree: it closes new
+child admission, interrupts the Lead and its recorded Executors, reconciles
+uncertain starts, and leaves sibling teams and direct Executors running. It
+preserves every affected checkout, slot and partial result and reports whether
+containment is complete. Stop only for explicit cancellation or a concrete
 necessity: demonstrated wrong direction, inability to progress, or a resource
 conflict the executor cannot resolve. Waiting, silence, slowness and timeout are
-not causes.
+not causes. A stopped Lead subtree remains preserved when capacity returns;
+stop never restarts it, releases its slots or authorizes a replacement dispatch.
 
 `executor_resume mode=exact` continues that same thread with the preserved
 assignment and bounded progress; it does not resubmit the assignment, reset the
-slot or repeat completed work blindly. `mode=fresh` starts one new bound thread,
-retains the predecessor and requires inspecting interrupted effects first. A
-stopped run is never restarted automatically. Release remains an explicit lead
-acceptance/discard decision, not a consequence of stop or completion.
+slot or repeat completed work blindly. It also clears a stopped Lead subtree
+only through that explicit continuation; recorded children are not restarted.
+`mode=fresh` starts one new bound thread, retains the predecessor, restores the
+recorded role, parent, workspace set and profile binding, and requires
+inspecting interrupted effects first; a fresh Lead successor reattaches
+surviving children without duplicating them. Partial containment refuses
+continuation until the owned work is verified gone or preserved for inspection.
+A stopped run is never restarted automatically, and capacity recovery alone
+never justifies a duplicate dispatch.
 
 ## Idempotent dispatch and admission
 

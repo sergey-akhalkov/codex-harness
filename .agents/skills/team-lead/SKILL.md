@@ -268,9 +268,12 @@ is not a lifecycle event.
 Stop a run with `executor_stop` only for an explicit cancellation request or a
 concrete necessity such as a demonstrated wrong direction or a run that cannot
 progress: a brief error, a slow stream, waiting or silence alone is not a reason
-to stop. It interrupts only that native thread and preserves files, checkout,
-slot and partial work. If containment is partial, preserve the run and use the
-reported cause rather than starting parallel work in its checkout.
+to stop. On a delegated Lead it closes that subtree: the Lead and its recorded
+Executors are interrupted, new child dispatch is refused, and sibling teams and
+direct Executors keep running. It preserves files, checkout, slot and partial
+work. If containment is partial, preserve the run and use the reported cause
+rather than starting parallel work in its checkout. A stopped subtree stays
+preserved when capacity returns; nothing restarts it or frees its slots.
 
 An ordinary interruption continues with `executor_resume mode=exact`: the same
 thread keeps its prior turns and the preserved assignment is not resubmitted.
@@ -278,7 +281,10 @@ For a cache-loss stop or a missing exact pre-turn history, inspect the preserved
 work and use `executor_resume mode=fresh`; it starts one new bound thread,
 retains the predecessor and requires checking interrupted tests, builds and
 other effects before reuse. Supply only bounded `progress` (at most 4096 bytes)
-the new thread cannot infer; an explicit stop is never resumed automatically.
+the new thread cannot infer. Resuming a Lead is the explicit continuation that
+clears its subtree stop; children are not restarted, and a fresh successor
+reattaches surviving children without duplicate dispatch. An explicit stop is
+never resumed automatically, and capacity recovery is not a resume request.
 Recovery policy is in
 [agent delegation](../../../docs/agent-delegation.md#provider-neutral-cache-loss-protection-and-recovery).
 
@@ -353,7 +359,9 @@ refuses a Lead block while a non-feedback child remains unfinished, and it never
 closes the OpenSpec change automatically. Acceptance, result receipt, board
 closure and worktree release stay distinct. A workspace is released only by a
 separate reviewed disposition after no descendant still needs it; an active
-assignment using the same workspace preserves it.
+assignment using the same workspace preserves it. `executor_release` refuses a
+Lead workspace while any child run under it is unreleased: review and release
+the children first. Acceptance does not release the accepted workspace.
 
 Executor slots are pool-owned, not task-owned: the pool never grows past
 `worktree_pool_size`, and slots are reused while conversations are not. MCP
@@ -390,7 +398,9 @@ One active lead. Reconcile surviving workers before replacement with
 not presumed complete, and its slot or partial work is not reclaimed by inference.
 Quota and transport failures stay classified from retained evidence. Succession
 uses the configured successor profile at a safe boundary. Do not purchase
-capacity or retry models infinitely.
+capacity or retry models infinitely. Recovery never silently substitutes a
+model, restarts a stopped subtree, duplicates a dispatch or treats release as
+acceptance.
 
 Policy (do not copy it here): [portable principles](../../../global/principles-of-work.md)
 and [agent delegation](../../../docs/agent-delegation.md).
