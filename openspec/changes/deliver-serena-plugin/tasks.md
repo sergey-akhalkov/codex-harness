@@ -1,0 +1,38 @@
+# Tasks
+
+Planning only: no implementation task below has been performed. Follow [design.md](design.md) and the four capability deltas; preserve the existing language, resource and recovery acceptance referenced there.
+
+## 1. First usable independent plugin
+
+- [ ] 1.1 Add the source-owned Serena package under `.agents/plugins/serena/` and a producer-built release tree using the existing native build/marketplace owners. Verify native installation, package-relative execution, declared supported CLI version and binary/resource provenance in an owned Codex home without core, a harness PATH entry or access to the source checkout; do not accept a manifest-only or manually unpacked substitute.
+- [ ] 1.2 Adapt the native entry/configuration boundary in `crates/codex-harness/src/mcp_cli.rs` and `crates/harness-core/src/mcp_preparation.rs` to packaged resources and explicit host state. Verify status and preparation remain callable with Python, Serena and language backends absent, using a meaningful failure-path test and the installed package.
+- [ ] 1.3 Complete the missing explicit preparation path for the selected provisionable Python/Serena prerequisites through `crates/harness-core/src/dependency_discovery.rs`, `dependency_plan.rs`, `dependency_apply.rs` and their staging owners, including the held BasedPyright path where needed. Verify clean preparation, compatible shared-package reuse, an acquisition/verification failure and an interrupted operation without a manual package-manager sequence or unrelated package changes.
+- [ ] 1.4 Package the setup/check/recovery guidance and run the first end-to-end path: native plugin installation, a user-level preparation request, actual tool discovery and a Python symbol/reference/edit/readback in an outside owned project. Verify no compiler was needed solely for harness and record any native catalogue refresh requirement. Update the applicable first-use section in `docs/code-tools.md` with the exercised path.
+
+## 2. Preserve semantic behavior and ordinary project use
+
+- [ ] 2.1 Route the packaged connection through the existing Serena stdio/broker/configuration owners and generate its portable selection from `global/code-tools.json` and `global/tool-resources.json`. Verify the real tool catalogue and startup guidance, selected exclusions, explicit diagnostic limits, absence of automatic checks, and absence of Nuphus acquisition in plugin setup.
+- [ ] 2.2 Exercise real Rust and Python operations through `crates/harness-core/src/serena_acceptance.rs` and the installed package with their applicable project prerequisites. Verify navigation, cross-file references, an owned semantic edit/readback and a broken-backend failure; keep the ordinary-use and prerequisite guidance in `docs/code-tools.md` accurate.
+- [ ] 2.3 Preserve reuse-only C++, C# and Pascal adoption and existing project-input behavior. Verify available supported backends with actual semantic operations, plus missing/ambiguous prerequisite results that leave ready languages usable; record any unavailable mandatory acceptance explicitly rather than changing the language contract.
+- [ ] 2.4 Reuse existing project routing, resource admission, lifetime and recovery code. Extend the relevant tests in `crates/codex-harness/tests/serena_stdio.rs` and existing resource/lifecycle owners to exercise two projects, one client's exit, idle-worker return, request identity, bounded transient recovery and non-replayed edits through the packaged entry point.
+- [ ] 2.5 Verify repeated setup, read-only Check and ordinary fresh/resumed/child consumers preserve prepared state and perform no downloads, upgrades, source builds or project-configuration rewrites. Add the relevant regression checks beside the existing dependency and Serena tests, and document only observed native consumer coverage.
+
+## 3. Package update, retained generations and removal
+
+- [ ] 3.1 Place mutable dependency/ownership/recovery state outside replaceable package contents using the existing lifecycle owners. Verify package replacement preserves host state, integrity failures remain actionable, and no machine-specific paths or credentials enter the produced release tree.
+- [ ] 3.2 Adapt existing runtime-generation retention for native plugin update/removal. Verify an open session and later broker restart retain the original verified runtime/resources and project while a fresh session uses the new package; exercise actual native cache replacement and Windows file-lock behavior.
+- [ ] 3.3 Verify explicit update and interrupted dependency activation preserve or restore the prior usable state, expose the original failure and retain a bounded recovery action. Include shared-consumer contention and preservation using the existing dependency recovery tests, without introducing a separate transaction framework.
+- [ ] 3.4 Verify native disable/remove stops discovery for new consumers while preserving user projects, adopted packages, foreign settings and active unrelated services. Document update/recovery/removal in the existing `docs/code-tools.md` owner and exercise the documented operations, including retained inactive state.
+
+## 4. Migrate the existing harness connection
+
+- [ ] 4.1 Extend the existing owned registration/activation route in `crates/harness-core/src/mcp_registration.rs` and `code_tools_lifecycle.rs` to cut over only legacy Serena after candidate semantic verification. Verify one selected provider in a fresh native consumer, rollback after interruption and refusal of a foreign edited registration.
+- [ ] 4.2 Make existing core/code-tools install/update/check/recover/disconnect respect the migrated plugin owner. Verify they neither recreate duplicate Serena registrations nor remove the independent plugin unexpectedly; preserve Nuphus registration, package state and a representative actual operation, plus executors and unrelated settings.
+- [ ] 4.3 Update `docs/installation.md`, `docs/code-tools.md` and the delivery decisions in `docs/project-decisions.md` to distinguish released Serena consumption from explicit checkout development. Verify the documented independent and legacy-migration paths, local links and factual version/coverage claims; leave external OpenSpec workflow files unchanged.
+
+## 5. Release and integrated acceptance
+
+- [ ] 5.1 Connect the verified release tree to the existing marketplace's supported distribution route and producer automation. Verify the delivered artifact is the tested prebuilt package, includes required data and dependency attribution, contains no private machine state, and can be installed through native Codex without a source checkout or manual extraction.
+- [ ] 5.2 Run the affected native/ownership checks and real Serena integration CI through the packaged path, retaining existing success/failure assertions. Verify errors are not skipped because prerequisites are missing and document the exact package/backend identities and unexercised conditions in existing verification owners.
+- [ ] 5.3 Complete clean Windows consumer acceptance outside this checkout: install without harness core/launcher/build prerequisites, explicit preparation, real Python use, Rust use with its project toolchain, repeat, update with an open session, recovery and removal. Verify fresh native Codex discovery and tool use; distinguish a real second-PC result from isolated-home or fixture evidence.
+- [ ] 5.4 Reconcile the full plugin and delta acceptance with actual results and run strict OpenSpec validation. Close only tasks whose implementation and checks are complete; preserve any remaining consumer or conditional-language evidence gap without marking delivery complete.
