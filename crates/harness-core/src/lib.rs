@@ -118,6 +118,7 @@ pub mod serena_acceptance;
 pub mod serena_broker;
 pub mod serena_configuration;
 pub mod serena_route;
+pub mod serena_setup;
 pub mod serena_shared;
 pub mod serena_stdio;
 pub mod source_observation;
