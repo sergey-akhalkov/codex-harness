@@ -65,6 +65,7 @@ pub struct RoleState {
 fn role_states(source: &Path) -> Vec<RoleState> {
     [
         Role::Lead,
+        Role::DelegatedLead,
         Role::Executor,
         Role::ExecutorSelfReflection,
         Role::LeadSelfReflection,
@@ -501,6 +502,10 @@ mod tests {
             ),
             ("global/instructions.md", "Fixture common safeguards"),
             ("global/lead.md", "Fixture lead responsibility"),
+            (
+                "global/delegated-lead.md",
+                "Fixture delegated lead responsibility",
+            ),
             ("global/executor.md", "Fixture executor responsibility"),
             (
                 "global/executor-reflection.md",
@@ -520,7 +525,7 @@ mod tests {
             ),
             (
                 "global/roles.toml",
-                "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n[roles.executor-self-reflection]\ninstructions = 'global/executor-reflection.md'\nskills = []\n[roles.lead-self-reflection]\ninstructions = 'global/lead-reflection.md'\nskills = []\n",
+                "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.delegated-lead]\ninstructions = 'global/delegated-lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n[roles.executor-self-reflection]\ninstructions = 'global/executor-reflection.md'\nskills = []\n[roles.lead-self-reflection]\ninstructions = 'global/lead-reflection.md'\nskills = []\n",
             ),
         ] {
             fs::write(source.join(path), body).unwrap();
@@ -544,6 +549,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("lead", "gap"),
+                ("delegated-lead", "gap"),
                 ("executor", "gap"),
                 ("executor-self-reflection", "gap"),
                 ("lead-self-reflection", "gap"),
@@ -570,6 +576,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("lead", "resolved"),
+                ("delegated-lead", "resolved"),
                 ("executor", "resolved"),
                 ("executor-self-reflection", "resolved"),
                 ("lead-self-reflection", "resolved"),

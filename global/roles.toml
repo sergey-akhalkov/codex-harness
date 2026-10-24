@@ -32,6 +32,10 @@ skills = [
   "team-lead",
 ]
 
+[roles.delegated-lead]
+instructions = "global/roles/delegated-lead.md"
+skills = []
+
 [roles.executor]
 instructions = "global/roles/executor.md"
 skills = []

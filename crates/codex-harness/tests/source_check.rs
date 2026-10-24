@@ -181,9 +181,13 @@ skills = ["lead-only"]
 [roles.executor]
 instructions = "global/roles/executor.md"
 skills = []
+[roles.delegated-lead]
+instructions = "global/roles/delegated-lead.md"
+skills = []
 "#,
     );
     f.write("global/roles/lead.md", "# Lead\n");
+    f.write("global/roles/delegated-lead.md", "# Delegated lead\n");
     f.write("global/roles/executor.md", "# Executor\n");
     f.write(
         "fixture-skills/fixture-skill/SKILL.md",
@@ -432,7 +436,7 @@ fn accounting_counts_links_across_invoked_bodies_once() {
     let f = kit_fixture();
     f.write(
         "global/roles.toml",
-        "schema = 1\nshared_skills = [\"fixture-skill\", \"other-skill\"]\n[roles.lead]\ninstructions = \"global/roles/lead.md\"\nskills = [\"lead-only\"]\n[roles.executor]\ninstructions = \"global/roles/executor.md\"\nskills = []\n",
+        "schema = 1\nshared_skills = [\"fixture-skill\", \"other-skill\"]\n[roles.lead]\ninstructions = \"global/roles/lead.md\"\nskills = [\"lead-only\"]\n[roles.delegated-lead]\ninstructions = \"global/roles/delegated-lead.md\"\nskills = []\n[roles.executor]\ninstructions = \"global/roles/executor.md\"\nskills = []\n",
     );
     f.write(
         "fixture-skills/fixture-skill/SKILL.md",

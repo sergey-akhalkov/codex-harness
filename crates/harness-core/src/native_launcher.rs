@@ -433,6 +433,20 @@ pub fn role_launch(
     })
 }
 
+/// The responsibility role a managed native invocation composes. The inherited
+/// executor marker stays authoritative; otherwise a named delegated Lead keeps
+/// its bounded role instead of falling back to the root Lead.
+fn context_role(executor_session: bool, named: Option<&str>) -> crate::role_context::Role {
+    use crate::role_context::Role;
+    if executor_session || named == Some(Role::Executor.label()) {
+        Role::Executor
+    } else if named == Some(Role::DelegatedLead.label()) {
+        Role::DelegatedLead
+    } else {
+        Role::Lead
+    }
+}
+
 /// Registration is produced by explicit installation. Ordinary launch performs
 /// no discovery, compilation, package acquisition or registration mutation.
 fn prepared_command(
@@ -583,11 +597,10 @@ fn prepared_command(
         };
         report_native_worktree_conflict(cli_worktrees, conflict);
         let record = build_identity::read_record(&selected)?;
-        let role = if env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some() {
-            crate::role_context::Role::Executor
-        } else {
-            crate::role_context::Role::Lead
-        };
+        let role = context_role(
+            env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some(),
+            env::var("HARNESS_CONTEXT_ROLE").ok().as_deref(),
+        );
         let resolved = crate::role_context::resolve(&record.source_root, role)?;
         let session = crate::portable_config::context_overrides(&context.overrides)?;
         let retained = crate::portable_config::retained_role_config(
@@ -3443,6 +3456,10 @@ mod tests {
             for (path, body) in [
                 ("global/instructions.md", "Common fixture safeguards"),
                 ("global/lead.md", "Fixture lead responsibility"),
+                (
+                    "global/delegated-lead.md",
+                    "Fixture delegated lead responsibility",
+                ),
                 ("global/executor.md", "Fixture executor responsibility"),
                 (
                     "skills/one/SKILL.md",
@@ -3450,7 +3467,7 @@ mod tests {
                 ),
                 (
                     "global/roles.toml",
-                    "schema = 1\nshared_skills = ['one']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n",
+                    "schema = 1\nshared_skills = ['one']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = []\n[roles.delegated-lead]\ninstructions = 'global/delegated-lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n",
                 ),
             ] {
                 fs::write(source.join(path), body).unwrap();
@@ -3529,8 +3546,10 @@ mod tests {
         // session marker, so the expected role text follows whichever role
         // this test process runs as. The marker is process-global state
         // shared with concurrently running tests: never mutate it here.
-        let executor_session =
-            std::env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some();
+        let expected = context_role(
+            std::env::var_os(crate::orchestration_config::EXECUTOR_SESSION_ENV).is_some(),
+            std::env::var("HARNESS_CONTEXT_ROLE").ok().as_deref(),
+        );
         let fixture = Fixture::new();
         fs::write(fixture.home.join("custom.config.toml"),
             "model = 'gpt-6-astra'\nmodel_reasoning_effort = 'high'\ndeveloper_instructions = 'Profile guidance'\n").unwrap();
@@ -3552,23 +3571,27 @@ mod tests {
             .unwrap();
         let effective = crate::portable_config::context_overrides(&context.overrides).unwrap();
         let developer = effective["developer_instructions"].as_str().unwrap();
-        let (expected_role, other_role) = if executor_session {
-            (
-                "Fixture executor responsibility",
-                "Fixture lead responsibility",
-            )
-        } else {
-            (
-                "Fixture lead responsibility",
-                "Fixture executor responsibility",
-            )
+        let responsibility = |role| match role {
+            crate::role_context::Role::Lead => "Fixture lead responsibility",
+            crate::role_context::Role::DelegatedLead => "Fixture delegated lead responsibility",
+            crate::role_context::Role::Executor => "Fixture executor responsibility",
+            _ => unreachable!("ordinary context role"),
         };
+        let expected_role = responsibility(expected);
         assert!(
             developer.contains(expected_role),
             "composed developer instructions: {developer:?}; composed argv: {actual:?}"
         );
         assert!(developer.contains("Session guidance"), "{developer:?}");
-        assert!(!developer.contains(other_role));
+        for other in [
+            crate::role_context::Role::Lead,
+            crate::role_context::Role::DelegatedLead,
+            crate::role_context::Role::Executor,
+        ] {
+            if other != expected {
+                assert!(!developer.contains(responsibility(other)));
+            }
+        }
         assert!(!developer.contains("Profile guidance"));
         assert_eq!(context.profile.as_deref(), Some("custom"));
         assert!(!effective.contains_key("model"));
@@ -3577,6 +3600,26 @@ mod tests {
         let error = command(&fixture.launcher, &fixture.home, &args).unwrap_err();
         assert!(error.to_string().contains("global/executor.md"), "{error}");
         assert!(command(&fixture.launcher, &fixture.home, &["--help".into()]).is_ok());
+    }
+
+    #[test]
+    fn delegated_lead_context_is_not_composed_as_the_root_role() {
+        use crate::role_context::Role;
+        assert_eq!(context_role(false, None), Role::Lead);
+        assert_eq!(context_role(false, Some(Role::Lead.label())), Role::Lead);
+        assert_eq!(
+            context_role(false, Some(Role::DelegatedLead.label())),
+            Role::DelegatedLead
+        );
+        assert_eq!(
+            context_role(false, Some(Role::Executor.label())),
+            Role::Executor
+        );
+        // The inherited executor marker remains authoritative.
+        assert_eq!(
+            context_role(true, Some(Role::DelegatedLead.label())),
+            Role::Executor
+        );
     }
 
     /// The managed `role_launch` and the ordinary launcher share one resolver:
@@ -3604,9 +3647,19 @@ mod tests {
             crate::role_context::Role::Executor,
         )
         .unwrap();
+        let delegated = role_launch(
+            &fixture.home,
+            &cwd,
+            None,
+            &toml::Table::new(),
+            crate::role_context::Role::DelegatedLead,
+        )
+        .unwrap();
         assert_eq!(lead.role, crate::role_context::Role::Lead);
+        assert_eq!(delegated.role, crate::role_context::Role::DelegatedLead);
         assert_eq!(executor.role, crate::role_context::Role::Executor);
         assert_ne!(lead.revision, executor.revision);
+        assert_ne!(lead.revision, delegated.revision);
         assert_eq!(
             lead.revision,
             role_launch(
@@ -3638,6 +3691,17 @@ mod tests {
             !executor_text.contains("Fixture lead responsibility"),
             "{executor_text}"
         );
+        let delegated_text = effective_developer(&delegated.args, &cwd);
+        assert!(
+            delegated_text.contains("Fixture delegated lead responsibility"),
+            "{delegated_text}"
+        );
+        for other in [
+            "Fixture lead responsibility",
+            "Fixture executor responsibility",
+        ] {
+            assert!(!delegated_text.contains(other), "{delegated_text}");
+        }
         fs::write(
             fixture.root.join("source/global/executor.md"),
             "Changed executor responsibility",

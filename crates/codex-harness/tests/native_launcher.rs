@@ -709,6 +709,11 @@ fn write_role_sources(f: &Fixture) {
     fs::write(f.source.join("AGENTS.md"), "fixture common guidance").unwrap();
     fs::write(f.source.join("global/roles/lead.md"), "lead role guidance").unwrap();
     fs::write(
+        f.source.join("global/roles/delegated-lead.md"),
+        "delegated lead role guidance",
+    )
+    .unwrap();
+    fs::write(
         f.source.join("global/roles/executor.md"),
         "executor role guidance",
     )
@@ -720,6 +725,9 @@ fn write_role_sources(f: &Fixture) {
             "shared_skills = []\n",
             "[roles.lead]\n",
             "instructions = \"global/roles/lead.md\"\n",
+            "skills = []\n",
+            "[roles.delegated-lead]\n",
+            "instructions = \"global/roles/delegated-lead.md\"\n",
             "skills = []\n",
             "[roles.executor]\n",
             "instructions = \"global/roles/executor.md\"\n",

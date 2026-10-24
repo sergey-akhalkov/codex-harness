@@ -2899,7 +2899,7 @@ fn catalogue_role_profile_keeps_the_selected_profiles_context_and_disablement() 
         String::from_utf8_lossy(&without_role.stderr)
     );
     assert!(
-        without_role_text.contains("pass --role lead|executor"),
+        without_role_text.contains("pass --role lead|delegated-lead|executor"),
         "profile context without a role refuses instead of guessing one: {without_role_text}"
     );
 

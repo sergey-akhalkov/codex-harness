@@ -700,7 +700,9 @@ fn admit_stage(
     let declaration = match role {
         Role::ExecutorSelfReflection => &chain.executor_stage,
         Role::LeadSelfReflection => &chain.lead_stage,
-        _ => return Err(invalid("only reflection roles can claim stage admission")),
+        Role::Lead | Role::DelegatedLead | Role::Executor => {
+            return Err(invalid("only reflection roles can claim stage admission"));
+        }
     };
     let config = orchestration_config::load(&chain.source)?;
     gate::ReflectionGate::from_config(&chain.source, &config).ensure_enabled()?;
@@ -1251,7 +1253,7 @@ fn native_reflection_title(role: Role, binding: &ProfileBinding, run: &str) -> S
     let role = match role {
         Role::ExecutorSelfReflection => "ERefl",
         Role::LeadSelfReflection => "LRefl",
-        Role::Lead | Role::Executor => "Refl",
+        Role::Lead | Role::DelegatedLead | Role::Executor => "Refl",
     };
     let profile = title_component(&binding.profile, 8);
     let provider = title_component(binding.model_provider.as_deref().unwrap_or("unbound"), 8);

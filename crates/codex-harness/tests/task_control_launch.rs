@@ -489,7 +489,7 @@ fn native_entry(case: EntryCase) {
     .unwrap();
     fs::write(
         source.join("global/roles.toml"),
-        "schema = 1\nshared_skills = []\n[roles.lead]\ninstructions = 'global/roles/lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/roles/executor.md'\nskills = []\n",
+        "schema = 1\nshared_skills = []\n[roles.lead]\ninstructions = 'global/roles/lead.md'\nskills = []\n[roles.delegated-lead]\ninstructions = 'global/roles/delegated-lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/roles/executor.md'\nskills = []\n",
     )
     .unwrap();
     fs::write(
@@ -497,6 +497,11 @@ fn native_entry(case: EntryCase) {
         format!(
             "# Lead responsibility\n\n{CONTROL_LEAD_ROLE_MARKER}: preserve the task, its constraints and acceptance.\n"
         ),
+    )
+    .unwrap();
+    fs::write(
+        source.join("global/roles/delegated-lead.md"),
+        "# Delegated Lead responsibility\n\nOwn the assigned change and report to the Director.\n",
     )
     .unwrap();
     fs::write(

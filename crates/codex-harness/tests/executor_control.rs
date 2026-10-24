@@ -3799,7 +3799,12 @@ impl ManagedLead {
         git(&self.source, &["config", "user.name", "Fixture"]);
         fs::write(
             self.source.join("global/roles.toml"),
-            "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n[roles.executor-self-reflection]\ninstructions = 'global/executor-reflection.md'\nskills = []\n[roles.lead-self-reflection]\ninstructions = 'global/lead-reflection.md'\nskills = []\n",
+            "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.delegated-lead]\ninstructions = 'global/delegated-lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n[roles.executor-self-reflection]\ninstructions = 'global/executor-reflection.md'\nskills = []\n[roles.lead-self-reflection]\ninstructions = 'global/lead-reflection.md'\nskills = []\n",
+        )
+        .unwrap();
+        fs::write(
+            self.source.join("global/delegated-lead.md"),
+            "Fixture delegated lead responsibility",
         )
         .unwrap();
         fs::write(

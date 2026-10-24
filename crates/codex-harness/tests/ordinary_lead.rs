@@ -1565,6 +1565,10 @@ fn installed_child_path(bd: &Path) -> OsString {
 fn installed_write_roles(project: &Path) {
     for (path, body) in [
         (
+            "global/delegated-lead.md",
+            "Fixture delegated lead responsibility",
+        ),
+        (
             "global/executor-self-reflection.md",
             "Fixture executor reflection responsibility",
         ),
@@ -1586,6 +1590,10 @@ skills = ["coordinate"]
 
 [roles.executor]
 instructions = "global/executor.md"
+skills = []
+
+[roles.delegated-lead]
+instructions = "global/delegated-lead.md"
 skills = []
 
 [roles.executor-self-reflection]

@@ -55,6 +55,10 @@ pub fn kit_source(root: &Path) -> PathBuf {
     for (path, body) in [
         ("global/instructions.md", "Common fixture safeguards"),
         ("global/lead.md", "Fixture lead responsibility"),
+        (
+            "global/delegated-lead.md",
+            "Fixture delegated lead responsibility",
+        ),
         ("global/executor.md", "Fixture executor responsibility"),
         (
             "skills/shared/SKILL.md",
@@ -66,7 +70,7 @@ pub fn kit_source(root: &Path) -> PathBuf {
         ),
         (
             "global/roles.toml",
-            "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n",
+            "schema = 1\nshared_skills = ['shared']\n[roles.lead]\ninstructions = 'global/lead.md'\nskills = ['coordinate']\n[roles.delegated-lead]\ninstructions = 'global/delegated-lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/executor.md'\nskills = []\n",
         ),
     ] {
         fs::write(source.join(path), body).unwrap();

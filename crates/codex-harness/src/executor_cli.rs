@@ -1233,6 +1233,11 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
     let spawn_hint = match role {
         Role::Executor => "codex-harness executor spawn",
         Role::Lead => "codex-harness lead dispatch",
+        Role::DelegatedLead => {
+            return Err(invalid(
+                "delegated Lead dispatch is owned by the Director; no root or executor continuation is substituted",
+            ));
+        }
         Role::ExecutorSelfReflection | Role::LeadSelfReflection => {
             return Err(invalid(
                 "reflection roles are not dispatch continuations; use `codex-harness self-reflection`",
@@ -1394,6 +1399,11 @@ fn continue_slot(args: &[OsString], fresh: bool, role: Role) -> io::Result<i32> 
                 ));
             }
             config.lead_profile.clone()
+        }
+        Role::DelegatedLead => {
+            return Err(invalid(
+                "delegated Lead continuation is owned by the Director; no root or executor profile is substituted",
+            ));
         }
         Role::ExecutorSelfReflection | Role::LeadSelfReflection => {
             return Err(invalid(
@@ -3386,6 +3396,9 @@ fn resolve_prompt(request: &Dispatch, binding: &SlotBinding) -> io::Result<Strin
             match request.role {
                 Role::Executor => executor_assignment::brief(&effective, &context),
                 Role::Lead => executor_assignment::lead_brief(&effective, &context),
+                Role::DelegatedLead => Err(invalid(
+                    "delegated Lead structured assignments are owned by the Director dispatch path; no root Lead or Executor brief is substituted",
+                )),
                 Role::ExecutorSelfReflection | Role::LeadSelfReflection => Err(invalid(
                     "reflection roles are not executor or lead dispatches",
                 )),
@@ -3789,6 +3802,10 @@ fn role_title(role: Role, profile: &str, owner: &str) -> String {
     match role {
         Role::Executor => executor_title(profile, owner),
         Role::Lead => lead_dispatch_title(profile, owner),
+        Role::DelegatedLead => bounded_owner_title(
+            format!("CDelegated ({}) - ", bounded_title_component(profile, 16)),
+            owner,
+        ),
         Role::ExecutorSelfReflection => bounded_owner_title(
             format!("ERefl ({}) - ", bounded_title_component(profile, 16)),
             owner,
@@ -4074,6 +4091,7 @@ fn admit_active_run(
         let subject = match role {
             Role::Executor => "executor concurrency",
             Role::Lead => "run concurrency",
+            Role::DelegatedLead => "delegated lead concurrency",
             Role::ExecutorSelfReflection | Role::LeadSelfReflection => "reflection concurrency",
         };
         return Err(io::Error::new(
@@ -6068,11 +6086,24 @@ fn run_control_receipt(
     // role, profile and tools with the single-agent suppression, its own
     // bounded-lead marker instead of the executor session marker and the lead
     // frontend shape, with the title the dispatching side already published.
-    // An executor or legacy receipt keeps exactly the executor lifecycle.
+    // An executor or legacy receipt keeps exactly the executor lifecycle. A
+    // delegated Lead receipt is not converted to either ordinary role here;
+    // its host is the Director-owned delegated dispatch path.
     let recorded_role = role_from_receipt(value)?;
-    let hosted_role = match &recorded_role {
-        Some(role) if role.role == Role::Lead.label() => Role::Lead,
-        _ => Role::Executor,
+    let hosted_role = match recorded_role.as_ref().map(|role| role.role.as_str()) {
+        Some(role) if role == Role::Lead.label() => Role::Lead,
+        Some(role) if role == Role::Executor.label() => Role::Executor,
+        Some(role) if role == Role::DelegatedLead.label() => {
+            return Err(invalid(
+                "this receipt records a delegated Lead; delegated Lead hosting is owned by the Director dispatch path and is not converted to a root lead or executor",
+            ));
+        }
+        Some(_) => {
+            return Err(invalid(
+                "this receipt records an unknown responsibility role; refusing to host it as an executor",
+            ));
+        }
+        None => Role::Executor,
     };
     let mut plan = ControlPlan::new(
         &launcher,
@@ -10376,6 +10407,10 @@ mod tests {
             role_title(Role::Executor, "default", "owner"),
             executor_title("default", "owner")
         );
+        let delegated = role_title(Role::DelegatedLead, "default", "owner");
+        assert_eq!(delegated, "CDelegated (default) - owner");
+        assert_ne!(delegated, role_title(Role::Lead, "default", "owner"));
+        assert_ne!(delegated, role_title(Role::Executor, "default", "owner"));
         let long_a = format!("lead-{}", "a".repeat(160));
         let long_b = format!("lead-{}", "b".repeat(160));
         let first = lead_dispatch_title("default", &long_a);

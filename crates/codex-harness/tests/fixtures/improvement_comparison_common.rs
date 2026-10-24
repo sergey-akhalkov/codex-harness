@@ -565,12 +565,17 @@ impl Fixture {
         // source therefore carries the same role inputs an installed kit has.
         fs::write(
             proj.join("global/roles.toml"),
-            "schema = 1\nshared_skills = [\"arm-skill\"]\n\n[roles.lead]\ninstructions = \"global/roles/lead.md\"\nskills = []\n\n[roles.executor]\ninstructions = \"global/roles/executor.md\"\nskills = []\n",
+            "schema = 1\nshared_skills = [\"arm-skill\"]\n\n[roles.lead]\ninstructions = \"global/roles/lead.md\"\nskills = []\n\n[roles.delegated-lead]\ninstructions = \"global/roles/delegated-lead.md\"\nskills = []\n\n[roles.executor]\ninstructions = \"global/roles/executor.md\"\nskills = []\n",
         )
         .unwrap();
         fs::write(
             proj.join("global/roles/lead.md"),
             "# Lead role\nfixture lead role instructions\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("global/roles/delegated-lead.md"),
+            "# Delegated Lead role\nfixture delegated lead role instructions\n",
         )
         .unwrap();
         fs::write(

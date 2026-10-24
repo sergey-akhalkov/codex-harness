@@ -16,6 +16,9 @@ use std::{
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
     Lead,
+    /// Bounded coordinator for exactly one OpenSpec change assigned by the
+    /// Director; it reports to that Director and never succeeds it.
+    DelegatedLead,
     Executor,
     /// Bounded, read-only analysis of an accepted executor conversation.
     ExecutorSelfReflection,
@@ -28,6 +31,7 @@ impl Role {
     pub fn label(self) -> &'static str {
         match self {
             Self::Lead => "lead",
+            Self::DelegatedLead => "delegated-lead",
             Self::Executor => "executor",
             Self::ExecutorSelfReflection => "executor-self-reflection",
             Self::LeadSelfReflection => "lead-self-reflection",
@@ -99,7 +103,7 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
     let descriptor_text = read("global/roles.toml")?;
     let descriptor: Descriptor = toml::from_str(descriptor_text.trim_start_matches('\u{feff}'))
         .map_err(|_| invalid("invalid roles.toml or unknown role"))?;
-    let ordinary = [Role::Lead, Role::Executor];
+    let ordinary = [Role::Lead, Role::DelegatedLead, Role::Executor];
     let reflection = [Role::ExecutorSelfReflection, Role::LeadSelfReflection];
     let ordinary_present = ordinary
         .iter()
@@ -107,11 +111,13 @@ pub fn resolve(source_root: &Path, role: Role) -> io::Result<ResolvedRole> {
     let reflection_present = reflection
         .iter()
         .all(|role| descriptor.roles.contains_key(role));
-    let complete = (descriptor.roles.len() == 2 && ordinary_present)
-        || (descriptor.roles.len() == 4 && ordinary_present && reflection_present);
+    let complete = (descriptor.roles.len() == ordinary.len() && ordinary_present)
+        || (descriptor.roles.len() == ordinary.len() + reflection.len()
+            && ordinary_present
+            && reflection_present);
     if descriptor.schema != 1 || !complete {
         return Err(invalid(
-            "roles.toml must define schema 1 and exactly the lead/executor roles, or all four roles including executor-self-reflection and lead-self-reflection",
+            "roles.toml must define schema 1 and exactly the lead/delegated-lead/executor roles, or all five roles including executor-self-reflection and lead-self-reflection",
         ));
     }
     let common = read(&manifest.instructions)?;
@@ -378,10 +384,11 @@ mod tests {
                 "developer_instructions = 'Shared developer'\nmodel = 'unchanged'",
             ),
             ("roles/lead.md", "Lead responsibility"),
+            ("roles/delegated-lead.md", "Delegated lead responsibility"),
             ("roles/executor.md", "Executor responsibility"),
             (
                 "roles.toml",
-                "schema = 1\nshared_skills = ['verify']\n[roles.lead]\ninstructions = 'global/roles/lead.md'\nskills = ['coordinate']\n[roles.executor]\ninstructions = 'global/roles/executor.md'\nskills = []\n",
+                "schema = 1\nshared_skills = ['verify']\n[roles.lead]\ninstructions = 'global/roles/lead.md'\nskills = ['coordinate']\n[roles.delegated-lead]\ninstructions = 'global/roles/delegated-lead.md'\nskills = []\n[roles.executor]\ninstructions = 'global/roles/executor.md'\nskills = []\n",
             ),
         ] {
             fs::write(root.path().join("global").join(name), body).unwrap();
@@ -427,17 +434,177 @@ mod tests {
         );
     }
 
+    fn kit_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .canonicalize()
+            .expect("canonical workspace root")
+    }
+
+    fn add_reflection_roles(root: &Path) {
+        for (name, body) in [
+            (
+                "executor-self-reflection.md",
+                "Executor reflection responsibility",
+            ),
+            ("lead-self-reflection.md", "Lead reflection responsibility"),
+        ] {
+            fs::write(root.join("global/roles").join(name), body).unwrap();
+        }
+        let path = root.join("global/roles.toml");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "[roles.executor-self-reflection]\ninstructions = 'global/roles/executor-self-reflection.md'\nskills = []\n[roles.lead-self-reflection]\ninstructions = 'global/roles/lead-self-reflection.md'\nskills = []\n",
+        );
+        fs::write(path, text).unwrap();
+    }
+
     #[test]
-    fn undeclared_reflection_roles_refuse_a_legacy_descriptor_without_panicking() {
+    fn delegated_lead_role_resolves_from_the_checkout_with_bounded_guidance() {
+        let source = kit_root();
+        let text = fs::read_to_string(source.join("global/roles/delegated-lead.md")).unwrap();
+        for required in [
+            "bounded coordinator for exactly one assigned OpenSpec change",
+            "may dispatch Executors",
+            "must accept",
+            "Report to your Director",
+            "Do not dispatch Leads",
+            "must not activate `team-lead`",
+        ] {
+            assert!(
+                text.contains(required),
+                "delegated-lead.md must state {required:?}: {text}"
+            );
+        }
+        let resolved = resolve(&source, Role::DelegatedLead).unwrap();
+        assert_eq!(resolved.role, Role::DelegatedLead);
+        assert!(resolved.developer_instructions.contains(text.trim()));
+        for shared in ["openspec-apply-change", "project-verification"] {
+            assert!(
+                resolved
+                    .skills
+                    .iter()
+                    .find(|skill| skill.name == shared)
+                    .unwrap()
+                    .allowed,
+                "shared skill {shared} remains shared with the delegated Lead"
+            );
+        }
+        for exclusive in ["team-lead", "structured-codex-run", "openspec-propose"] {
+            assert!(
+                !resolved
+                    .skills
+                    .iter()
+                    .find(|skill| skill.name == exclusive)
+                    .unwrap()
+                    .allowed,
+                "a delegated Lead must not inherit the root-only {exclusive} skill"
+            );
+        }
+        let root = resolve(&source, Role::Lead).unwrap();
+        assert!(
+            root.skills
+                .iter()
+                .find(|skill| skill.name == "team-lead")
+                .unwrap()
+                .allowed,
+            "the root Lead keeps its team-lead skill"
+        );
+    }
+
+    #[test]
+    fn delegated_lead_revision_tracks_only_its_own_source() {
+        // The checkout test above proves the real role source resolves; this
+        // fixture proves the revision binds this role's own file.
         let root = fixture();
+        let lead = resolve(root.path(), Role::Lead).unwrap();
+        let delegated = resolve(root.path(), Role::DelegatedLead).unwrap();
+        fs::write(
+            root.path().join("global/roles/delegated-lead.md"),
+            "Changed delegated lead",
+        )
+        .unwrap();
+        let changed = resolve(root.path(), Role::DelegatedLead).unwrap();
+        assert_ne!(delegated.revision, changed.revision);
+        assert!(
+            changed
+                .developer_instructions
+                .contains("Changed delegated lead")
+        );
+        assert_eq!(
+            lead.revision,
+            resolve(root.path(), Role::Lead).unwrap().revision
+        );
+    }
+
+    #[test]
+    fn role_sets_accept_exactly_three_ordinary_roles_or_all_five() {
+        let root = fixture();
+        for role in [Role::Lead, Role::DelegatedLead, Role::Executor] {
+            assert!(resolve(root.path(), role).is_ok(), "{}", role.label());
+        }
         for role in [Role::ExecutorSelfReflection, Role::LeadSelfReflection] {
             let error = resolve(root.path(), role).unwrap_err().to_string();
             assert!(error.contains(role.label()), "{error}");
             assert!(error.contains("global/roles.toml"), "{error}");
             assert!(error.contains("update"), "{error}");
         }
-        assert!(resolve(root.path(), Role::Lead).is_ok());
-        assert!(resolve(root.path(), Role::Executor).is_ok());
+        add_reflection_roles(root.path());
+        for role in [
+            Role::Lead,
+            Role::DelegatedLead,
+            Role::Executor,
+            Role::ExecutorSelfReflection,
+            Role::LeadSelfReflection,
+        ] {
+            assert!(resolve(root.path(), role).is_ok(), "{}", role.label());
+        }
+    }
+
+    #[test]
+    fn incomplete_extra_or_duplicate_role_sets_are_refused() {
+        let root = fixture();
+        let path = root.path().join("global/roles.toml");
+        let three = fs::read_to_string(&path).unwrap();
+        let two = three.replace(
+            "[roles.delegated-lead]\ninstructions = 'global/roles/delegated-lead.md'\nskills = []\n",
+            "",
+        );
+        fs::write(&path, two).unwrap();
+        let error = resolve(root.path(), Role::Lead).unwrap_err().to_string();
+        assert!(
+            error.contains("exactly the lead/delegated-lead/executor roles"),
+            "{error}"
+        );
+
+        let root = fixture();
+        add_reflection_roles(root.path());
+        let path = root.path().join("global/roles.toml");
+        let five = fs::read_to_string(&path).unwrap();
+        let four = five.replace(
+            "[roles.executor-self-reflection]\ninstructions = 'global/roles/executor-self-reflection.md'\nskills = []\n",
+            "",
+        );
+        fs::write(&path, four).unwrap();
+        assert!(resolve(root.path(), Role::Lead).is_err());
+
+        let root = fixture();
+        let path = root.path().join("global/roles.toml");
+        let mut extra = fs::read_to_string(&path).unwrap();
+        extra.push_str("[roles.auditor]\ninstructions = 'global/roles/lead.md'\nskills = []\n");
+        fs::write(&path, extra).unwrap();
+        assert!(resolve(root.path(), Role::Lead).is_err());
+
+        let root = fixture();
+        let path = root.path().join("global/roles.toml");
+        let mut duplicate = fs::read_to_string(&path).unwrap();
+        duplicate.push_str(
+            "[roles.lead]\ninstructions = 'global/roles/delegated-lead.md'\nskills = []\n",
+        );
+        fs::write(&path, duplicate).unwrap();
+        assert!(resolve(root.path(), Role::Lead).is_err());
     }
 
     #[test]

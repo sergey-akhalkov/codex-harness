@@ -27,7 +27,7 @@ const CATALOGUE_LIMIT: u64 = 16 * 1024;
 const COMMANDS: [(&str, &str); 5] = [
     (
         "catalogue",
-        "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--role lead|executor] [--profile ID] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps; raw native evidence stays in a private temporary root and a missing native read reports unavailable rather than a local scan. --role composes the installed build's recorded responsibility role (developer text and skill memberships) onto the native read exactly as a managed session receives it, so the catalogue shows that role's effective set; it refuses when the role inputs are missing instead of reporting a different set. --profile ID adds the native profile layer the managed session selected for that role (the installed profile file or its profiles.<name> table; default adds nothing), so the layers that profile carries reach both the resolved role context and the native read, and the composed role and profile are reported as role_context=role=...;profile=...;revision=...; no model routing is composed. --limit accepts 1024-1048576 bytes (default 16384); rerun with a larger --limit for omitted entries.",
+        "codex-harness skills catalogue [--case DIRECTORY] [--codex-home DIRECTORY] [--upstream PATH] [--role lead|delegated-lead|executor] [--profile ID] [--timeout SECONDS] [--limit BYTES]\nModel-free native skills/list for one project: effective skills with kit revision identity, disablement, conflicts, duplicate links and explicit coverage gaps; raw native evidence stays in a private temporary root and a missing native read reports unavailable rather than a local scan. --role composes the installed build's recorded responsibility role (developer text and skill memberships) onto the native read exactly as a managed session receives it, so the catalogue shows that role's effective set; it refuses when the role inputs are missing instead of reporting a different set. --profile ID adds the native profile layer the managed session selected for that role (the installed profile file or its profiles.<name> table; default adds nothing), so the layers that profile carries reach both the resolved role context and the native read, and the composed role and profile are reported as role_context=role=...;profile=...;revision=...; no model routing is composed. --limit accepts 1024-1048576 bytes (default 16384); rerun with a larger --limit for omitted entries.",
     ),
     (
         "isolate",
@@ -108,6 +108,7 @@ fn catalogue_cmd(args: &[OsString]) -> io::Result<i32> {
     let upstream = opts.remove("--upstream").map(PathBuf::from);
     let role = match opts.remove("--role") {
         Some(value) if value == "lead" => Some(Role::Lead),
+        Some(value) if value == "delegated-lead" => Some(Role::DelegatedLead),
         Some(value) if value == "executor" => Some(Role::Executor),
         Some(_) => return Err(invalid()),
         None => None,
@@ -123,7 +124,7 @@ fn catalogue_cmd(args: &[OsString]) -> io::Result<i32> {
     }
     if profile.is_some() && role.is_none() {
         return Err(io::Error::other(
-            "--profile applies one selected native profile layer to the composed role context; pass --role lead|executor with it",
+            "--profile applies one selected native profile layer to the composed role context; pass --role lead|delegated-lead|executor with it",
         ));
     }
     // An explicitly requested role is resolved from the installed build's
