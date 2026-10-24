@@ -836,6 +836,19 @@ fn recorded_lead_thread(title: &str, checkout: &Path, with_turn: bool) -> SimThr
     thread
 }
 
+fn recorded_executor_child(home: &Path, server: &Server) -> ReleaseRun {
+    let run = release_run(home, LEAD, EXECUTOR, server);
+    let mut value: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    let run_id = value["run"].as_str().unwrap().to_owned();
+    value["role"] = json!("executor");
+    value["parentThreadId"] = json!(LEAD);
+    value["leadThreadId"] = json!(LEAD);
+    value["rootThreadId"] = json!(DIRECTOR);
+    value["runGeneration"] = json!(run_id);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    run
+}
+
 fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> SyntheticRun {
     endpoint(home, lead, lead, server.port, 0);
     let endpoint_value: Value = serde_json::from_slice(
@@ -6296,6 +6309,174 @@ fn fresh_lead_recovery_restores_hierarchy_workspace_set_and_ds_binding() {
     assert_eq!(receipt["continuation"]["parentThreadId"], DIRECTOR);
     assert_eq!(receipt["continuation"]["rootThreadId"], DIRECTOR);
     mcp.finish();
+    drop(lead);
+}
+
+#[test]
+fn fresh_lead_recovery_reattaches_preexisting_children_to_the_successor() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let lead = delegated_lead_continuation_run(home.path(), &server);
+    let child = recorded_executor_child(home.path(), &server);
+    let title = lead.value["title"].as_str().unwrap();
+    let mut sim = NativeSim::new(DIRECTOR, LEAD, &lead.primary, false, false);
+    sim.threads.insert(
+        LEAD.to_owned(),
+        recorded_lead_thread(title, &lead.primary, false),
+    );
+    sim.threads.insert(
+        EXECUTOR.to_owned(),
+        SimThread::idle(EXECUTOR, &child.checkout),
+    );
+    let sim = Arc::new(Mutex::new(sim));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let resumed = mcp.call_tool(
+        2,
+        "executor_resume",
+        json!({"run": lead.value["run"], "mode": "fresh"}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let resumed = result(&resumed);
+    let successor = resumed["threadId"].as_str().unwrap();
+    let child_value: Value = serde_json::from_slice(&fs::read(&child.receipt).unwrap()).unwrap();
+    assert_ne!(successor, LEAD);
+    assert_eq!(resumed["successorAttachment"]["count"], 1, "{resumed}");
+    assert_eq!(
+        resumed["successorAttachment"]["errors"],
+        json!([]),
+        "{resumed}"
+    );
+    assert_eq!(
+        resumed["successorAttachment"]["runs"][0], child_value["run"],
+        "the attachment report must name the exact child run"
+    );
+    assert_eq!(resumed["successorAttachment"]["fromThreadId"], LEAD);
+    assert_eq!(resumed["successorAttachment"]["toThreadId"], successor);
+    assert!(
+        sim.lock().unwrap().threads.contains_key(LEAD),
+        "the predecessor remains retained"
+    );
+    assert_eq!(child_value["parentThreadId"], successor, "{child_value}");
+    assert_eq!(child_value["leadThreadId"], successor, "{child_value}");
+    assert_eq!(child_value["rootThreadId"], DIRECTOR, "{child_value}");
+    assert_eq!(
+        child_value["successorAttachment"]["fromParentThreadId"], LEAD,
+        "{child_value}"
+    );
+
+    let status = mcp.call_tool(
+        3,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": successor})),
+    );
+    let status = result(&status);
+    assert_eq!(status["callerRole"], "lead", "{status}");
+    let child_status = status["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["run"] == child_value["run"])
+        .unwrap();
+    assert_eq!(child_status["parentThreadId"], successor, "{child_status}");
+    let recorded_parent = child_status["parentThreadId"].as_str().unwrap();
+    harness_core::task_orchestrate::validate_acceptance_relation(
+        "executor",
+        "lead",
+        Some(recorded_parent),
+        successor,
+    )
+    .unwrap();
+
+    let child_before_old_attempts: Value =
+        serde_json::from_slice(&fs::read(&child.receipt).unwrap()).unwrap();
+    let starts_before_old_attempts = server.requests_for("thread/start").len();
+    let turns_before_old_attempts = server.requests_for("turn/start").len();
+    let old_message = mcp.call_tool(
+        4,
+        "executor_message",
+        json!({"run": child_value["run"], "text": "stale parent message"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&old_message).contains("not a recorded MCP executor lead"),
+        "{old_message}"
+    );
+    let old_release = release_tool(
+        &mut mcp,
+        5,
+        LEAD,
+        child_value["run"].as_str(),
+        "discarded",
+        "stale parent review",
+    );
+    assert!(
+        tool_error(&old_release).contains("owned by the calling lead"),
+        "{old_release}"
+    );
+    let old_dispatch = mcp.call(
+        6,
+        json!({
+            "owner": "stale-parent-dispatch",
+            "assignment": assignment("must not start from the predecessor")
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&old_dispatch).contains("retained continuation predecessor"),
+        "{old_dispatch}"
+    );
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        starts_before_old_attempts
+    );
+    assert_eq!(
+        server.requests_for("turn/start").len(),
+        turns_before_old_attempts
+    );
+    let child_after_old_attempts: Value =
+        serde_json::from_slice(&fs::read(&child.receipt).unwrap()).unwrap();
+    assert_eq!(
+        child_after_old_attempts, child_before_old_attempts,
+        "the retained predecessor mutated the child receipt"
+    );
+
+    let message = mcp.call_tool(
+        7,
+        "executor_message",
+        json!({
+            "run": child_value["run"],
+            "text": "continue under the recorded successor",
+            "clientMessageId": "successor-child-message"
+        }),
+        Some(json!({"threadId": successor})),
+    );
+    let message = result(&message);
+    assert_eq!(message["delivery"]["status"], "delivered", "{message}");
+    let child_turn = message["delivery"]["turnId"].as_str().unwrap();
+    complete_turn(
+        &sim,
+        EXECUTOR,
+        child_turn,
+        "the child completed under its successor",
+    );
+
+    let released = release_tool(
+        &mut mcp,
+        8,
+        successor,
+        child_value["run"].as_str(),
+        "discarded",
+        "successor reviewed the child",
+    );
+    let released = result(&released);
+    assert_eq!(released["leadThreadId"], successor, "{released}");
+    assert_eq!(released["executorThreadId"], EXECUTOR, "{released}");
+    assert_eq!(released["state"], "released", "{released}");
+    mcp.finish();
+    drop(child);
     drop(lead);
 }
 

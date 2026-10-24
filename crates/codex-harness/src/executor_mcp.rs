@@ -323,7 +323,7 @@ fn stop_tool_definition() -> Value {
 fn resume_tool_definition() -> Value {
     json!({
         "name": RESUME_TOOL,
-        "description": "Explicitly continue one stopped child run owned by the verified calling lead, including a delegated Lead. exact resumes the same thread with the preserved assignment and bounded progress, without resubmitting the assignment, changing the recorded hierarchy or repositories, or resetting the pool. fresh starts one new thread on the same shared app-server with the preserved assignment, role, parent, root, repository set and ds binding, retains the predecessor, and asks the model to inspect interrupted effects. Missing or stale authority is refused before native work, and an explicit stop is never restarted automatically.",
+        "description": "Explicitly continue one stopped child run owned by the verified calling lead, including a delegated Lead. exact resumes the same thread with the preserved assignment and bounded progress, without resubmitting the assignment, changing the recorded hierarchy or repositories, or resetting the pool. fresh starts one new thread on the same shared app-server with the preserved assignment, role, parent, root, repository set and ds binding, rebinds recorded children to that successor, retains the predecessor, and asks the model to inspect interrupted effects. Missing or stale authority is refused before native work, and an explicit stop is never restarted automatically.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -4329,6 +4329,25 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                     ),
                 });
             }
+            let successor_attachment = if run.child_role == RunRole::Lead {
+                attach_children_to_successor(
+                    &home,
+                    &run.executor_thread,
+                    &new_thread,
+                    &run.root_thread,
+                )
+                .unwrap_or_else(|error| {
+                    json!({
+                        "fromThreadId": run.executor_thread,
+                        "toThreadId": new_thread,
+                        "count": 0,
+                        "runs": [],
+                        "errors": [{"error": error.to_string()}]
+                    })
+                })
+            } else {
+                Value::Null
+            };
             let endpoint_retire_error = if run.child_role == RunRole::Lead {
                 control::retire_lead_endpoint(&home, &run.executor_thread)
                     .err()
@@ -4355,6 +4374,7 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "profile": run.identity,
                 "workspaceRoots": workspace_roots,
                 "workspaces": run.value["workspaces"],
+                "successorAttachment": successor_attachment,
                 "receipt": run.receipt,
                 "workspace": evidence,
                 "detail": "created one new bound thread on the same shared app-server; the predecessor thread remains retained, the slot stayed bound, and the preserved assignment was submitted once in the new thread"
@@ -4485,6 +4505,98 @@ fn record_continuation(
         }
         Ok(())
     })
+}
+
+fn attach_children_to_successor(
+    home: &Path,
+    predecessor: &str,
+    successor: &str,
+    expected_root: &str,
+) -> io::Result<Value> {
+    let children: Vec<RunReceipt> = read_receipts(home)?
+        .into_iter()
+        .filter(|receipt| {
+            let parent = receipt.value["parentThreadId"]
+                .as_str()
+                .or_else(|| receipt.value["leadThreadId"].as_str());
+            parent == Some(predecessor)
+                && receipt.value["role"].as_str() != Some("lead")
+                && receipt.value["executorThreadId"].as_str() != Some(successor)
+        })
+        .collect();
+    let mut runs = Vec::new();
+    let mut errors = Vec::new();
+    for child in children {
+        let run = child.value["run"].as_str().unwrap_or_default().to_owned();
+        let thread = child.value["executorThreadId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let result = executor_message::update_receipt_document(&child.path, |document| {
+            if document["run"].as_str() != Some(run.as_str())
+                || document["executorThreadId"].as_str() != Some(thread.as_str())
+            {
+                return Err(invalid(format!(
+                    "child run {run} changed while the Lead successor was attaching it; refusing to overwrite it"
+                )));
+            }
+            let parent = document["parentThreadId"]
+                .as_str()
+                .or_else(|| document["leadThreadId"].as_str());
+            if parent == Some(successor) {
+                return Ok(false);
+            }
+            if parent != Some(predecessor) {
+                return Err(invalid(format!(
+                    "child run {run} is no longer recorded under predecessor {predecessor}; refusing a duplicate parent"
+                )));
+            }
+            let root = document["rootThreadId"].as_str().unwrap_or(predecessor);
+            if root != expected_root {
+                return Err(invalid(format!(
+                    "child run {run} records root {root}, not the recovered Lead root {expected_root}; refusing to retarget it"
+                )));
+            }
+            if document["role"].as_str() == Some("lead") {
+                return Err(invalid(format!(
+                    "child run {run} records another Lead below a delegated Lead; refusing an unsupported hierarchy"
+                )));
+            }
+            document["parentThreadId"] = Value::String(successor.to_owned());
+            document["leadThreadId"] = Value::String(successor.to_owned());
+            document["successorAttachment"] = json!({
+                "schema": 1,
+                "fromParentThreadId": predecessor,
+                "toParentThreadId": successor,
+                "recordedMs": executor_message_now()
+            });
+            if let Some(messages) = document["leadMessages"].as_array_mut() {
+                for message in messages {
+                    if message["leadThreadId"].as_str() == Some(predecessor) {
+                        message["leadThreadId"] = Value::String(successor.to_owned());
+                    }
+                }
+            }
+            Ok(true)
+        });
+        match result {
+            Ok(true) => runs.push(Value::String(run)),
+            Ok(false) => {}
+            Err(error) => errors.push(json!({
+                "run": run,
+                "threadId": thread,
+                "error": error.to_string()
+            })),
+        }
+    }
+    let count = runs.len();
+    Ok(json!({
+        "fromThreadId": predecessor,
+        "toThreadId": successor,
+        "count": count,
+        "runs": runs,
+        "errors": errors
+    }))
 }
 
 fn continuation_workspace_roots(run: &VerifiedRun, exact: bool) -> io::Result<Vec<PathBuf>> {
