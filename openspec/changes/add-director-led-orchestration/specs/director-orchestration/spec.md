@@ -88,6 +88,22 @@ A Lead assignment SHALL support one or several explicitly selected repositories,
 - **THEN** no model work starts, the result identifies completed and failed preparation, and unused new reservations are released only when safe
 - **AND** pre-existing work and any uncertain effects remain preserved and observable
 
+### Requirement: Hierarchy worktree labels
+
+Hierarchy worktrees SHALL use fixed role and ordinal labels in every selected repository pool: `de1..de4` for direct Director Executors, `l1..l2` for Leads, and `l1e1..l1e6` and `l2e1..l2e6` for Lead Executors. The same label SHALL be used in every repository selected by one assignment.
+
+#### Scenario: Direct Executor and Lead allocations
+- **WHEN** the Director dispatches a direct Executor, a Lead, and an Executor under that Lead
+- **THEN** their worktrees are named with `deN`, `lN`, and `lNeM` respectively for the same ordinal in every selected repository
+
+### Requirement: Legacy worktree labels
+
+Legacy `{repo}-wtN` worktrees SHALL remain readable and SHALL NOT be renamed while held. A released position MAY migrate to its hierarchy label only when no owner or partial work can be lost. Compatibility CLI and ordinary tasks MAY keep legacy labels until migrated.
+
+#### Scenario: Legacy slot reuse
+- **WHEN** a held `{repo}-wtN` position is encountered during allocation
+- **THEN** it remains readable and is not moved; after safe release and reuse the position takes its hierarchy label without losing retained work
+
 ### Requirement: Committed parent inputs determine child work
 
 Child assignments SHALL resolve their required inputs to exact commits in the parent's declared repositories before dispatch. Children SHALL start from those snapshots and verify them. Integration targets and changed input revisions SHALL remain explicit. Uncommitted inputs SHALL not be copied into a running child checkout or silently replaced by an unrelated default branch.

@@ -96,6 +96,12 @@ Worktrees are neighboring slots of their repositories' common pools, not physica
 
 Multi-repository preparation either establishes all required bindings before starting the model or reports the exact partial preparation and safely releases only unused reservations created by that attempt. Never reset pre-existing work to simulate atomic preparation. Tool connections with mutable project selection must be session-scoped or explicitly addressed, so one Lead cannot retarget another Lead's Serena/project context.
 
+### 6.1 Hierarchy labels are stable pool positions
+
+The shared pool has eighteen lazy positions. Their hierarchy labels are fixed: positions 1-4 are `de1..de4` (Director Executors), 5-6 are `l1..l2` (Leads), 7-12 are `l1e1..l1e6`, and 13-18 are `l2e1..l2e6`. The same label is used for the corresponding worktree in every repository selected by a multi-repository assignment. The label describes the pool position and hierarchy owner; it is not authority.
+
+Existing `{repo}-wtN` worktrees and records predate the labels. Keep them readable and do not move a held or active worktree. A free or released legacy position may be migrated to its hierarchy label only after its owner and partial work are proved safe. Compatibility CLI and ordinary task allocations may continue to use legacy labels until their positions are migrated, so the pool must recognize both names for a position without treating one as a foreign worktree.
+
 ### 7. Beads and OpenSpec retain their own responsibilities
 
 Use a selected existing board for a linked initiative: an epic for its outcome, a feature per assigned change and tasks for Executor work. Reuse existing suitable cards. Separate initiatives can retain different boards; the Director aggregates observations without a mirrored tracker. A multi-repository spec keeps one coordinating board with explicit code-repository references.
