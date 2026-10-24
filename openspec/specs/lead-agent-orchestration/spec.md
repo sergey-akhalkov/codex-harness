@@ -11,7 +11,7 @@ surfaces with durable recovery.
 
 ### Requirement: Configurable lead and executor roles
 
-The kit SHALL provide reusable orchestration configuration that names the lead session profile, the executor profiles available for assignment, the maximum number of concurrent executors, and the independent managed worktree pool capacity defined by `isolated-worktree-workflow`. Dispatch SHALL use exactly the configured profiles and SHALL NOT hardcode provider-specific roles, while explicit user profile selection retains its native precedence. The existing installation check SHALL validate that every configured profile is installed and that both limits are positive, reporting a concrete error without substituting another profile or silently disabling orchestration. Unrelated user configuration, credentials and profiles SHALL be preserved.
+The kit SHALL provide reusable orchestration configuration that names the root Director profile through the compatible root lead settings, a separate delegated Lead profile, the Executor profiles available for assignment, the direct-child limits defined by `director-orchestration`, the installation-wide maximum concurrent Executors, and the independent managed worktree pool capacity defined by `isolated-worktree-workflow`. Dispatch SHALL use exactly the configured profiles and SHALL NOT hardcode provider-specific roles, while explicit user profile selection retains its native precedence. The existing installation check SHALL validate that every configured profile is installed and that configured count limits are positive, reporting a concrete error without substituting another profile or silently disabling orchestration. Unrelated user configuration, credentials and profiles SHALL be preserved. The shipped Director route SHALL remain ordinary Codex, while delegated Leads and Executors SHALL use the configured `ds` profile. Role-specific instructions and capabilities SHALL be applied per session without rewriting that shared profile or silently changing model, effort, provider or billing. Existing `lead_profile` and `successor_lead_profile` settings SHALL retain their root-session meaning.
 
 #### Scenario: Roles come from configuration
 - **WHEN** the configuration names one lead profile and two executor profiles
@@ -25,10 +25,19 @@ The kit SHALL provide reusable orchestration configuration that names the lead s
 - **WHEN** an installed executor is dispatched into a selected consuming repository
 - **THEN** it uses the installed orchestration configuration and the selected repository's common pool, without requiring a copy of kit configuration inside that repository
 
+#### Scenario: Lead and Executor share a profile but not powers
+- **WHEN** a Director dispatches a Lead and an Executor through the shipped configuration
+- **THEN** both children consume the configured ds model and effort, the root retains its ordinary Codex route, and the children receive different role-specific instructions and tool capabilities
+
+#### Scenario: Existing root routing survives upgrade
+- **WHEN** an installation with explicit root lead settings is upgraded
+- **THEN** those settings continue to select the root Director and its successor rather than selecting the new delegated Lead route
+- **AND** explicit local limits and profiles are preserved, with effective constraints reported
+
 ### Requirement: Lead activation through the team-lead skill
 
 The kit SHALL provide a `team-lead` skill, delivered through its installation
-lifecycle, that activates the lead role in an ordinary Codex session of a
+lifecycle, that activates the root Director role in an ordinary Codex session of a
 consuming project. The role SHALL be entered by skill invocation, by a user
 request that clearly asks for orchestrated asynchronous development, or by a
 user request to use executors or lead/executor dispatch for the current work -
@@ -37,10 +46,7 @@ NOT require the skill name. The main session SHALL also be able to enter the
 role on its own judgement, without a user request, when the user's task
 decomposes into genuinely parallel, independently verifiable implementation
 slices whose orchestration cost the task repays; it SHALL state that
-activation and its basis before spawning anything. That autonomous decision
-SHALL belong to the main session alone: an executor session or ephemeral
-helper agent SHALL NOT activate the role or originate further agents or
-executors, and SHALL report such a need to the lead instead. A session that
+activation and its basis before spawning anything. Root activation SHALL belong to the main session alone. A delegated Lead SHALL receive its bounded coordinator role through verified Director dispatch and SHALL be permitted to originate only Executors within that assignment. An Executor session or ephemeral helper SHALL NOT promote itself, activate a coordinator role or originate further agents or executors, and SHALL report such a need to its parent instead. A session that
 has not entered the role SHALL NOT spawn executors or create orchestration
 state; small direct tasks, read-only work and corrections smaller than their
 own delegation overhead SHALL stay direct without orchestration. While the
@@ -48,7 +54,7 @@ role is active, the lead SHALL minimize its own token spend and the time to
 the accepted result: it keeps for itself judgment, decomposition,
 integration, acceptance and work that genuinely exceeds executor capability,
 delegates the remaining parallelizable implementation work, and creates no
-manufactured slices or delegation-count targets. The skill SHALL own the lead
+manufactured slices or delegation-count targets. The skill SHALL own the Director and delegated Lead
 workflow instructions: role configuration discovery, board setup and
 inspection, specification creation, executor briefs through the installed MCP interface,
 steering, acceptance, merge and explicit stop. Global instructions SHALL
@@ -61,7 +67,7 @@ stopping orchestration SHALL remain explicit and preserve partial work.
 
 #### Scenario: A user executor request activates the role
 - **WHEN** the user asks to use executors for the current work, or asks why executors are unused, without naming the `team-lead` skill
-- **THEN** the session activates the lead role for that work through the skill and dispatches executor-suitable slices instead of reporting a rule conflict
+- **THEN** the session activates the Director role for that work through the skill and dispatches executor-suitable slices instead of reporting a rule conflict
 
 #### Scenario: The main session activates orchestration on its own judgement
 - **WHEN** the user requests an implementation outcome that decomposes into parallel, independently verifiable slices, executors are configured and available, and no executor use was requested
@@ -83,9 +89,18 @@ stopping orchestration SHALL remain explicit and preserve partial work.
 - **WHEN** the user asks for orchestrated asynchronous development without naming the skill
 - **THEN** the agent selects the `team-lead` skill based on its description before spawning anything, instead of improvising an orchestration workflow
 
+#### Scenario: Director delegates a prepared specification
+- **WHEN** an activated Director selects a prepared OpenSpec change for delegated implementation
+- **THEN** the verified Lead starts with its assigned boundaries, configured ds route, board reference and authority to create Executors without a second user activation
+- **AND** the Lead receives the exact specification inputs, while the Director remains free to implement other changes directly or through direct Executors
+
+#### Scenario: Lead cannot create another Lead
+- **WHEN** a delegated Lead needs another coordination layer or a broader outcome
+- **THEN** it asks the Director instead of promoting an Executor or starting another Lead
+
 ### Requirement: Isolated and visible executor sessions
 
-Every executor assignment SHALL run in a distinct native Codex conversation with its configured effective profile and a harness-owned pool worktree selected, synchronized and bound before its first model request. The same CLI's native /agents interface SHALL provide conversation visibility under `executor-mcp-plugin`; separate terminal surfaces SHALL NOT be required. Executor isolation SHALL use the selected repository's shared harness pool defined by `isolated-worktree-workflow`. The MCP dispatch SHALL acquire and bind through that common owner before launching a session; executor sessions and lead-side recipes MUST NOT create substitute or additional worktrees. The controller SHALL record the slot mapping with the assignment, including slot path and index, owner session identity, archived or unavailable status and synchronized base revision, and preserve it through interruption. Slot release SHALL reuse the tree: after the lead merges or explicitly discards the assignment result, the slot is reset to the merged committed base with ignored build caches kept, and the same slot serves later assignments. A slot whose state cannot be safely reset SHALL be preserved with its reason for lead review; the controller MUST NOT silently reset a dirty slot, force-remove an unmerged tree, delete a branch whose work is not preserved, or treat agents-overview hide, archive or task deletion as slot release. Deleting a pool tree is a slot-retirement action that first establishes the work is preserved and the removal is authorized. A native conversation view SHALL expose the already bound pool checkout instead of allocating another checkout. Ephemeral spawn_agent helpers SHALL be spawned only by the lead; executor sessions SHALL run without agent-spawning tools, so helper and nested-executor conversations cannot originate inside an executor assignment. Executors SHALL NOT write to the shared checkout. Each native conversation SHALL expose assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. The controller and lead SHALL NOT resize, move or arrange desktop windows - including the terminal the lead runs in - to make conversations fit the screen; missing or lost native access SHALL be restored through the owning runtime connection. Automatic model-backed helpers SHALL be visible and attributable or disabled. Ordinary conversation navigation or closing an individual view SHALL NOT establish visibility loss. If the controlling CLI surface or required native access is lost, the controller SHALL suspend new dependent model dispatch, reconcile in-flight effects without replay, report the failure and restore access before continuing.
+Every executor assignment SHALL run in a distinct native Codex conversation with its configured effective profile and a harness-owned pool worktree selected, synchronized and bound before its first model request. The same CLI's native /agents interface SHALL provide conversation visibility under `executor-mcp-plugin`; separate terminal surfaces SHALL NOT be required. Executor isolation SHALL use the selected repository's shared harness pool defined by `isolated-worktree-workflow`. The MCP dispatch SHALL acquire and bind through that common owner before launching a session; executor sessions and lead-side recipes MUST NOT create substitute or additional worktrees. The controller SHALL record the slot mapping with the assignment, including slot path and index, owner session identity, archived or unavailable status and synchronized base revision, and preserve it through interruption. Slot release SHALL reuse the tree: after the lead merges or explicitly discards the assignment result, the slot is reset to the merged committed base with ignored build caches kept, and the same slot serves later assignments. A slot whose state cannot be safely reset SHALL be preserved with its reason for lead review; the controller MUST NOT silently reset a dirty slot, force-remove an unmerged tree, delete a branch whose work is not preserved, or treat agents-overview hide, archive or task deletion as slot release. Deleting a pool tree is a slot-retirement action that first establishes the work is preserved and the removal is authorized. A native conversation view SHALL expose the already bound pool checkout instead of allocating another checkout. Any permitted ephemeral spawn_agent helpers SHALL be root-Director-only. Delegated Leads and Executors SHALL run without native agent-spawning or native cross-agent messaging tools; a Lead SHALL create its assigned Executors exclusively through its authorized MCP operations, and an Executor SHALL create no descendants. Executors SHALL NOT write to the shared checkout. Each native conversation SHALL expose assignment, role, actual profile/model, supported effective reasoning effort, live messages, tool activity and state. A hidden process, raw log or single chat identity masking several conversations SHALL NOT satisfy this requirement. The controller and lead SHALL NOT resize, move or arrange desktop windows - including the terminal the lead runs in - to make conversations fit the screen; missing or lost native access SHALL be restored through the owning runtime connection. Automatic model-backed helpers SHALL be visible and attributable or disabled. Ordinary conversation navigation or closing an individual view SHALL NOT establish visibility loss. If the controlling CLI surface or required native access is lost, the controller SHALL suspend new dependent model dispatch, reconcile in-flight effects without replay, report the failure and restore access before continuing.
 
 #### Scenario: Two executors work in parallel
 - **WHEN** the lead dispatches two independent assignments to different configured profiles
@@ -129,7 +144,7 @@ Every executor assignment SHALL run in a distinct native Codex conversation with
 
 ### Requirement: Board-based asynchronous assignment and feedback
 
-Lead and executors SHALL coordinate routine assignments and feedback through the consuming project's task board using its non-interactive CLI: development stages as epics, specifications as features, executor feedback as feedback tasks, and lead-initiated improvements as tasks, or as OpenSpec changes when they alter accepted requirements. The board SHALL remain consuming-project state; the Rust controller SHALL NOT parse or duplicate it, because lead and executors read and update the board themselves. The kit SHALL deliver board-tool availability and workflow guidance through its installation lifecycle, verified from a fresh external session. Public kit sources SHALL contain only synthetic examples. When the board is unavailable, the orchestrator SHALL report the limitation explicitly and continue only work whose acceptance does not depend on the board. Exceptional questions and escalations SHALL be able to reach the originating lead through the authenticated MCP communication tool while durable blockers, decisions, progress and results remain on the board; messaging SHALL NOT replace the board or introduce a parallel task record.
+The Director, Leads and Executors SHALL coordinate routine assignments and feedback through the selected consuming-project board using its non-interactive CLI: development stages as epics, specifications as features, executor work as tasks, executor feedback as feedback-labeled tasks, and coordinator-initiated improvements as tasks, or as OpenSpec changes when they alter accepted requirements. Existing suitable records SHALL be reused. Each assignment SHALL identify its board, issue and specific owning run; a shared assignee named only `lead` SHALL NOT identify several concurrent coordinators. A linked multi-repository initiative SHALL use one selected existing coordinating board with repository references; independent initiatives can retain separate boards. Changing cwd SHALL NOT change the assignment's board. The board SHALL remain consuming-project state; the Rust controller SHALL NOT parse or duplicate it, because lead and executors read and update the board themselves. The kit SHALL deliver board-tool availability and workflow guidance through its installation lifecycle, verified from a fresh external session. Public kit sources SHALL contain only synthetic examples. When the board is unavailable, the orchestrator SHALL report the limitation explicitly and continue only work whose acceptance does not depend on the board. Exceptional questions and escalations SHALL be able to reach the originating lead through the authenticated MCP communication tool, with a Lead able to ask its Director, while durable blockers, decisions, progress and results remain on the board; messaging SHALL NOT replace the board or introduce a parallel task record.
 
 #### Scenario: An executor escalates a blocker
 - **WHEN** an executor cannot proceed because of a missing dependency or an ambiguous requirement
@@ -142,6 +157,15 @@ Lead and executors SHALL coordinate routine assignments and feedback through the
 #### Scenario: The board is unavailable
 - **WHEN** the board tool or its project state is missing or broken
 - **THEN** orchestration reports the limitation and affected assignments explicitly instead of silently losing acceptance records or inventing a replacement protocol
+
+#### Scenario: Two Leads have separate review inboxes
+- **WHEN** Executors from two Leads return work for review
+- **THEN** each result is assigned to its actual parent and visible in that parent's review scope without another Lead accepting or closing it accidentally
+
+#### Scenario: Board and code live in different repositories
+- **WHEN** an Executor changes a repository other than the initiative's coordinating board repository
+- **THEN** its durable assignment and feedback use the explicitly bound board, while checks and output paths identify the code repository
+- **AND** no duplicate tracker or copied acceptance record is created
 
 ### Requirement: Delegation-first utilization without reporting ritual
 
@@ -165,15 +189,19 @@ The lead workflow SHALL dispatch substantial eligible investigation, writing or 
 
 ### Requirement: Lead acceptance and merge
 
-The lead SHALL review each completed assignment against its accepted requirements and applicable checks before acceptance, merge accepted branches itself, and return concrete defects with their acceptance conditions to the original executor when correction is within its scope. A rejected assignment SHALL retain its partial work and slot worktree until corrected or explicitly discarded. Acceptance decisions and merges SHALL be recorded in task state and reflected on the board; the lead SHALL NOT claim completion for integrated work whose checks have not passed.
+The immediate coordinating parent SHALL review each completed assignment against its accepted requirements and applicable checks before acceptance, merge accepted branches itself, and return concrete defects with their acceptance conditions to the original executor when correction is within its scope. A rejected assignment SHALL retain its partial work and slot worktree until corrected or explicitly discarded. Acceptance decisions and merges SHALL be recorded in task state and reflected on the board; the coordinator SHALL NOT claim completion for integrated work whose checks have not passed. A delegated Lead SHALL integrate Executor outputs into its assigned block and submit that block to the Director. The Director SHALL accept direct Executor and Lead outputs against the overall outcome, including combined behavior and the exact multi-repository revision set. Executor task acceptance SHALL not close an unfinished parent block or OpenSpec change.
 
 #### Scenario: Accepted work is merged
 - **WHEN** an executor branch passes the applicable checks and meets its requirements
-- **THEN** the lead merges it, the slot is reset to the merged base for later reuse when its state is safely resettable, otherwise preserved with an explicit limitation, and the board and task records show the accepted outcome
+- **THEN** the parent merges it and records acceptance; a separate explicit release resets the slot to the merged base for later reuse only when safely resettable, otherwise preserving it with an explicit limitation, and the board and task records show the accepted outcome
 
 #### Scenario: A defect returns to the executor
 - **WHEN** review finds a concrete defect that the original executor can correct within its scope
 - **THEN** the lead returns the finding and acceptance condition to that executor instead of rewriting the work, and the partial result is preserved
+
+#### Scenario: Lead completion requires Director acceptance
+- **WHEN** a Lead has integrated and checked its Executors' work
+- **THEN** it returns the block's revisions, checks, remaining issues and evidence to the Director, while overall closure waits for the Director's combined acceptance
 
 ### Requirement: Durable authorized task state
 
@@ -189,7 +217,7 @@ A recoverable task SHALL retain its workspace and worktree identity, accepted ob
 
 ### Requirement: Single ownership and cause-aware recovery
 
-The runtime SHALL distinguish quota exhaustion, temporary throttling, authentication/model rejection, transport failure and incomplete output from retained provider evidence, preserving original cause, scope and uncertainty. Confirmed unavailability SHALL exclude the affected route for a bounded, cause-appropriate period instead of probing it on every assignment. Reassignment SHALL select a capable configured executor and preserve partial work. When no connected profile can serve the next required work, the task SHALL retain its checkpoint, report the reason and any known recovery condition, and suspend without purchases, repeated model probes or infinite retries. One active lead SHALL own decisions and acceptance for a task, and workers SHALL NOT create recursive agent trees.
+The runtime SHALL distinguish quota exhaustion, temporary throttling, authentication/model rejection, transport failure and incomplete output from retained provider evidence, preserving original cause, scope and uncertainty. Confirmed unavailability SHALL exclude the affected route for a bounded, cause-appropriate period instead of probing it on every assignment. Reassignment SHALL select a capable configured executor and preserve partial work. When no connected profile can serve the next required work, the task SHALL retain its checkpoint, report the reason and any known recovery condition, and suspend without purchases, repeated model probes or infinite retries. One active coordinating parent SHALL own decisions and acceptance for an assignment. A Director can own several Lead blocks; a delegated Lead can own Executors only. Executors SHALL NOT create descendants, and recovery SHALL NOT introduce another coordination depth or silently change the configured role route.
 
 #### Scenario: A worker fails after partial work
 - **WHEN** an executor receives a confirmed quota or model refusal after changing files
@@ -205,7 +233,7 @@ The runtime SHALL distinguish quota exhaustion, temporary throttling, authentica
 
 ### Requirement: Lead succession at safe boundaries
 
-The installed task runtime SHALL observe assignment outcomes and perform already authorized lead recovery without requiring a successful response from the unavailable lead. On a confirmed lead failure, the controller SHALL establish exactly one successor lead from the configured capable profiles, with current decisions, assignments and acceptance intact, in its own identified visible conversation, and only at a safe boundary where in-flight executor effects have been reconciled - never in the middle of an executor tool call. A configured preferred lead SHALL regain leadership at a safe decision boundary after verified recovery, without interrupting a healthy executor or duplicating completed work. Problems beyond available capability SHALL remain explicit dependencies rather than being guessed away. Instruction-refresh succession is owned by the follow-up change and SHALL NOT be claimed by this capability. Unsupported control contracts SHALL produce an explicit capability limitation before activation.
+The installed task runtime SHALL observe assignment outcomes and perform already authorized lead recovery without requiring a successful response from the unavailable lead. On a confirmed lead failure, the controller SHALL establish exactly one successor lead from the configured capable profiles, with current decisions, assignments and acceptance intact, in its own identified visible conversation, and only at a safe boundary where in-flight executor effects have been reconciled - never in the middle of an executor tool call. A configured preferred lead SHALL regain leadership at a safe decision boundary after verified recovery, without interrupting a healthy executor or duplicating completed work. Problems beyond available capability SHALL remain explicit dependencies rather than being guessed away. In a hierarchy, succession SHALL preserve the failed session's role, immediate parent, children and exact configured profile; a delegated Lead SHALL NOT inherit the root Director's authority or successor route. The surviving Director SHALL remain the acceptance owner of a recovered Lead block. Instruction-refresh succession is owned by the follow-up change and SHALL NOT be claimed by this capability. Unsupported control contracts SHALL produce an explicit capability limitation before activation.
 
 #### Scenario: The lead cannot issue a fallback instruction
 - **WHEN** an active lead receives a confirmed quota-exhaustion response before it can request recovery
@@ -219,9 +247,13 @@ The installed task runtime SHALL observe assignment outcomes and perform already
 - **WHEN** every configured lead profile is unavailable but an executor can finish an existing assignment
 - **THEN** that result is delivered, hard unresolved decisions remain pending, and the task does not claim full completion before required acceptance
 
+#### Scenario: Delegated Lead recovery keeps its team
+- **WHEN** a delegated Lead needs recovery while its Executors have partial or completed work
+- **THEN** the Director and runtime reconcile in-flight effects, preserve the child bindings and pending results, and recover the Lead on its configured route without duplicate writers or promotion to Director
+
 ### Requirement: Restart recovery and explicit stop
 
-After an unexpected controller or client interruption, the runtime SHALL reconcile saved task, process and worktree state and restore required visible conversation views before resuming active authorized work. It SHALL reconnect or recover surviving assignments instead of starting duplicate copies. Explicit user stop, task cancellation or integration disconnection SHALL disable automatic dispatch for the affected task and SHALL NOT be undone by a quota reset or process restart. Stop SHALL preserve recoverable partial work and prevent orphaned owned writers. Losing one client SHALL NOT suspend another task whose required conversations remain visible.
+After an unexpected controller interruption while the controlling CLI remains available, the runtime SHALL reconcile saved task, process and worktree state and restore required visible conversation views before resuming active authorized work. Closing or losing the controlling CLI SHALL instead preserve its hierarchy for explicit user resumption under `director-orchestration`; reopening alone SHALL NOT dispatch model work. It SHALL reconnect or recover surviving assignments instead of starting duplicate copies. Explicit user stop, task cancellation or integration disconnection SHALL disable automatic dispatch for the affected task and SHALL NOT be undone by a quota reset or process restart. Stop SHALL preserve recoverable partial work and prevent orphaned owned writers. Stopping a delegated Lead SHALL include its owned subtree, while stopping a direct Executor SHALL remain isolated to that run. Losing one client SHALL NOT suspend another task whose required conversations remain visible.
 
 #### Scenario: The controller restarts with surviving workers
 - **WHEN** the controller restarts after failure and executors may still be active
@@ -231,9 +263,13 @@ After an unexpected controller or client interruption, the runtime SHALL reconci
 - **WHEN** the user explicitly stops a suspended task and capacity later recovers
 - **THEN** it remains stopped until the user resumes it, with its partial work available
 
+#### Scenario: Reopening does not silently resume a hierarchy
+- **WHEN** a controlling CLI was closed and a new root session opens
+- **THEN** saved assignments, questions and results are available for inspection, but continuation waits for explicit resumption and verified ownership reconciliation
+
 ### Requirement: Globally verified orchestration
 
-Delivery SHALL include installation, update, check, recovery and disconnection through the supported global kit lifecycle. Fresh ordinary Codex sessions outside this checkout SHALL exercise configured lead/executor dispatch, board workflow, distinct native conversations accessible through /agents in one CLI, worktree isolation, steering, recovery and merge through the real entry point, with actual subscribed tool work on a locally selected real external development task whose applicable acceptance passes and whose results are consumed. Failure acceptance SHALL use owned targets and deterministic quota/transport faults rather than exhausting accounts. Public records SHALL contain no consumer-specific data; a toy fixture alone SHALL NOT establish complete delivery.
+Delivery SHALL include installation, update, check, recovery and disconnection through the supported global kit lifecycle. Fresh ordinary Codex sessions outside this checkout SHALL exercise Director-to-Lead-to-Executor and direct Director-to-Executor dispatch, the actual configured ds Lead and Executor routes, role-specific tool visibility, board workflow, distinct native conversations accessible through /agents in one CLI, worktree isolation, steering, explicit restoration and merge through the real entry point, with actual subscribed tool work on a locally selected real external development task whose applicable acceptance passes and whose results are consumed. Failure acceptance SHALL use owned targets and deterministic quota/transport faults rather than exhausting accounts. Public records SHALL contain no consumer-specific data; a toy fixture alone SHALL NOT establish complete delivery.
 
 #### Scenario: A real consuming task completes
 - **WHEN** the globally installed workflow completes a locally selected external development task
@@ -242,6 +278,11 @@ Delivery SHALL include installation, update, check, recovery and disconnection t
 #### Scenario: Recovery is accepted without exhausting a subscription
 - **WHEN** an owned test injects a realistic quota failure at the lead and worker boundaries
 - **THEN** the installed control path performs the expected succession and preserves work, while separate bounded live requests verify the actual configured profile bindings
+
+#### Scenario: Hierarchy is consumed outside the kit
+- **WHEN** the installed workflow performs a locally selected real external task involving multiple blocks and repositories
+- **THEN** Leads coordinate actual Executor work, the Director consumes and accepts the combined result, and role restrictions and recovery are verified through the installed interfaces
+- **AND** native fixtures cover deterministic failures and full admission limits without substituting for the real consumed outcome
 
 ### Requirement: Launcher capability preflight and stale-build handling
 
@@ -336,14 +377,14 @@ Executor dispatch SHALL accept a structured assignment as an alternative to exis
 
 ### Requirement: Concise titles and four executor slots
 
-New executor native conversation titles SHALL begin with `CEx` and retain their profile and assignment owner. The shipped orchestration configuration SHALL permit four concurrent executor runs and independently default the shared worktree pool capacity to four without changing the aggregate heavy-command allowance or explicit executor profile.
+New executor native conversation titles SHALL begin with `CEx` and retain their profile and assignment owner. The shipped orchestration configuration SHALL use the configurable hierarchy limits defined by `director-orchestration`: two direct Leads and four direct Executors per Director, six Executors per Lead, sixteen concurrent Executors across the installation and an independently configurable shared pool capacity of eighteen per repository. Worktrees SHALL be created lazily. Existing explicit local limits SHALL be preserved and their effective bottlenecks reported without changing the aggregate heavy-command allowance or explicit executor profile.
 
 #### Scenario: Executor terminal identity
 - **WHEN** dispatch or continuation exposes an executor conversation
 - **THEN** its title uses `CEx ({profile}) - {owner}` and remains distinct from another owner's conversation
 
 #### Scenario: Configured four-slot pool is full
-- **WHEN** all four configured shared slots contain live, suspended, reserved or unreviewed tasks of any supported type and a fifth independent owner requests dispatch
+- **WHEN** all four explicitly configured shared slots contain live, suspended, reserved or unreviewed tasks of any supported type and a fifth independent owner requests dispatch
 - **THEN** the existing pool reports capacity exhaustion without creating another slot or replacing held work
 
 ### Requirement: Shared heavy-command admission
