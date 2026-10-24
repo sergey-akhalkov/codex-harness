@@ -58,6 +58,18 @@ const STATUS_NATIVE_READ_BOUND: Duration = Duration::from_secs(1);
 const MAX_RESULT_ACKS: usize = 8;
 const MAX_WAIT_MESSAGE_BYTES: usize = 32 * 1024;
 const MAX_WAIT_TURN_PAGES: usize = 64;
+const EXECUTOR_TOOLS: &[&str] = &["executor_ask_lead", "executor_message", "executor_status"];
+const LEAD_TOOLS: &[&str] = &[
+    "executor_dispatch",
+    "executor_status",
+    "executor_wait",
+    "executor_message",
+    "executor_reply",
+    "executor_ask_lead",
+    "executor_stop",
+    "executor_resume",
+    "executor_release",
+];
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -434,6 +446,90 @@ fn generated_owner(caller: &str) -> String {
     format!("mcp-{suffix}-{nanos}")
 }
 
+/// A thread-local executors server table with the role's tool allowlist.
+///
+/// shortcut: Codex 0.164.0 rejects a leaf allowlist for a plugin-generated
+/// server, so the full server table is repeated per thread and the filtered
+/// thread loses `pluginId`; upgrade if a plugin-preserving per-thread filter
+/// becomes available.
+fn executors_tool_filter(source: &Path, tools: &[&str]) -> io::Result<Value> {
+    let path = source.join(".agents/plugins/executors/.mcp.json");
+    let value: Value = serde_json::from_slice(&fs::read(&path).map_err(|error| {
+        invalid(format!(
+            "the installed executors plugin manifest {} is unreadable: {error}",
+            path.display()
+        ))
+    })?)
+    .map_err(|error| {
+        invalid(format!(
+            "the installed executors plugin manifest {} is invalid: {error}",
+            path.display()
+        ))
+    })?;
+    let server = &value["mcpServers"]["executors"];
+    let command = server["command"].as_str().ok_or_else(|| {
+        invalid("the installed executors plugin manifest records no server command")
+    })?;
+    let args = server["args"].as_array().ok_or_else(|| {
+        invalid("the installed executors plugin manifest records no server arguments")
+    })?;
+    let mut table = json!({
+        "command": command,
+        "args": args,
+        "enabled_tools": tools,
+    });
+    if let Some(timeout) = server["tool_timeout_sec"].as_u64() {
+        table["tool_timeout_sec"] = Value::from(timeout);
+    }
+    Ok(json!({"executors": table}))
+}
+
+/// Verify the started child's thread-local catalogue before any turn starts.
+/// The full-table override is only useful if the native runtime actually
+/// applies it; an absent or different catalogue is a capability failure that
+/// preserves the created thread and pool claim for inspection.
+fn verify_role_tools(
+    conversation: &mut Conversation,
+    thread_id: &str,
+    allowed: &[&str],
+) -> io::Result<()> {
+    let answer = conversation.call(
+        "mcpServerStatus/list",
+        json!({
+            "threadId": thread_id,
+            "detail": "toolsAndAuthOnly",
+            "limit": 100
+        }),
+    )?;
+    if !answer["nextCursor"].is_null() {
+        return Err(invalid(
+            "the thread-local MCP catalogue returned more than one page; refusing an unverified role surface",
+        ));
+    }
+    let data = answer["data"]
+        .as_array()
+        .ok_or_else(|| invalid("the thread-local MCP catalogue returned no data array"))?;
+    let server = data
+        .iter()
+        .find(|server| server["name"] == "executors")
+        .ok_or_else(|| {
+            invalid("the thread-local MCP catalogue has no 'executors' server entry; the role filter was not applied")
+        })?;
+    let tools = server["tools"]
+        .as_object()
+        .ok_or_else(|| invalid("the thread-local 'executors' catalogue carries no tools object"))?;
+    let actual: BTreeSet<&str> = tools.keys().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = allowed.iter().copied().collect();
+    if actual != expected {
+        return Err(invalid(format!(
+            "the thread-local executors catalogue differs from the role allowlist: expected [{}], observed [{}]",
+            expected.into_iter().collect::<Vec<_>>().join(", "),
+            actual.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DispatchArgs {
@@ -715,6 +811,11 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
     );
     plan.approval_policy = Some(APPROVAL_POLICY.into());
     plan.overrides = overrides;
+    let filter = match executors_tool_filter(&source, EXECUTOR_TOOLS) {
+        Ok(filter) => filter,
+        Err(error) => return Err(prepared.release(error)),
+    };
+    plan.overrides.insert("mcp_servers".into(), filter);
     if let Some(sandbox) = lead_thread["sandbox"].as_str() {
         plan.sandbox = Some(sandbox.to_owned());
     }
@@ -743,6 +844,14 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
         Ok(status) => status,
         Err(error) => return Err(prepared.release(error)),
     };
+    if let Err(error) = verify_role_tools(&mut conversation, &executor_thread, EXECUTOR_TOOLS) {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; executor thread {executor_thread} was created and the pool claim is preserved because the role tool surface could not be verified"
+            ),
+        ));
+    }
     let turn = match conversation.assign(&prepared.prompt) {
         Ok(turn) => turn,
         Err(error) => {
@@ -896,6 +1005,11 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     );
     plan.approval_policy = Some(APPROVAL_POLICY.into());
     plan.overrides = overrides;
+    let filter = match executors_tool_filter(&source, LEAD_TOOLS) {
+        Ok(filter) => filter,
+        Err(error) => return Err(prepared.release(error)),
+    };
+    plan.overrides.insert("mcp_servers".into(), filter);
     plan.delegated_lead_session = true;
     if let Some(sandbox) = director_thread["sandbox"].as_str() {
         plan.sandbox = Some(sandbox.to_owned());
@@ -925,6 +1039,14 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
         Ok(status) => status,
         Err(error) => return Err(prepared.release(error)),
     };
+    if let Err(error) = verify_role_tools(&mut conversation, &lead_thread, LEAD_TOOLS) {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; delegated Lead thread {lead_thread} was created and the pool claim is preserved because the role tool surface could not be verified"
+            ),
+        ));
+    }
     if let Err(error) =
         control::publish_lead_endpoint(&codex_home, &endpoint.for_thread(&lead_thread)?)
     {

@@ -27,6 +27,18 @@ const SECOND_LEAD: &str = "01a00000-0000-7000-8000-000000000005";
 const SECOND_EXECUTOR: &str = "01a00000-0000-7000-8000-000000000006";
 const THIRD_EXECUTOR: &str = "01a00000-0000-7000-8000-000000000007";
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const ALL_TOOLS: [&str; 10] = [
+    "executor_ask_lead",
+    "executor_dispatch",
+    "executor_message",
+    "executor_release",
+    "executor_reply",
+    "executor_resume",
+    "executor_status",
+    "executor_stop",
+    "executor_wait",
+    "lead_dispatch",
+];
 
 struct Mcp {
     child: Child,
@@ -290,6 +302,7 @@ struct SimThread {
     model: String,
     model_provider: String,
     reasoning_effort: String,
+    tools: Vec<String>,
     turns: Vec<Value>,
     next_turn: u64,
 }
@@ -303,6 +316,7 @@ impl SimThread {
             model: "test-model".into(),
             model_provider: "test-provider".into(),
             reasoning_effort: "high".into(),
+            tools: ALL_TOOLS.iter().map(|tool| (*tool).to_owned()).collect(),
             turns: Vec::new(),
             next_turn: 1,
         }
@@ -316,6 +330,7 @@ impl SimThread {
             model: "test-model".into(),
             model_provider: "test-provider".into(),
             reasoning_effort: "high".into(),
+            tools: ALL_TOOLS.iter().map(|tool| (*tool).to_owned()).collect(),
             turns: vec![json!({"id": turn, "status": "inProgress", "items": []})],
             next_turn: 2,
         }
@@ -522,6 +537,25 @@ fn native_responder(
         let method = request["method"].as_str().unwrap_or_default();
         match method {
             "initialize" => Answer::Result(json!({})),
+            "mcpServerStatus/list" => {
+                let sim = sim.lock().unwrap();
+                let thread = request["params"]["threadId"].as_str().unwrap_or_default();
+                let tools: BTreeMap<String, Value> = sim
+                    .threads
+                    .get(thread)
+                    .map(|thread| {
+                        thread
+                            .tools
+                            .iter()
+                            .map(|tool| (tool.clone(), json!({})))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Answer::Result(json!({
+                    "data": [{"name": "executors", "tools": tools}],
+                    "nextCursor": null
+                }))
+            }
             "thread/read" => {
                 let id = request["params"]["threadId"].as_str().unwrap_or_default();
                 let sim = sim.lock().unwrap();
@@ -548,6 +582,15 @@ fn native_responder(
                 if let Some(effort) = request["params"]["config"]["model_reasoning_effort"].as_str()
                 {
                     thread.reasoning_effort = effort.to_owned();
+                }
+                if let Some(tools) =
+                    request["params"]["config"]["mcp_servers"]["executors"]["enabled_tools"]
+                        .as_array()
+                {
+                    thread.tools = tools
+                        .iter()
+                        .filter_map(|tool| tool.as_str().map(str::to_owned))
+                        .collect();
                 }
                 sim.threads.insert(id.clone(), thread);
                 Answer::Result(json!({
@@ -753,6 +796,22 @@ fn synthetic_run(home: &Path, lead: &str, executor: &str, server: &Server) -> Sy
 
 fn install_kit(home: &Path, root: &Path) {
     let kit = synthetic_role_build::kit_source(root);
+    let plugin = kit.join(".agents/plugins/executors");
+    fs::create_dir_all(&plugin).unwrap();
+    fs::write(
+        plugin.join(".mcp.json"),
+        serde_json::to_vec(&json!({
+            "mcpServers": {
+                "executors": {
+                    "command": "codex-harness",
+                    "args": ["mcp", "executors"],
+                    "tool_timeout_sec": 1860
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     fs::write(
         kit.join("global/orchestration.toml"),
         "schema = 1\nlead_profile = \"default\"\nsuccessor_lead_profile = \"default\"\nexecutor_profiles = [\"ds\"]\nmax_concurrent_executors = 6\nworktree_pool_size = 6\n",
@@ -1766,6 +1825,29 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
     assert_eq!(direct["parentThreadId"], DIRECTOR, "{direct}");
     assert_eq!(direct["rootThreadId"], DIRECTOR, "{direct}");
 
+    let starts = server.requests_for("thread/start");
+    assert_eq!(starts.len(), 3, "{starts:?}");
+    for start in &starts {
+        assert_eq!(
+            start["params"]["config"]["agents.enabled"], false,
+            "{start}"
+        );
+    }
+    let lead_tools = starts[0]["params"]["config"]["mcp_servers"]["executors"]["enabled_tools"]
+        .as_array()
+        .unwrap();
+    assert!(lead_tools.iter().any(|tool| tool == "executor_dispatch"));
+    assert!(!lead_tools.iter().any(|tool| tool == "lead_dispatch"));
+    for index in [1, 2] {
+        let child_tools =
+            starts[index]["params"]["config"]["mcp_servers"]["executors"]["enabled_tools"]
+                .as_array()
+                .unwrap();
+        assert!(child_tools.iter().any(|tool| tool == "executor_status"));
+        assert!(!child_tools.iter().any(|tool| tool == "executor_dispatch"));
+        assert!(!child_tools.iter().any(|tool| tool == "lead_dispatch"));
+    }
+
     // A vague Lead assignment is refused before any new thread.
     let starts_before = server.requests_for("thread/start").len();
     let refused = mcp.call_tool(
@@ -1777,6 +1859,50 @@ fn director_dispatches_a_prepared_change_to_a_lead_that_dispatches_an_executor()
     assert!(tool_error(&refused).contains("lead_change"), "{refused}");
     assert_eq!(server.requests_for("thread/start").len(), starts_before);
 
+    mcp.finish();
+}
+
+#[test]
+fn a_missing_role_tool_catalogue_fails_before_the_turn() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (_repository, lead) = delegated_lead_run(home.path(), root.path(), &server);
+    let base = lead["base"].as_str().unwrap().to_owned();
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        "unused",
+        Path::new(lead["checkout"].as_str().unwrap()),
+        false,
+        false,
+    )));
+    let responder = native_responder(sim);
+    server.answer_fn(move |request| {
+        if request["method"] == "mcpServerStatus/list" {
+            Answer::Result(json!({"data": [], "nextCursor": null}))
+        } else {
+            responder(request)
+        }
+    });
+    let mut mcp = Mcp::start(home.path());
+    let starts = server.requests_for("thread/start").len();
+    let turns = server.requests_for("turn/start").len();
+    let refused = mcp.call(
+        2,
+        json!({
+            "owner": "unfiltered-child",
+            "base": base,
+            "assignment": assignment("should not start a turn")
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&refused).contains("no 'executors' server entry"),
+        "{refused}"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), starts + 1);
+    assert_eq!(server.requests_for("turn/start").len(), turns);
     mcp.finish();
 }
 
