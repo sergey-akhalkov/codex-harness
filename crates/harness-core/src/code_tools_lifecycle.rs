@@ -45,6 +45,8 @@ pub struct Report {
     pub mutated: bool,
     pub registration: Value,
     pub inventory_servers: Vec<String>,
+    /// `plugin` after the explicit ownership handoff, otherwise `legacy`.
+    pub serena_owner: &'static str,
 }
 
 fn conflict(message: &str) -> io::Error {
@@ -208,6 +210,12 @@ pub fn run(request: &Request) -> io::Result<Report> {
     let user = normal(&request.user_home)?;
     let dependency = normal(&request.dependency_user_home)?;
     let _locks = InstallationLocks::acquire(&user, &dependency)?;
+    let serena_plugin_owned = mcp_registration::serena_plugin_owned(&home)?;
+    let serena_owner = if serena_plugin_owned {
+        "plugin"
+    } else {
+        "legacy"
+    };
     if request.mode != Mode::Recover {
         for name in [
             "harness/activation-pending.json",
@@ -229,7 +237,11 @@ pub fn run(request: &Request) -> io::Result<Report> {
         .into_iter()
         .flatten()
         .any(|item| item["id"] == "serena" && adopted(item));
-    if matches!(request.mode, Mode::Install | Mode::Update) && !request.preview && !serena_adopted {
+    if matches!(request.mode, Mode::Install | Mode::Update)
+        && !request.preview
+        && !serena_plugin_owned
+        && !serena_adopted
+    {
         return Err(conflict(
             "Serena dependency is missing or incompatible; explicit provisioning is required.",
         ));
@@ -252,6 +264,7 @@ pub fn run(request: &Request) -> io::Result<Report> {
             mutated: !request.preview,
             registration,
             inventory_servers: Vec::new(),
+            serena_owner,
         });
     }
     if activating && let Some(manager) = request.manager.as_deref() {
@@ -276,13 +289,21 @@ pub fn run(request: &Request) -> io::Result<Report> {
             .into_iter()
             .flatten()
         {
+            if serena_plugin_owned && name == "serena" {
+                continue;
+            }
             retained_for_graph["registrations"][name] = spec.clone();
         }
     }
-    // Mutating modes never silently drop a managed connection: every managed
-    // tool must carry a verified native registration.
+    // Mutating modes never silently drop a managed connection: Nuphus and,
+    // before migration, legacy Serena each need a verified native registration.
     if activating {
-        for name in ["serena", "nuphus"] {
+        let required: &[&str] = if serena_plugin_owned {
+            &["nuphus"]
+        } else {
+            &["serena", "nuphus"]
+        };
+        for name in required {
             if retained_for_graph["registrations"][name].is_null() {
                 return Err(conflict(&format!(
                     "{name} has no verified native connection; explicit provisioning is required."
@@ -290,7 +311,7 @@ pub fn run(request: &Request) -> io::Result<Report> {
             }
         }
     }
-    let registration = mcp_registration::apply(&RegistrationRequest {
+    let mut registration = mcp_registration::apply(&RegistrationRequest {
         codex_home: home.clone(),
         mode: match request.mode {
             Mode::Install if !request.preview => "Install".into(),
@@ -302,6 +323,9 @@ pub fn run(request: &Request) -> io::Result<Report> {
         preview: request.preview,
         retained_registrations: Some(retained_for_graph),
     })?;
+    if serena_plugin_owned {
+        registration["serena_owner"] = json!("plugin");
+    }
     let servers = inventory["mcp"]
         .as_array()
         .into_iter()
@@ -318,6 +342,7 @@ pub fn run(request: &Request) -> io::Result<Report> {
             mutated: false,
             registration,
             inventory_servers: servers,
+            serena_owner,
         });
     }
     if request.mode == Mode::Disconnect {
@@ -330,6 +355,7 @@ pub fn run(request: &Request) -> io::Result<Report> {
             mutated: !request.preview,
             registration,
             inventory_servers: servers,
+            serena_owner,
         });
     }
     let mut registry = inventory.clone();
@@ -349,6 +375,7 @@ pub fn run(request: &Request) -> io::Result<Report> {
         mutated: true,
         registration,
         inventory_servers: servers,
+        serena_owner,
     })
 }
 
@@ -358,6 +385,50 @@ mod tests {
 
     fn repo() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn write_plugin_marker(home: &Path) {
+        let marker = home.join(mcp_registration::SERENA_PLUGIN_OWNER_MARKER);
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(
+            marker,
+            json!({
+                "schema_version": 1,
+                "plugin": mcp_registration::SERENA_PLUGIN_ID
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn seed_legacy_connections(home: &Path) {
+        fs::write(
+            home.join("config.toml"),
+            "model = 'fixture'\n[mcp_servers.foreign]\ncommand = 'foreign.exe'\nargs = []\n",
+        )
+        .unwrap();
+        let plan = json!({
+            "serena": {
+                "command": "D:/mgr.exe",
+                "args": ["mcp", "serena", "--serena", "D:/serena.exe"]
+            },
+            "nuphus": {
+                "command": "D:/mgr.exe",
+                "args": ["mcp", "nuphus"]
+            }
+        });
+        mcp_registration::apply(&RegistrationRequest {
+            codex_home: home.to_owned(),
+            mode: "Install".into(),
+            defer_commit: false,
+            preview: false,
+            retained_registrations: Some(json!({"registrations": plan})),
+        })
+        .unwrap();
+    }
+
+    fn servers_text(home: &Path) -> String {
+        fs::read_to_string(home.join("config.toml")).unwrap()
     }
 
     #[test]
@@ -508,6 +579,120 @@ mod tests {
         assert!(error.to_string().contains("explicit provisioning"));
         assert_eq!(fs::read(&wrapper).unwrap(), b"opencode-wrapper");
         assert!(!home.join("harness/code-tools.json").exists());
+    }
+
+    #[test]
+    fn invalid_plugin_marker_keeps_the_legacy_serena_requirement() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        fs::create_dir_all(home.join("harness")).unwrap();
+        fs::write(
+            home.join(mcp_registration::SERENA_PLUGIN_OWNER_MARKER),
+            json!({"schema_version": 1, "plugin": "wrong@marketplace"}).to_string(),
+        )
+        .unwrap();
+        let error = run(&Request {
+            source: repo(),
+            codex_home: home.clone(),
+            user_home: root.path().join("user"),
+            dependency_user_home: root.path().join("dependency"),
+            mode: Mode::Update,
+            preview: false,
+            manager: None,
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("explicit provisioning"),
+            "{error}"
+        );
+        assert!(!home.join("harness/code-tools.json").exists());
+        assert!(!home.join("harness/code-tools-registration.json").exists());
+    }
+
+    #[test]
+    fn marker_alone_does_not_retire_or_recreate_legacy_serena() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        fs::create_dir_all(home.join("harness")).unwrap();
+        seed_legacy_connections(&home);
+        write_plugin_marker(&home);
+        let request = |mode| Request {
+            source: repo(),
+            codex_home: home.clone(),
+            user_home: root.path().join("user"),
+            dependency_user_home: root.path().join("dependency"),
+            mode,
+            preview: false,
+            manager: None,
+        };
+
+        let checked = run(&request(Mode::Check)).unwrap();
+        assert_eq!(checked.serena_owner, "plugin");
+        assert_eq!(checked.registration["serena_owner"], "plugin");
+        assert!(serena_operations(&checked).is_empty());
+        assert!(servers_text(&home).contains("[mcp_servers.serena]"));
+
+        let installed = run(&request(Mode::Install)).unwrap();
+        assert_eq!(installed.serena_owner, "plugin");
+        assert!(serena_operations(&installed).is_empty());
+        let updated = run(&request(Mode::Update)).unwrap();
+        assert_eq!(updated.serena_owner, "plugin");
+        assert!(serena_operations(&updated).is_empty());
+        let config = servers_text(&home);
+        assert!(config.contains("[mcp_servers.serena]"), "{config}");
+        assert!(config.contains("[mcp_servers.nuphus]"), "{config}");
+        assert!(config.contains("[mcp_servers.foreign]"), "{config}");
+        assert!(
+            mcp_registration::serena_plugin_owned(&home).unwrap(),
+            "the explicit marker must remain"
+        );
+    }
+
+    #[test]
+    fn post_retirement_lifecycle_preserves_nuphus_and_plugin_state() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        fs::create_dir_all(home.join("harness")).unwrap();
+        seed_legacy_connections(&home);
+        write_plugin_marker(&home);
+        let plugin_state = home.join("harness/serena-plugin/state.json");
+        fs::create_dir_all(plugin_state.parent().unwrap()).unwrap();
+        fs::write(&plugin_state, b"plugin-owned-state").unwrap();
+        mcp_registration::retire_legacy_serena(&home).unwrap();
+        let request = |mode| Request {
+            source: repo(),
+            codex_home: home.clone(),
+            user_home: root.path().join("user"),
+            dependency_user_home: root.path().join("dependency"),
+            mode,
+            preview: false,
+            manager: None,
+        };
+
+        let checked = run(&request(Mode::Check)).unwrap();
+        assert_eq!(checked.serena_owner, "plugin");
+        assert_eq!(checked.registration["serena_owner"], "plugin");
+        assert!(serena_operations(&checked).is_empty());
+        let installed = run(&request(Mode::Install)).unwrap();
+        assert_eq!(installed.serena_owner, "plugin");
+        assert!(serena_operations(&installed).is_empty());
+        let updated = run(&request(Mode::Update)).unwrap();
+        assert_eq!(updated.serena_owner, "plugin");
+        let config = servers_text(&home);
+        assert!(!config.contains("[mcp_servers.serena]"), "{config}");
+        assert!(config.contains("[mcp_servers.nuphus]"), "{config}");
+        assert!(config.contains("[mcp_servers.foreign]"), "{config}");
+
+        let recovered = run(&request(Mode::Recover)).unwrap();
+        assert_eq!(recovered.serena_owner, "plugin");
+        let disconnected = run(&request(Mode::Disconnect)).unwrap();
+        assert_eq!(disconnected.serena_owner, "plugin");
+        let config = servers_text(&home);
+        assert!(!config.contains("[mcp_servers.serena]"), "{config}");
+        assert!(!config.contains("[mcp_servers.nuphus]"), "{config}");
+        assert!(config.contains("[mcp_servers.foreign]"), "{config}");
+        assert_eq!(fs::read(&plugin_state).unwrap(), b"plugin-owned-state");
+        assert!(mcp_registration::serena_plugin_owned(&home).unwrap());
     }
 
     fn write_native_serena(home: &Path, spec: &Value, connection: bool) -> Vec<u8> {

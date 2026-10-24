@@ -2,6 +2,9 @@
 //! managed CodeGraph retirement. Does not download packages, probe the
 //! published runtime, or write live global MCP.
 #![cfg(windows)]
+use harness_core::mcp_registration::{
+    self, RegistrationRequest, SERENA_PLUGIN_ID, SERENA_PLUGIN_OWNER_MARKER,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -182,6 +185,21 @@ fn parsed_config(home: &Path) -> Value {
 fn receipt(home: &Path) -> Value {
     serde_json::from_slice(&fs::read(home.join("harness/code-tools-registration.json")).unwrap())
         .unwrap()
+}
+
+fn write_plugin_marker(home: &Path) {
+    let marker = home.join(SERENA_PLUGIN_OWNER_MARKER);
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(
+        marker,
+        json!({"schema_version": 1, "plugin": SERENA_PLUGIN_ID}).to_string(),
+    )
+    .unwrap();
+}
+
+fn seed_legacy_connections(home: &Path) -> Value {
+    let plan = retained_plan("C:\\python\\python.exe", "C:\\pwsh\\pwsh.exe", home);
+    run_apply(home, "Install", &["--retained-registrations-json", &plan])
 }
 
 fn restamp_owned_block_as_toml(home: &Path) {
@@ -932,4 +950,197 @@ fn isolated_apply_accepts_native_nuphus_unlimited_and_preserves_serena_unlimited
     let text = fs::read_to_string(home.join("config.toml")).unwrap();
     assert!(text.contains("retain my comment"), "{text}");
     assert_eq!(servers["foreign"]["command"], "untouched.exe");
+}
+
+#[test]
+fn serena_plugin_owner_marker_requires_exact_schema_and_plugin() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    let marker = home.join(SERENA_PLUGIN_OWNER_MARKER);
+    assert!(!mcp_registration::serena_plugin_owned(&home).unwrap());
+
+    fs::write(&marker, b"not json").unwrap();
+    assert!(!mcp_registration::serena_plugin_owned(&home).unwrap());
+
+    fs::write(
+        &marker,
+        json!({"schema_version": 2, "plugin": SERENA_PLUGIN_ID}).to_string(),
+    )
+    .unwrap();
+    assert!(!mcp_registration::serena_plugin_owned(&home).unwrap());
+
+    fs::write(
+        &marker,
+        json!({"schema_version": 1, "plugin": "another-serena"}).to_string(),
+    )
+    .unwrap();
+    assert!(!mcp_registration::serena_plugin_owned(&home).unwrap());
+    let error = mcp_registration::retire_legacy_serena(&home).unwrap_err();
+    assert!(error.to_string().contains("marker"), "{error}");
+
+    write_plugin_marker(&home);
+    assert!(mcp_registration::serena_plugin_owned(&home).unwrap());
+    let no_legacy = mcp_registration::retire_legacy_serena(&home).unwrap();
+    assert_eq!(no_legacy["status"], "no-owned-legacy-serena");
+}
+
+#[test]
+fn post_marker_check_install_and_update_do_not_project_legacy_serena() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    write_plugin_marker(&home);
+    let plan = retained_plan("C:\\python\\python.exe", "C:\\pwsh\\pwsh.exe", &home);
+
+    let checked = run_apply(&home, "Check", &["--retained-registrations-json", &plan]);
+    assert_eq!(checked["serena_owner"], "plugin", "{checked}");
+    assert!(
+        !checked["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| operation["name"] == "serena"),
+        "{checked}"
+    );
+
+    let installed = run_apply(&home, "Install", &["--retained-registrations-json", &plan]);
+    assert_eq!(installed["serena_owner"], "plugin", "{installed}");
+    let servers = servers(&home);
+    assert!(servers.get("serena").is_none(), "{servers}");
+    assert_eq!(servers["nuphus"]["args"][5], "nuphus");
+    assert_eq!(servers["foreign"]["command"], "untouched.exe");
+    assert_eq!(receipt(&home)["registrations"].get("serena"), None);
+    assert!(mcp_registration::serena_plugin_owned(&home).unwrap());
+}
+
+#[test]
+fn retirement_removes_only_owned_serena_and_preserves_plugin_state() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    let package = shared_package(root.path(), "shared-package");
+    seed_legacy_connections(&home);
+    write_plugin_marker(&home);
+    let marker = home.join(SERENA_PLUGIN_OWNER_MARKER);
+    let marker_bytes = fs::read(&marker).unwrap();
+    let plugin_state = home.join("harness/serena-plugin/state.json");
+    fs::create_dir_all(plugin_state.parent().unwrap()).unwrap();
+    fs::write(&plugin_state, b"plugin-owned-state").unwrap();
+
+    let retired = mcp_registration::retire_legacy_serena(&home).unwrap();
+    assert_eq!(retired["status"], "serena-retired", "{retired}");
+    let servers = servers(&home);
+    assert!(servers.get("serena").is_none(), "{servers}");
+    assert_eq!(servers["nuphus"]["args"][5], "nuphus");
+    assert_eq!(servers["foreign"]["command"], "untouched.exe");
+    let text = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(text.contains("# retain my comment"), "{text}");
+    assert!(text.contains("model = \"gpt-6-astra\""), "{text}");
+
+    let recorded = receipt(&home);
+    assert_eq!(recorded["registrations"].get("serena"), None);
+    assert!(recorded["registrations"].get("nuphus").is_some());
+    assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+    assert_eq!(fs::read(&plugin_state).unwrap(), b"plugin-owned-state");
+    assert_eq!(fs::read(package.join("keep.txt")).unwrap(), b"shared-bytes");
+}
+
+#[test]
+fn retirement_refuses_a_foreign_serialized_serena_edit() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    seed_legacy_connections(&home);
+    write_plugin_marker(&home);
+    let text = fs::read_to_string(home.join("config.toml")).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        text.replacen("launch.py", "launch-user.py", 1),
+    )
+    .unwrap();
+    let config = fs::read(home.join("config.toml")).unwrap();
+    let state = fs::read(home.join("harness/code-tools-registration.json")).unwrap();
+
+    let error = mcp_registration::retire_legacy_serena(&home).unwrap_err();
+    assert!(
+        error.to_string().contains("ownership conflict")
+            || error.to_string().contains("preserving"),
+        "{error}"
+    );
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), config);
+    assert_eq!(
+        fs::read(home.join("harness/code-tools-registration.json")).unwrap(),
+        state
+    );
+    assert!(
+        !home
+            .join("harness/code-tools-registration-pending.json")
+            .exists()
+    );
+}
+
+#[test]
+fn retirement_does_not_recreate_a_missing_unrelated_owned_registration() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    seed_legacy_connections(&home);
+    write_plugin_marker(&home);
+    let mut config: toml::Table =
+        toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+    config["mcp_servers"]
+        .as_table_mut()
+        .unwrap()
+        .remove("nuphus");
+    let edited = toml::to_string(&config).unwrap();
+    fs::write(home.join("config.toml"), &edited).unwrap();
+
+    let error = mcp_registration::retire_legacy_serena(&home).unwrap_err();
+    assert!(error.to_string().contains("nuphus"), "{error}");
+    assert!(error.to_string().contains("missing"), "{error}");
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        edited
+    );
+    assert!(servers(&home).get("serena").is_some());
+    assert!(servers(&home).get("nuphus").is_none());
+}
+
+#[test]
+fn interrupted_serena_retirement_recovers_the_previous_route() {
+    let root = tempfile::tempdir().unwrap();
+    let home = write_home(root.path());
+    seed_legacy_connections(&home);
+    write_plugin_marker(&home);
+    let config = fs::read(home.join("config.toml")).unwrap();
+    let state = fs::read(home.join("harness/code-tools-registration.json")).unwrap();
+
+    let interrupted = mcp_registration::apply(&RegistrationRequest {
+        codex_home: home.clone(),
+        mode: "RetireSerena".into(),
+        defer_commit: true,
+        preview: false,
+        retained_registrations: None,
+    })
+    .unwrap();
+    assert_eq!(interrupted["status"], "serena-retired", "{interrupted}");
+    assert!(
+        home.join("harness/code-tools-registration-pending.json")
+            .is_file()
+    );
+    assert!(servers(&home).get("serena").is_none());
+    let error = mcp_registration::retire_legacy_serena(&home).unwrap_err();
+    assert!(error.to_string().contains("Recover"), "{error}");
+
+    let recovered = run_apply(&home, "Recover", &[]);
+    assert_eq!(recovered["status"], "registration-recovered");
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), config);
+    assert_eq!(
+        fs::read(home.join("harness/code-tools-registration.json")).unwrap(),
+        state
+    );
+    assert!(
+        !home
+            .join("harness/code-tools-registration-pending.json")
+            .exists()
+    );
+    assert!(servers(&home).get("serena").is_some());
+    assert_eq!(servers(&home)["nuphus"]["args"][5], "nuphus");
+    assert!(mcp_registration::serena_plugin_owned(&home).unwrap());
 }

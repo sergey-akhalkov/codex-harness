@@ -1,7 +1,8 @@
-//! Owned CodeGraph MCP registration journal for an explicit Codex home.
+//! Owned MCP registration journal for an explicit Codex home.
 //! Install/Update retire only owned CBM, Graphify and CodeGraph entries.
-//! Check is read-only. Recover
-//! restores interrupted activation. Disconnect removes the owned native block.
+//! Check is read-only. Recover restores interrupted activation. Disconnect
+//! removes the owned native block. An explicit plugin-owner marker keeps later
+//! lifecycle operations from recreating the superseded Serena connection.
 //! Callers pass an owned home; this module does not search for or mutate a
 //! default global Codex home.
 #![cfg(windows)]
@@ -34,6 +35,8 @@ const GRAPHIFY: &str = "graphify";
 const GRAPH: &str = "codegraph";
 const LSP: &str = "harness-lsp";
 const READINESS: &str = "mcp_optional_startup_grace_ms";
+pub const SERENA_PLUGIN_ID: &str = "serena@coding-agents-harness";
+pub const SERENA_PLUGIN_OWNER_MARKER: &str = "harness/serena-plugin-owner.json";
 
 #[path = "mcp_registration_toml.rs"]
 mod statements;
@@ -46,14 +49,100 @@ pub struct RegistrationRequest {
     pub retained_registrations: Option<Value>,
 }
 
+/// The marker is written by the packaged prepare/verify owner only after the
+/// plugin candidate has been verified. Invalid or absent markers deliberately
+/// preserve the pre-migration lifecycle.
+pub fn serena_plugin_owned(codex_home: &Path) -> io::Result<bool> {
+    let home = local_path(codex_home)?;
+    let Ok(Some(bytes)) = read_optional(&home.join(SERENA_PLUGIN_OWNER_MARKER)) else {
+        return Ok(false);
+    };
+    let Ok(marker) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(
+        marker.get("schema_version").and_then(Value::as_u64) == Some(1)
+            && marker.get("plugin").and_then(Value::as_str) == Some(SERENA_PLUGIN_ID),
+    )
+}
+
+/// Removes only the Serena connection recorded in the owned registration
+/// journal. The caller invokes this after the packaged plugin has passed its
+/// semantic verification; this function does not infer readiness from an
+/// installed plugin or cache.
+pub fn retire_legacy_serena(codex_home: &Path) -> io::Result<Value> {
+    let home = local_path(codex_home)?;
+    if !serena_plugin_owned(&home)? {
+        return Err(conflict(
+            "Serena plugin ownership marker is absent or invalid; preserving the legacy registration.",
+        ));
+    }
+    let state_path = home.join("harness/code-tools-registration.json");
+    let pending_path = home.join("harness/code-tools-registration-pending.json");
+    inventory::ordinary_parents(&state_path)?;
+    inventory::ordinary_parents(&pending_path)?;
+    if read_optional(&pending_path)?.is_some() {
+        return Err(conflict(
+            "Interrupted MCP registration: run the native code-tools Recover.",
+        ));
+    }
+    let state_bytes = read_bytes(&state_path)?;
+    if state_bytes.is_empty() {
+        return Ok(json!({
+            "status": "no-owned-legacy-serena",
+            "serena_owner": "plugin",
+            "retired": [],
+            "model_calls": 0
+        }));
+    }
+    let state: Value = serde_json::from_slice(&state_bytes)?;
+    if state["schema_version"] != 1 {
+        return Err(conflict(
+            "Unknown registration state schema; preserving configuration.",
+        ));
+    }
+    let Some(registrations) = state["registrations"].as_object() else {
+        return Err(invalid("registration state"));
+    };
+    if !registrations.contains_key("serena") {
+        return Ok(json!({
+            "status": "no-owned-legacy-serena",
+            "serena_owner": "plugin",
+            "retired": [],
+            "model_calls": 0
+        }));
+    }
+    let result = apply(&RegistrationRequest {
+        codex_home: home,
+        mode: "RetireSerena".into(),
+        defer_commit: false,
+        preview: false,
+        retained_registrations: None,
+    });
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if pending_path.exists() => Err(conflict(&format!(
+            "{error}; interrupted retirement retained {}; run the native code-tools Recover",
+            pending_path.display()
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn apply(request: &RegistrationRequest) -> io::Result<Value> {
     if !matches!(
         request.mode.as_str(),
-        "Install" | "Update" | "Check" | "Disconnect" | "Recover"
+        "Install" | "Update" | "Check" | "Disconnect" | "Recover" | "RetireSerena"
     ) {
-        return Err(invalid("unsupported CodeGraph registration mode"));
+        return Err(invalid("unsupported MCP registration mode"));
     }
     let home = local_path(&request.codex_home)?;
+    let plugin_owned = serena_plugin_owned(&home)?;
+    if request.mode == "RetireSerena" && !plugin_owned {
+        return Err(conflict(
+            "Serena plugin ownership marker is absent or invalid; preserving the legacy registration.",
+        ));
+    }
     let config = home.join("config.toml");
     let state_path = home.join("harness/code-tools-registration.json");
     let pending_path = home.join("harness/code-tools-registration-pending.json");
@@ -80,15 +169,52 @@ pub fn apply(request: &RegistrationRequest) -> io::Result<Value> {
             "Unknown registration state schema; preserving configuration.",
         ));
     }
-    let desired = desired_registrations(
-        &state,
-        request.mode.as_str(),
-        request.retained_registrations.as_ref(),
-    )?;
+    let mut desired = if request.mode == "RetireSerena" {
+        let registrations = state["registrations"]
+            .as_object()
+            .ok_or_else(|| invalid("registration state"))?;
+        let mut desired = BTreeMap::new();
+        for (name, spec) in registrations {
+            if name != "serena" {
+                registration_table(spec)?;
+                desired.insert(name.clone(), spec.clone());
+            }
+        }
+        desired
+    } else {
+        desired_registrations(
+            &state,
+            request.mode.as_str(),
+            request.retained_registrations.as_ref(),
+        )?
+    };
+    // The marker makes the plugin the only Serena owner. A missing journal
+    // entry is complete: no later Install/Update/Check may project the legacy
+    // core command again. An existing owned entry stays untouched until the
+    // explicit retirement operation.
+    if plugin_owned
+        && request.mode != "RetireSerena"
+        && !state["registrations"]
+            .as_object()
+            .is_some_and(|registrations| registrations.contains_key("serena"))
+    {
+        desired.remove("serena");
+    }
     let names = all_names(&state, &desired);
     let parsed = parse_config(&before)?;
     let servers = mcp_servers(&parsed);
     refuse_conflicts(&servers, &state, &names)?;
+    if request.mode == "RetireSerena"
+        && let Some(registrations) = state["registrations"].as_object()
+    {
+        for name in registrations.keys() {
+            if name != "serena" && !servers.contains_key(name) {
+                return Err(conflict(&format!(
+                    "Owned MCP registration {name} is missing; preserving current settings."
+                )));
+            }
+        }
+    }
     let mut ops = operations(&servers, &desired, &names)?;
     let readiness = readiness_plan(&parsed, &state, &request.mode)?;
     if let Some(operation) = &readiness.operation {
@@ -100,6 +226,7 @@ pub fn apply(request: &RegistrationRequest) -> io::Result<Value> {
             "callable": false,
             "serving_allowed": false,
             "operations": ops,
+            "serena_owner": if plugin_owned { "plugin" } else { "legacy" },
             "note": "CodeGraph, Graphify and Codebase Memory are retired and carry no kit surface; their host residue is inert.",
             "model_calls": 0
         }));
@@ -112,7 +239,12 @@ pub fn apply(request: &RegistrationRequest) -> io::Result<Value> {
             "model_calls": 0
         }));
     }
-    if ops.is_empty() {
+    if ops.is_empty()
+        && !(request.mode == "RetireSerena"
+            && state["registrations"]
+                .as_object()
+                .is_some_and(|registrations| registrations.contains_key("serena")))
+    {
         return Ok(json!({"status": "unchanged-registration", "model_calls": 0}));
     }
     let prepared = adjust_readiness(&before, readiness.target.as_ref())?;
@@ -165,10 +297,19 @@ pub fn apply(request: &RegistrationRequest) -> io::Result<Value> {
             delete_regular(&pending_path)?;
         }
         Ok(json!({
-            "status": if request.mode == "Disconnect" { "disconnected" } else { "connected" },
+            "status": match request.mode.as_str() {
+                "Disconnect" => "disconnected",
+                "RetireSerena" => "serena-retired",
+                _ => "connected",
+            },
             "servers": desired.keys().cloned().collect::<Vec<_>>(),
             "callable": Value::Null,
-            "retired": if request.mode == "Disconnect" { Value::Array(vec![]) } else { json!([CBM, GRAPHIFY, GRAPH]) },
+            "serena_owner": if plugin_owned { "plugin" } else { "legacy" },
+            "retired": match request.mode.as_str() {
+                "Disconnect" => Value::Array(vec![]),
+                "RetireSerena" => json!(["serena"]),
+                _ => json!([CBM, GRAPHIFY, GRAPH]),
+            },
             "model_calls": 0
         }))
     })();
@@ -500,6 +641,13 @@ fn readiness_plan(parsed: &toml::Table, state: &Value, mode: &str) -> io::Result
         return Err(conflict(
             "Native MCP readiness ownership conflict; preserving current settings.",
         ));
+    }
+    if mode == "RetireSerena" {
+        return Ok(ReadinessPlan {
+            policy: prior.cloned().unwrap_or(Value::Null),
+            target: actual.cloned(),
+            operation: None,
+        });
     }
     if mode == "Disconnect" {
         let target = if prior.is_some_and(|policy| policy["previous_present"] == false) {
