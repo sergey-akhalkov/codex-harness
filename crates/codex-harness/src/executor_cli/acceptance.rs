@@ -34,8 +34,9 @@ codex-harness executor accept TASK --project DIRECTORY [--source CHECKOUT] [--co
   recorded parent, takes the newest retained completion for TASK unless --run
   names the exact generation, records the exact clean repository revision set,
   writes the acceptance binding through the board owner and closes the task
-  with reason 'accepted'. A Lead block with unfinished board children is
-  refused before board effects. Acceptance never releases a workspace.
+  with reason 'accepted'. A task with live board dependencies or a Lead block
+  with unfinished board children is refused before board effects. Acceptance
+  never releases a workspace.
   Repeating the same accepted result is a no-op; --run resolves only an
   ambiguous timestamp tie and never bypasses a newer retained or unresolved
   correction.";
@@ -170,6 +171,7 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
     if board_cli::issue_metadata(&issue).contains_key(ACCEPTANCE_METADATA) {
         return Err(board_cli::open_acceptance_refusal(&request.task));
     }
+    refuse_blocked_dependencies(&issue, &request.task)?;
     let config_source = if source.join("global/roles.toml").is_file() {
         source.clone()
     } else {
@@ -650,6 +652,28 @@ fn required_revision_path(value: &Value, field: &str) -> io::Result<PathBuf> {
                 "accepted workspace evidence records no usable {field}; refusing an incomplete repository revision set"
             ))
         })
+}
+
+/// A board `blocks` relationship is separate from the parent-child tree. The
+/// board owner refuses the accepted close while a blocker is open; refuse
+/// before metadata is written so a waiting dependency has no false completion
+/// and can be accepted normally after its prerequisite is verified.
+fn refuse_blocked_dependencies(issue: &Value, task: &str) -> io::Result<()> {
+    let blockers: Vec<&str> = issue["dependencies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|dependency| dependency["dependency_type"].as_str() == Some("blocks"))
+        .filter(|dependency| dependency["status"].as_str() != Some("closed"))
+        .filter_map(|dependency| dependency["id"].as_str())
+        .collect();
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    Err(invalid(&format!(
+        "dependent task {task} is blocked by prerequisite contract {}; verify and record the prerequisite, then retry. No acceptance metadata or board closure was written.",
+        blockers.join(", ")
+    )))
 }
 
 fn refuse_unfinished_parent(bd: &Path, project: &Path, task: &str) -> io::Result<()> {

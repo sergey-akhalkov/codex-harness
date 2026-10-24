@@ -237,6 +237,10 @@ impl SpawnFixture {
         self.bd_json(&["update", issue, "--set-metadata", &pair, "--json"]);
     }
 
+    fn add_blocker(&self, blocked: &str, blocker: &str) {
+        self.bd_json(&["dep", blocker, "--blocks", blocked, "--json"]);
+    }
+
     fn rename_issue(&self, issue: &str, title: &str) {
         self.bd_json(&["update", issue, "--title", title, "--json"]);
     }
@@ -614,14 +618,7 @@ impl AcceptanceFixture {
         source: Option<SourceIdentity>,
         role: &str,
     ) -> RetainedCompletion {
-        let assignment_sha256 = harness_core::build_identity::hash_bytes(run.as_bytes());
-        let assignment = SlotAssignmentBinding {
-            source: source.unwrap_or_else(|| self.board_source()),
-            issue: task.to_owned(),
-            assignment_sha256: assignment_sha256.clone(),
-            purpose: Some(purpose.as_str().to_owned()),
-            purpose_source: "board".to_owned(),
-        };
+        let assignment = self.assignment_for(task, purpose, run, source);
         self.retain_bound_role(
             run,
             state,
@@ -631,6 +628,47 @@ impl AcceptanceFixture {
             assignment,
             role,
         )
+    }
+
+    fn retain_at(
+        &self,
+        task: &str,
+        purpose: Purpose,
+        run: &str,
+        state: &str,
+        role: &str,
+        checkout: &Path,
+        result_text: &str,
+    ) -> RetainedCompletion {
+        let assignment = self.assignment_for(task, purpose, run, None);
+        self.retain_bound_role_at(
+            run,
+            state,
+            "executor-slot-binding",
+            &format!("handle-{run}"),
+            "executor-acceptance",
+            assignment,
+            role,
+            checkout,
+            result_text,
+        )
+    }
+
+    fn assignment_for(
+        &self,
+        task: &str,
+        purpose: Purpose,
+        run: &str,
+        source: Option<SourceIdentity>,
+    ) -> SlotAssignmentBinding {
+        let assignment_sha256 = harness_core::build_identity::hash_bytes(run.as_bytes());
+        SlotAssignmentBinding {
+            source: source.unwrap_or_else(|| self.board_source()),
+            issue: task.to_owned(),
+            assignment_sha256,
+            purpose: Some(purpose.as_str().to_owned()),
+            purpose_source: "board".to_owned(),
+        }
     }
 
     fn retain_bound(
@@ -667,9 +705,35 @@ impl AcceptanceFixture {
         assignment: SlotAssignmentBinding,
         role: &str,
     ) -> RetainedCompletion {
+        self.retain_bound_role_at(
+            run,
+            state,
+            slot_task,
+            slot_handle,
+            owner,
+            assignment,
+            role,
+            self.checkout(),
+            &format!("synthetic result for {run}\n"),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retain_bound_role_at(
+        &self,
+        run: &str,
+        state: &str,
+        slot_task: &str,
+        slot_handle: &str,
+        owner: &str,
+        assignment: SlotAssignmentBinding,
+        role: &str,
+        checkout: &Path,
+        result_text: &str,
+    ) -> RetainedCompletion {
         thread::sleep(Duration::from_millis(10));
         let result = self.spawn.base.root.join(format!("result-{run}.txt"));
-        fs::write(&result, format!("synthetic result for {run}\n")).unwrap();
+        fs::write(&result, result_text).unwrap();
         let state_dir = task_worktree::pool_state_dir(self.home(), self.checkout()).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
         let assignment_sha256 = assignment.assignment_sha256.clone();
@@ -679,7 +743,7 @@ impl AcceptanceFixture {
                 run_generation: run.to_owned(),
                 slot: 1,
                 owner: owner.to_owned(),
-                checkout: self.checkout().to_path_buf(),
+                checkout: checkout.to_path_buf(),
                 task: Some(slot_task.to_owned()),
                 handle: Some(slot_handle.to_owned()),
                 assignment: Some(assignment),
@@ -4090,5 +4154,305 @@ fn accepted_without_exact_turn_metadata_repeats_but_is_reflection_ineligible() {
         fixture.acceptance(&task).as_deref(),
         Some(stripped_raw.as_str())
     );
+    fixture.drop_fixture();
+}
+
+#[test]
+fn dependent_spec_waits_for_an_accepted_prerequisite_without_metadata() {
+    let fixture = AcceptanceFixture::new("accept-dependency");
+    let contract = fixture.create_task("Verified contract", Some(Purpose::Ordinary));
+    let dependent = fixture
+        .spawn
+        .create_issue("Dependent specification", "feature", None);
+    fixture
+        .spawn
+        .set_metadata(&dependent, "harness.purpose", "ordinary");
+    fixture.spawn.add_blocker(&dependent, &contract);
+
+    let dependencies = fixture
+        .spawn
+        .bd_json(&["dep", "list", &dependent, "--json"]);
+    assert!(
+        dependencies
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|dependency| dependency["id"] == contract.as_str()
+                && dependency["status"] == "open"),
+        "{dependencies}"
+    );
+
+    fixture.retain(
+        &contract,
+        Purpose::Ordinary,
+        "run-contract",
+        "completed",
+        None,
+    );
+    fixture.write_run_receipt("run-contract", "executor", ACCEPTANCE_LEAD, None);
+    fixture.retain_with_role(
+        &dependent,
+        Purpose::Ordinary,
+        "run-dependent",
+        "completed",
+        None,
+        "lead",
+    );
+    fixture.write_run_receipt("run-dependent", "lead", ACCEPTANCE_LEAD, None);
+
+    let waiting = fixture.refuse(&dependent, None);
+    assert!(
+        waiting.contains("blocked by prerequisite contract"),
+        "{waiting}"
+    );
+    assert!(waiting.contains(&contract), "{waiting}");
+    let shown = fixture.show(&dependent);
+    assert_eq!(shown["status"], "open", "{shown}");
+    assert!(
+        shown["metadata"]
+            .get(ACCEPTANCE_METADATA)
+            .is_none_or(Value::is_null),
+        "{shown}"
+    );
+    assert!(fixture.acceptance(&dependent).is_none(), "{shown}");
+
+    let accepted_contract = fixture.accept(&contract, None);
+    assert_eq!(
+        accepted_contract["status"], "accepted",
+        "{accepted_contract}"
+    );
+    assert_eq!(
+        accepted_contract["revisions"].as_array().unwrap().len(),
+        1,
+        "{accepted_contract}"
+    );
+    assert_eq!(fixture.show(&contract)["status"], "closed");
+
+    let accepted = fixture.accept(&dependent, None);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["review"]["outputRole"], "lead", "{accepted}");
+    assert_eq!(
+        accepted["review"]["acceptingRole"], "director",
+        "{accepted}"
+    );
+    assert_eq!(fixture.show(&dependent)["status"], "closed");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn local_passes_do_not_accept_a_failed_combined_path() {
+    let fixture = AcceptanceFixture::new("accept-combined-failure");
+    let feature = fixture
+        .spawn
+        .create_issue("Combined outcome", "feature", None);
+    fixture
+        .spawn
+        .set_metadata(&feature, "harness.purpose", "ordinary");
+    let mut children = Vec::new();
+    for (title, run) in [("Left output", "run-left"), ("Right output", "run-right")] {
+        let child = fixture.spawn.create_issue(title, "task", Some(&feature));
+        fixture
+            .spawn
+            .set_metadata(&child, "harness.purpose", "ordinary");
+        fixture.retain(&child, Purpose::Ordinary, run, "completed", None);
+        fixture.write_run_receipt(run, "executor", ACCEPTANCE_LEAD, None);
+        let accepted = fixture.accept(&child, None);
+        assert_eq!(accepted["status"], "accepted", "{accepted}");
+        children.push(child);
+    }
+
+    let evidence = fixture.spawn.base.root.join("combined-failure.txt");
+    fs::write(
+        &evidence,
+        "left local check: pass\nright local check: pass\ncombined check: failed (exit 64)\n",
+    )
+    .unwrap();
+    let correction =
+        fixture
+            .spawn
+            .create_issue("Correct combined behavior", "task", Some(&feature));
+    fixture
+        .spawn
+        .set_metadata(&correction, "harness.purpose", "ordinary");
+    fixture.spawn.bd_json(&[
+        "update",
+        &correction,
+        "--assignee",
+        "lead-combined-correction",
+        "--description",
+        "Both local checks passed, but their combined path failed. Preserve and rerun combined-failure.txt.",
+        "--json",
+    ]);
+
+    fixture.retain_with_role(
+        &feature,
+        Purpose::Ordinary,
+        "run-combined",
+        "completed",
+        None,
+        "lead",
+    );
+    fixture.write_run_receipt("run-combined", "lead", ACCEPTANCE_LEAD, None);
+    let refused = fixture.refuse(&feature, None);
+    assert!(refused.contains("unfinished board children"), "{refused}");
+    assert!(refused.contains(&correction), "{refused}");
+
+    let shown = fixture.show(&feature);
+    assert_eq!(shown["status"], "open", "{shown}");
+    assert!(fixture.acceptance(&feature).is_none(), "{shown}");
+    let correction_shown = fixture.show(&correction);
+    assert_eq!(
+        correction_shown["assignee"], "lead-combined-correction",
+        "{correction_shown}"
+    );
+    assert!(
+        correction_shown["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("combined path failed")),
+        "{correction_shown}"
+    );
+    for child in children {
+        let child = fixture.show(&child);
+        assert_eq!(child["status"], "closed", "{child}");
+        assert_eq!(child["close_reason"], "accepted", "{child}");
+    }
+    assert!(
+        fs::read_to_string(evidence)
+            .unwrap()
+            .contains("combined check: failed"),
+    );
+    fixture.drop_fixture();
+}
+
+#[test]
+fn accepted_repository_and_failed_repository_report_partial_status() {
+    let fixture = AcceptanceFixture::new("accept-partial-repositories");
+    let feature = fixture
+        .spawn
+        .create_issue("Two-repository outcome", "feature", None);
+    fixture
+        .spawn
+        .set_metadata(&feature, "harness.purpose", "ordinary");
+    let first_repository_task =
+        fixture
+            .spawn
+            .create_issue("Repository A integration", "task", Some(&feature));
+    let second_repository_task =
+        fixture
+            .spawn
+            .create_issue("Repository B integration", "task", Some(&feature));
+    for task in [&first_repository_task, &second_repository_task] {
+        fixture
+            .spawn
+            .set_metadata(task, "harness.purpose", "ordinary");
+    }
+    let (second_repository, second_revision) = fixture.clean_repository("failed-repository");
+
+    let first = fixture.retain_at(
+        &first_repository_task,
+        Purpose::Ordinary,
+        "run-repository-a",
+        "completed",
+        "executor",
+        fixture.checkout(),
+        "repository A check: pass\n",
+    );
+    let first_revision = first.source.revision.clone().unwrap();
+    fixture.write_run_receipt(
+        "run-repository-a",
+        "executor",
+        ACCEPTANCE_LEAD,
+        Some(json!([{
+            "repository": fixture.project(),
+            "checkout": fixture.checkout(),
+            "base": first_revision,
+        }])),
+    );
+    let accepted = fixture.accept(&first_repository_task, None);
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+    let revisions = accepted["revisions"].as_array().unwrap();
+    assert_eq!(revisions.len(), 1, "{accepted}");
+    assert_eq!(
+        revisions[0]["revision"],
+        first_revision.as_str(),
+        "{accepted}"
+    );
+
+    let second = fixture.retain_at(
+        &second_repository_task,
+        Purpose::Ordinary,
+        "run-repository-b",
+        "failed",
+        "executor",
+        &second_repository,
+        "repository B check: failed\n",
+    );
+    assert_eq!(
+        second.source.revision.as_deref(),
+        Some(second_revision.as_str())
+    );
+    let failed_evidence = second.result.as_ref().unwrap().locator.clone();
+    let refused = fixture.refuse(&second_repository_task, None);
+    assert!(
+        refused.contains("not a completed zero-exit assignment"),
+        "{refused}"
+    );
+    assert_eq!(
+        fs::read_to_string(&failed_evidence).unwrap(),
+        "repository B check: failed\n"
+    );
+    assert!(
+        fixture.acceptance(&second_repository_task).is_none(),
+        "{refused}"
+    );
+
+    fixture.retain_with_role(
+        &feature,
+        Purpose::Ordinary,
+        "run-two-repositories",
+        "completed",
+        None,
+        "lead",
+    );
+    fixture.write_run_receipt(
+        "run-two-repositories",
+        "lead",
+        ACCEPTANCE_LEAD,
+        Some(json!([
+            {
+                "repository": fixture.project(),
+                "checkout": fixture.checkout(),
+                "base": first_revision,
+            },
+            {
+                "repository": second_repository,
+                "checkout": second_repository,
+                "base": second_revision,
+            }
+        ])),
+    );
+    let partial = format!(
+        "Partial integration: repository A accepted at {first_revision}; repository B failed at {second_revision}; combined acceptance pending."
+    );
+    fixture
+        .spawn
+        .bd_json(&["update", &feature, "--append-notes", &partial, "--json"]);
+    let refused = fixture.refuse(&feature, None);
+    assert!(refused.contains("unfinished board children"), "{refused}");
+    assert!(refused.contains(&second_repository_task), "{refused}");
+    let shown = fixture.show(&feature);
+    assert_eq!(shown["status"], "open", "{shown}");
+    assert!(fixture.acceptance(&feature).is_none(), "{shown}");
+    assert!(
+        shown["notes"]
+            .as_str()
+            .is_some_and(|notes| notes.contains("combined acceptance pending")),
+        "{shown}"
+    );
+    assert_eq!(
+        fixture.show(&first_repository_task)["close_reason"],
+        "accepted"
+    );
+    assert_eq!(fixture.show(&second_repository_task)["status"], "open");
     fixture.drop_fixture();
 }

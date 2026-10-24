@@ -275,6 +275,42 @@ or accept its work. `executor_wait` remains a direct-child wait. Stop, resume an
 release keep their existing exact-run meaning; subtree stop and explicit
 restoration are separate operations.
 
+### Dependencies and combined acceptance
+
+Record a cross-block dependency on the owning board instead of inferring it
+from the supervision tree:
+
+```powershell
+bd dep <prerequisite-id> --blocks <dependent-id>
+```
+
+The dependency stays visible through `bd dep list <dependent-id> --json` and
+the dependent issue's `dependencies`. Independent work may proceed, but the
+dependent's implementation or acceptance waits until the prerequisite contract
+is verified and that result is recorded on the board. If `executor accept`
+finds a live `blocks` dependency, it names the prerequisite and refuses before
+writing acceptance metadata or closing anything; the dependent stays open and
+the same retry proceeds after the prerequisite is accepted or otherwise
+verified and closed. Do not bypass the wait with `--force` or a manual accepted
+close.
+
+Accept each Executor result into its Lead, then accept the Lead's integrated
+result as the Director. Direct Executor work is accepted by the Director. A
+Lead block with unfinished board children is refused before effects, so close
+Executor work before accepting the Lead. When individually passing outputs
+fail their combined user path, create an open correction task assigned to the
+owning Lead or Executor, record the failing command and evidence, and leave the
+parent open. Accepted child results and exact revisions remain available; the
+Director does not claim the combined outcome until that correction is accepted.
+
+For a multi-repository outcome, acceptance records the exact clean revision of
+each included checkout. If one repository integrates and another fails, report
+the accepted repository and revision separately from the open failed repository
+and its retained result, then keep combined acceptance pending. A Git merge
+alone does not establish behavioral compatibility. Repeating an already
+successful acceptance returns the recorded result with `duplicate: true` and
+makes no second closure effect.
+
 ## Executor utilization
 
 While the lead role is active, substantial eligible investigation, writing or
