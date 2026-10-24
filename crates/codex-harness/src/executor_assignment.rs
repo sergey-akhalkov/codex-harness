@@ -160,7 +160,8 @@ pub struct LeadRepositoryEvidence {
 }
 
 /// The actual dispatch context the brief names: the bound checkout, its
-/// committed base, the session owner and the source checkout it came from.
+/// committed base, the exact parent/run owner label and the source checkout it
+/// came from.
 pub struct AssignmentContext<'a> {
     pub checkout: &'a Path,
     pub base: &'a str,
@@ -717,6 +718,12 @@ fn render_brief(
     text.push_str(&format!("source: {}\n", context.source.display()));
     text.push_str(&format!("owner: {}\n", context.owner));
     text.push_str(&format!("consumer: {consumer}\n"));
+    if let Some(board_task) = &assignment.board_task {
+        text.push_str(&format!("board task: {board_task}\n"));
+        text.push_str(
+            "board feedback: record assignment, result and acceptance feedback on that exact task; do not create a copied tracker or duplicate task\n",
+        );
+    }
     if let Some(purpose) = purpose {
         text.push_str(&format!("purpose: {}\n", purpose.as_str()));
     }

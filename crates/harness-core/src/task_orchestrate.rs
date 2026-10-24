@@ -4,8 +4,207 @@ use crate::{
     task_store::{self, Assignment, TaskRecord},
     task_worktree::{self, LaneDisposition},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{io, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    io,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+/// Board metadata holding the exact source revisions accepted together. The
+/// board remains their owner; this is evidence attached to the acceptance,
+/// not a second task store.
+pub const ACCEPTANCE_REVISIONS_METADATA: &str = "harness.acceptanceRevisions";
+const MAX_ACCEPTANCE_REPOSITORIES: usize = 16;
+
+/// One repository and managed checkout at the revision the reviewer accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepositoryRevision {
+    pub repository: String,
+    pub checkout: String,
+    pub revision: String,
+}
+
+/// Refuses an acceptance that does not follow the recorded hierarchy. An
+/// executor may be accepted by its immediate Lead or the Director; a Lead may
+/// be accepted only by the Director. A recorded parent must be the accepting
+/// conversation, never a sibling or an inspecting ancestor.
+pub fn validate_acceptance_relation(
+    output_role: &str,
+    accepting_role: &str,
+    run_parent: Option<&str>,
+    accepting_thread: &str,
+) -> io::Result<()> {
+    if !matches!(accepting_role, "lead" | "director") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("accepting role '{accepting_role}' is not a Lead or Director"),
+        ));
+    }
+    match (output_role, accepting_role) {
+        ("executor", "lead" | "director") | ("lead", "director") => {}
+        ("lead", "lead") => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a delegated Lead cannot accept another Lead; the Director owns that acceptance",
+            ));
+        }
+        (role, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("run role '{role}' is not an executor or Lead output"),
+            ));
+        }
+    }
+    match run_parent {
+        Some(parent) if parent == accepting_thread => Ok(()),
+        Some(parent) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "run parent {parent} is not the accepting conversation {accepting_thread}; only the immediate parent accepts"
+            ),
+        )),
+        None if accepting_role == "director" && output_role == "executor" => Ok(()),
+        None => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the run has no recorded immediate parent; hierarchical acceptance cannot establish that this conversation owns the result",
+        )),
+    }
+}
+
+/// Unclosed board children that gate a Lead block. Feedback cards are durable
+/// observations rather than pending delivery work, so they do not hold the
+/// block open.
+pub fn unfinished_children(children: &[Value]) -> Vec<String> {
+    children
+        .iter()
+        .filter(|child| child["status"].as_str() != Some("closed"))
+        .filter(|child| {
+            !child["labels"].as_array().is_some_and(|labels| {
+                labels
+                    .iter()
+                    .any(|label| label.as_str() == Some("feedback"))
+            })
+        })
+        .filter_map(|child| child["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+pub fn refuse_unfinished_parent(task: &str, unfinished: &[String]) -> io::Result<()> {
+    if unfinished.is_empty() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "parent task {task} still has unfinished board children: {}; no acceptance metadata or closure was written",
+            unfinished.join(", ")
+        ),
+    ))
+}
+
+/// Reads the exact clean HEAD of every repository/checkout pair. Duplicate
+/// repository declarations are refused and the returned vector is sorted, so
+/// one workspace cannot stand in for a missing repository or be counted twice.
+pub fn repository_revisions(
+    repositories: &[(PathBuf, PathBuf)],
+) -> io::Result<Vec<RepositoryRevision>> {
+    if repositories.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "acceptance requires at least one repository revision",
+        ));
+    }
+    if repositories.len() > MAX_ACCEPTANCE_REPOSITORIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "acceptance names {} repositories; the limit is {MAX_ACCEPTANCE_REPOSITORIES}",
+                repositories.len()
+            ),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut evidence = Vec::with_capacity(repositories.len());
+    for (repository, checkout) in repositories {
+        let repository = repository.canonicalize().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "accepted repository {} is unavailable: {error}",
+                    repository.display()
+                ),
+            )
+        })?;
+        let checkout = checkout.canonicalize().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "accepted checkout {} is unavailable: {error}",
+                    checkout.display()
+                ),
+            )
+        })?;
+        let key = repository.to_string_lossy().to_lowercase();
+        if !seen.insert(key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "accepted repository {} is declared more than once; one revision cannot be counted twice",
+                    repository.display()
+                ),
+            ));
+        }
+        let revision = git_text(&checkout, &["rev-parse", "HEAD"])?.to_owned();
+        if !(revision.len() == 40 || revision.len() == 64)
+            || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "checkout {} did not resolve HEAD to an exact commit identifier",
+                    checkout.display()
+                ),
+            ));
+        }
+        let dirty = git_text(
+            &checkout,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        if !dirty.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "checkout {} is not clean at {revision}; acceptance requires exact committed revisions, not working-tree state",
+                    checkout.display()
+                ),
+            ));
+        }
+        evidence.push(RepositoryRevision {
+            repository: repository.display().to_string(),
+            checkout: checkout.display().to_string(),
+            revision,
+        });
+    }
+    evidence.sort_by(|left, right| left.repository.cmp(&right.repository));
+    Ok(evidence)
+}
+
+fn git_text(cwd: &Path, args: &[&str]) -> io::Result<String> {
+    let output = Command::new("git").args(args).current_dir(cwd).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
 
 pub fn view_loss(closed: &[&str]) -> Value {
     json!({
@@ -43,6 +242,22 @@ pub fn merge_accepted(
             }
         }
     }
+    if let Some(active) = record.assignments.iter().find(|item| {
+        item.id != assignment
+            && item.accepted != Some(true)
+            && item
+                .worktree
+                .as_deref()
+                .is_some_and(|worktree| same_workspace(worktree, &mapping.path))
+    }) {
+        return Ok(LaneDisposition::Preserved {
+            limitation: format!(
+                "workspace {} is still needed by unaccepted assignment {}; acceptance is recorded but the lane was not released",
+                mapping.path.display(),
+                active.id
+            ),
+        });
+    }
     // Lanes are reused, not retired: reset the lane to the base the lead just
     // merged so the next task in this lane starts from it with its build
     // caches. Unresettable state is preserved for the lane retirement decision.
@@ -57,6 +272,18 @@ pub fn merge_accepted(
     }
     let base = String::from_utf8_lossy(&base.stdout).trim().to_owned();
     task_worktree::reset_for_reuse(mapping, current, &base)
+}
+
+fn same_workspace(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy()),
+        _ => left
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/'])),
+    }
 }
 
 pub fn reconcile_before_replace(record: &TaskRecord, assignment: &str) -> io::Result<()> {
@@ -171,6 +398,90 @@ mod tests {
         assert_eq!(report["suspendDispatch"], true);
         assert_eq!(report["replay"], false);
         assert_eq!(report["closed"][0], "exec-xai");
+    }
+
+    #[test]
+    fn acceptance_relation_follows_the_recorded_hierarchy() {
+        validate_acceptance_relation("executor", "lead", Some("lead-a"), "lead-a").unwrap();
+        validate_acceptance_relation("executor", "director", Some("director"), "director").unwrap();
+        validate_acceptance_relation("lead", "director", Some("director"), "director").unwrap();
+        assert!(
+            validate_acceptance_relation("executor", "lead", Some("lead-b"), "lead-a")
+                .unwrap_err()
+                .to_string()
+                .contains("not the accepting conversation")
+        );
+        assert!(
+            validate_acceptance_relation("lead", "lead", Some("director"), "lead-a")
+                .unwrap_err()
+                .to_string()
+                .contains("cannot accept another Lead")
+        );
+        assert!(validate_acceptance_relation("executor", "lead", None, "lead-a").is_err());
+        assert!(
+            validate_acceptance_relation("lead", "director", Some("lead-a"), "director")
+                .unwrap_err()
+                .to_string()
+                .contains("not the accepting conversation")
+        );
+    }
+
+    #[test]
+    fn an_unfinished_parent_names_its_open_children() {
+        let children = vec![
+            json!({"id": "task-1", "status": "closed"}),
+            json!({"id": "task-2", "status": "lead_review"}),
+            json!({"id": "task-3", "status": "in_progress"}),
+            json!({"id": "feedback-1", "status": "open", "labels": ["feedback"]}),
+        ];
+        assert_eq!(
+            unfinished_children(&children),
+            vec!["task-2".to_owned(), "task-3".to_owned()]
+        );
+        let error =
+            refuse_unfinished_parent("feature-1", &["task-2".to_owned(), "task-3".to_owned()])
+                .unwrap_err();
+        assert!(error.to_string().contains("feature-1"), "{error}");
+        assert!(error.to_string().contains("task-2"), "{error}");
+        refuse_unfinished_parent("feature-1", &[]).unwrap();
+    }
+
+    #[test]
+    fn revision_evidence_is_exact_clean_and_deduplicated() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        for repository in [&first, &second] {
+            fs::create_dir_all(repository).unwrap();
+            git(repository, &["init", "-q"]);
+            git(repository, &["config", "user.email", "accept@example.test"]);
+            git(repository, &["config", "user.name", "Accept"]);
+            fs::write(repository.join("README.md"), "base\n").unwrap();
+            git(repository, &["add", "README.md"]);
+            git(repository, &["commit", "-qm", "base"]);
+        }
+        let first_revision = git_output(&first, &["rev-parse", "HEAD"]);
+        let second_revision = git_output(&second, &["rev-parse", "HEAD"]);
+        let evidence = repository_revisions(&[
+            (first.clone(), first.clone()),
+            (second.clone(), second.clone()),
+        ])
+        .unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].revision, first_revision);
+        assert_eq!(evidence[1].revision, second_revision);
+        let duplicate = repository_revisions(&[
+            (first.clone(), first.clone()),
+            (first.clone(), first.clone()),
+        ])
+        .unwrap_err();
+        assert!(
+            duplicate.to_string().contains("more than once"),
+            "{duplicate}"
+        );
+        fs::write(first.join("dirty.txt"), "uncommitted\n").unwrap();
+        let dirty = repository_revisions(&[(first.clone(), first)]).unwrap_err();
+        assert!(dirty.to_string().contains("not clean"), "{dirty}");
     }
 
     #[test]
@@ -305,6 +616,40 @@ mod tests {
         match retired {
             LaneDisposition::Preserved { limitation } => assert!(!limitation.is_empty()),
             LaneDisposition::Reused { .. } => panic!("missing tree must be preserved"),
+        }
+    }
+
+    #[test]
+    fn acceptance_does_not_release_a_workspace_another_active_assignment_needs() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("missing-shared-tree");
+        let mut record = TaskRecord {
+            schema: 1,
+            id: "t".into(),
+            workspace: root.path().to_path_buf(),
+            worktree: None,
+            lead_profile: "default".into(),
+            authorization: "full".into(),
+            requirements: "checks pass".into(),
+            stopped: false,
+            active_lead: "default".into(),
+            purpose: Some("ordinary".into()),
+            assignments: vec![
+                seed_assignment("accepted", "ds", "exec-a", &shared, Some("ordinary")),
+                seed_assignment("active", "ds", "exec-b", &shared, Some("ordinary")),
+            ],
+        };
+        let mapping = mapping("exec-a", shared.to_str().unwrap());
+        let disposition = merge_accepted(&mut record, "accepted", &mapping, root.path()).unwrap();
+        assert_eq!(record.assignments[0].accepted, Some(true));
+        match disposition {
+            LaneDisposition::Preserved { limitation } => {
+                assert!(limitation.contains("assignment active"), "{limitation}");
+                assert!(limitation.contains("was not released"), "{limitation}");
+            }
+            LaneDisposition::Reused { .. } => {
+                panic!("a workspace needed by another active assignment must be preserved")
+            }
         }
     }
 

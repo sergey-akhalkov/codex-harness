@@ -37,6 +37,16 @@ the independent worktree pool. Admission counts startup reservations, active
 turns and reply-waiting runs by immediate parent and role. Use the configured
 profiles only; a Lead and an Executor share `ds` routing but not tool authority.
 
+Every parent owns a run-specific board label, rendered as the assignment
+`owner`. Executor cards and their feedback stay assigned to that exact label;
+there is no shared `assignee=lead` inbox. A Lead reviews only its own
+`lead_review` results. The Director reviews Lead results and direct Executor
+results, and may inspect descendants without acknowledging a Lead's inbox.
+Assignments name the selected board's existing issue id. A child working in a
+different code repository still records its assignment and feedback through the
+coordinating project's board; dispatch does not copy the tracker or invent
+another scope.
+
 ## Operating objective
 
 Maximize delivery speed of the accepted result while minimizing avoidable lead
@@ -338,6 +348,13 @@ behavior. A green per-Executor check does not prove the integrated path.
 Director inspection of a descendant does not acknowledge the Lead's pending
 result, resolve its question or accept its work.
 
+Acceptance records the exact clean revision of every declared repository. It
+refuses a Lead block while a non-feedback child remains unfinished, and it never
+closes the OpenSpec change automatically. Acceptance, result receipt, board
+closure and worktree release stay distinct. A workspace is released only by a
+separate reviewed disposition after no descendant still needs it; an active
+assignment using the same workspace preserves it.
+
 Executor slots are pool-owned, not task-owned: the pool never grows past
 `worktree_pool_size`, and slots are reused while conversations are not. MCP
 completion, result delivery or archival never releases a slot. After review,
@@ -358,8 +375,8 @@ files. An interruption keeps the recorded mapping, and a second live owner of
 one slot is refused instead of sharing a checkout. Slot state, explicit
 disposition and legacy-tree semantics live in
 [agent delegation](../../../docs/agent-delegation.md#executor-worktrees).
-Executors set status `lead_review` instead of closing. The lead closes on
-accept or returns the item to `in_progress` with conditions. Native executor
+Executors set status `lead_review` instead of closing. Their immediate parent
+closes on accept or returns the item to `in_progress` with conditions. Native executor
 threads are per-run, never a pooled conversation: a fresh dispatch must not
 inherit another assignment's context. To return defects or continue after an
 ordinary stop, call `executor_resume mode=exact` for that run, provide the

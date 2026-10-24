@@ -1,10 +1,11 @@
-//! Normal lead acceptance for retained structured executor work.
+//! Hierarchical acceptance for retained structured Lead and Executor work.
 //!
-//! The live lead names only the board task. This owner derives the assignment,
-//! result, executor session/turn and current lead turn from retained completion
-//! state and the native control endpoint, then closes through the existing
-//! board owner. It makes no model calls and never fabricates a turn or a
-//! successful automatic reflection.
+//! The accepting Lead or Director names only the board task. This owner derives
+//! the assignment, result, child session/turn and current reviewer turn from
+//! retained completion state and the native control endpoint, checks the
+//! recorded parent relationship, records the exact repository revision set and
+//! closes through the existing board owner. It makes no model calls, never
+//! fabricates a turn and never releases a workspace.
 
 use super::{control, executor_input, invalid, option_text};
 use harness_core::{
@@ -13,28 +14,35 @@ use harness_core::{
         self, ACCEPTANCE_METADATA, AcceptanceBinding, BindingStatus, Purpose, ReflectionController,
     },
     orchestration_config,
+    task_orchestrate::{self, RepositoryRevision},
     task_worktree::{self, RetainedCompletion},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     env,
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 const HELP: &str = "\
 codex-harness executor accept TASK --project DIRECTORY [--source CHECKOUT] [--codex-home DIRECTORY] [--run GENERATION]
-  Accept retained structured executor work as the live lead. TASK is the exact
-  board issue. The command authenticates the current managed lead turn, takes
-  the newest retained completion for TASK unless --run names the exact
-  generation, writes the acceptance binding through the board owner and closes
-  the task with reason 'accepted'. It reports whether automatic reflection is
-  eligible. Repeating the same accepted result is a no-op; --run resolves only
-  an ambiguous timestamp tie and never bypasses a newer retained or unresolved
+  Accept retained structured work as the live immediate parent (Executor work)
+  or as the Director (Lead or direct Executor work). TASK is the exact board
+  issue. The command authenticates the current managed turn, verifies the
+  recorded parent, takes the newest retained completion for TASK unless --run
+  names the exact generation, records the exact clean repository revision set,
+  writes the acceptance binding through the board owner and closes the task
+  with reason 'accepted'. A Lead block with unfinished board children is
+  refused before board effects. Acceptance never releases a workspace.
+  Repeating the same accepted result is a no-op; --run resolves only an
+  ambiguous timestamp tie and never bypasses a newer retained or unresolved
   correction.";
 
 const MAX_CANDIDATES: usize = 6;
+const MAX_RECEIPTS: usize = 256;
+const MAX_REPOSITORIES: usize = 16;
 
 struct Request {
     task: String,
@@ -110,6 +118,7 @@ impl Request {
 struct LeadTurn {
     thread: String,
     turn: String,
+    role: &'static str,
 }
 
 struct Accepted {
@@ -118,6 +127,8 @@ struct Accepted {
     result: String,
     result_locator: Option<PathBuf>,
     revision: String,
+    revisions: Vec<RepositoryRevision>,
+    output_role: String,
     executor_session: Option<String>,
     executor_turn: Option<String>,
     duplicate: bool,
@@ -202,6 +213,7 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         request.run.as_deref(),
         &retained,
     )?;
+    let run_receipt = validate_hierarchy(&home, &selected, &lead)?;
     validate_completion(&bd, &request.project, &issue, &selected, purpose, &retained)?;
     refuse_stale_explicit_run(request.run.as_deref(), &selected, &retained)?;
     refuse_unresolved_correction(&home, &source, &request.task, &selected, &retained)?;
@@ -227,6 +239,14 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         .revision
         .clone()
         .expect("validated completion has a source revision");
+    let output_role = selected
+        .role
+        .as_deref()
+        .expect("validated completion has a run role");
+    if output_role == "lead" {
+        refuse_unfinished_parent(&bd, &request.project, &request.task)?;
+    }
+    let revisions = acceptance_revisions(&selected, run_receipt.as_ref())?;
 
     let binding = AcceptanceBinding::new(
         request.task.clone(),
@@ -245,7 +265,11 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         Some(lead.turn.clone()),
     )
     .with_self_reflection_enabled(self_reflection_enabled);
-    let metadata = delivery_reflection::acceptance_metadata(&binding)?;
+    let mut metadata = delivery_reflection::acceptance_metadata(&binding)?;
+    metadata.insert(
+        task_orchestrate::ACCEPTANCE_REVISIONS_METADATA.to_owned(),
+        serde_json::to_string(&revisions)?,
+    );
     let closed = board_cli::close_accepted(
         &bd,
         &request.project,
@@ -261,6 +285,8 @@ pub(super) fn run(args: &[OsString]) -> io::Result<i32> {
         result: result.sha256.clone(),
         result_locator: Some(result.locator.clone()),
         revision,
+        revisions,
+        output_role: output_role.to_owned(),
         executor_session: Some(executor_session),
         executor_turn: Some(executor_turn),
         duplicate: closed.duplicate,
@@ -318,6 +344,14 @@ fn receipt(
             .as_ref()
             .map(|path| path.display().to_string()),
         "revision": accepted.revision,
+        "revisions": accepted.revisions,
+        "review": {
+            "outputRole": accepted.output_role,
+            "acceptingRole": lead.role,
+            "parent": lead.thread,
+            "workspaceRelease": "held",
+        },
+        "workspaceHeld": true,
         "executorSession": accepted.executor_session,
         "executorTurn": accepted.executor_turn,
         "leadSession": accepted.binding.lead_session,
@@ -386,7 +420,317 @@ fn current_lead(home: &Path) -> io::Result<LeadTurn> {
             ))
         })?
         .to_owned();
-    Ok(LeadTurn { thread, turn })
+    let role = accepting_role(home, &thread)?;
+    Ok(LeadTurn { thread, turn, role })
+}
+
+/// The accepting conversation is identified from the same retained MCP run
+/// receipts that establish dispatch hierarchy. An unrecorded registered root is
+/// the Director; a recorded Lead is a delegated Lead; a recorded Executor has no
+/// acceptance authority.
+fn accepting_role(home: &Path, thread: &str) -> io::Result<&'static str> {
+    let own: Vec<Value> = receipt_values(home)?
+        .into_iter()
+        .filter(|receipt| receipt["executorThreadId"].as_str() == Some(thread))
+        .collect();
+    match own.as_slice() {
+        [] => Ok("director"),
+        [receipt] => {
+            if !receipt["release"].is_null() {
+                return Err(invalid(
+                    "the current conversation's run was released and cannot accept work",
+                ));
+            }
+            match receipt["role"].as_str() {
+                Some("lead") => Ok("lead"),
+                Some("executor") => Err(invalid(
+                    "the current conversation is a recorded Executor and cannot accept its own or another run's work",
+                )),
+                Some(role) => Err(invalid(&format!(
+                    "the current conversation records unknown run role '{role}'; acceptance authority is unavailable"
+                ))),
+                None => Err(invalid(
+                    "the current conversation's run receipt records no role; acceptance authority is unavailable",
+                )),
+            }
+        }
+        _ => Err(invalid(
+            "the current conversation is recorded as the child of more than one run; refusing ambiguous acceptance authority",
+        )),
+    }
+}
+
+fn validate_hierarchy(
+    home: &Path,
+    retained: &RetainedCompletion,
+    lead: &LeadTurn,
+) -> io::Result<Option<Value>> {
+    let output_role = retained.role.as_deref().ok_or_else(|| {
+        invalid(
+            "the retained completion records no run role; hierarchical acceptance is unavailable",
+        )
+    })?;
+    let receipt = run_receipt(home, &retained.run_generation)?;
+    let parent = match receipt.as_ref() {
+        Some(receipt) => {
+            if receipt["role"].as_str() != Some(output_role) {
+                return Err(invalid(&format!(
+                    "retained run {} records role {}, but its MCP receipt records role {}; refusing a changed hierarchy identity",
+                    retained.run_generation,
+                    output_role,
+                    receipt["role"].as_str().unwrap_or("unrecorded")
+                )));
+            }
+            if receipt["executorThreadId"].as_str() != retained.session.as_deref()
+                || receipt["turnId"].as_str() != retained.turn.as_deref()
+            {
+                return Err(invalid(&format!(
+                    "retained run {} does not match the exact session and completed turn in its MCP receipt; refusing fabricated turn provenance",
+                    retained.run_generation
+                )));
+            }
+            let parent = receipt["parentThreadId"]
+                .as_str()
+                .or_else(|| receipt["leadThreadId"].as_str())
+                .ok_or_else(|| {
+                    invalid(&format!(
+                        "retained run {} has no recorded parent thread; hierarchical acceptance cannot establish ownership",
+                        retained.run_generation
+                    ))
+                })?;
+            if let Some(lead_thread) = receipt["leadThreadId"].as_str()
+                && lead_thread != parent
+            {
+                return Err(invalid(&format!(
+                    "retained run {} records conflicting parent and lead threads; refusing ambiguous ownership",
+                    retained.run_generation
+                )));
+            }
+            Some(parent)
+        }
+        None => None,
+    };
+    if receipt.is_none() && output_role == "lead" {
+        return Err(invalid(&format!(
+            "retained run {} is a Lead output without an MCP receipt; the Director's exact parent relationship cannot be established",
+            retained.run_generation
+        )));
+    }
+    task_orchestrate::validate_acceptance_relation(output_role, lead.role, parent, &lead.thread)
+        .map_err(|error| invalid(&format!("acceptance hierarchy refused: {error}")))?;
+    Ok(receipt)
+}
+
+fn run_receipt(home: &Path, generation: &str) -> io::Result<Option<Value>> {
+    let matches: Vec<Value> = receipt_values(home)?
+        .into_iter()
+        .filter(|receipt| {
+            receipt["runGeneration"].as_str() == Some(generation)
+                || receipt["run"].as_str() == Some(generation)
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [receipt] => Ok(Some(receipt.clone())),
+        _ => Err(invalid(&format!(
+            "run generation {generation} matches more than one MCP receipt; refusing ambiguous parent or revision evidence"
+        ))),
+    }
+}
+
+fn receipt_values(home: &Path) -> io::Result<Vec<Value>> {
+    let root = home.join("harness/executor-pool");
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut receipts = Vec::new();
+    for directory in fs::read_dir(&root)? {
+        let directory = directory?;
+        if !directory.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(directory.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("mcp-") || !name.ends_with(".json") {
+                continue;
+            }
+            if receipts.len() >= MAX_RECEIPTS {
+                return Err(invalid(&format!(
+                    "more than {MAX_RECEIPTS} MCP run receipts are present; refusing an unbounded acceptance scan"
+                )));
+            }
+            let value = serde_json::from_slice(&fs::read(entry.path())?).map_err(|error| {
+                invalid(&format!(
+                    "MCP run receipt {} is not valid JSON: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            receipts.push(value);
+        }
+    }
+    Ok(receipts)
+}
+
+fn acceptance_revisions(
+    selected: &RetainedCompletion,
+    receipt: Option<&Value>,
+) -> io::Result<Vec<RepositoryRevision>> {
+    if receipt.is_none() {
+        // Legacy single-level Executor acceptance keeps its retained exact
+        // revision even after an explicit release reused the slot. That
+        // revision, not the slot's later HEAD, is the accepted input.
+        return Ok(vec![RepositoryRevision {
+            repository: selected.checkout.display().to_string(),
+            checkout: selected.checkout.display().to_string(),
+            revision: selected
+                .source
+                .revision
+                .clone()
+                .expect("validated completion has a source revision"),
+        }]);
+    }
+    let receipt = receipt.expect("non-legacy acceptance has a run receipt");
+    let mut repositories = Vec::new();
+    if let Some(workspaces) = receipt["workspaces"].as_array() {
+        for workspace in workspaces {
+            let repository = required_revision_path(workspace, "repository")?;
+            let checkout = required_revision_path(workspace, "checkout")?;
+            repositories.push((repository, checkout));
+        }
+    } else {
+        let repository = receipt["repository"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| selected.checkout.clone());
+        repositories.push((repository, selected.checkout.clone()));
+    }
+    if !repositories
+        .iter()
+        .any(|(_, checkout)| same_path(checkout, &selected.checkout))
+    {
+        let repository = receipt["repository"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| selected.checkout.clone());
+        repositories.push((repository, selected.checkout.clone()));
+    }
+    let evidence = task_orchestrate::repository_revisions(&repositories)?;
+    let primary = evidence
+        .iter()
+        .find(|revision| same_path(Path::new(&revision.checkout), &selected.checkout))
+        .ok_or_else(|| {
+            invalid(&format!(
+                "accepted revision evidence does not name the completed checkout {}",
+                selected.checkout.display()
+            ))
+        })?;
+    if selected.source.revision.as_deref() != Some(primary.revision.as_str()) {
+        return Err(invalid(&format!(
+            "completed checkout {} is now at {}, not the retained completion revision {}; refusing changed acceptance input",
+            selected.checkout.display(),
+            primary.revision,
+            selected.source.revision.as_deref().unwrap_or("unrecorded")
+        )));
+    }
+    Ok(evidence)
+}
+
+fn required_revision_path(value: &Value, field: &str) -> io::Result<PathBuf> {
+    value[field]
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            invalid(&format!(
+                "accepted workspace evidence records no usable {field}; refusing an incomplete repository revision set"
+            ))
+        })
+}
+
+fn refuse_unfinished_parent(bd: &Path, project: &Path, task: &str) -> io::Result<()> {
+    let output = Command::new(bd)
+        .args(["children", task, "--json"])
+        .current_dir(project)
+        .output()?;
+    if !output.status.success() {
+        return Err(invalid(&format!(
+            "cannot read board children of Lead task {task}: {}; acceptance changed no board state",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        invalid(&format!(
+            "board children of Lead task {task} are not valid JSON: {error}; acceptance changed no board state"
+        ))
+    })?;
+    let children = value
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            value
+                .get("issues")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .ok_or_else(|| {
+            invalid(&format!(
+                "board children of Lead task {task} are not an issue list; acceptance changed no board state"
+            ))
+        })?;
+    task_orchestrate::refuse_unfinished_parent(
+        task,
+        &task_orchestrate::unfinished_children(&children),
+    )
+    .map_err(|error| invalid(&error.to_string()))
+}
+
+fn recorded_revisions(issue: &Value) -> io::Result<Option<Vec<RepositoryRevision>>> {
+    let metadata = board_cli::issue_metadata(issue);
+    let Some(raw) = metadata.get(task_orchestrate::ACCEPTANCE_REVISIONS_METADATA) else {
+        return Ok(None);
+    };
+    let revisions: Vec<RepositoryRevision> = serde_json::from_str(raw).map_err(|error| {
+        invalid(&format!(
+            "recorded acceptance repository revisions are malformed: {error}"
+        ))
+    })?;
+    if revisions.is_empty() || revisions.len() > MAX_REPOSITORIES {
+        return Err(invalid(&format!(
+            "recorded acceptance names {} repositories; the supported range is 1..={MAX_REPOSITORIES}",
+            revisions.len()
+        )));
+    }
+    for revision in &revisions {
+        if !(revision.revision.len() == 40 || revision.revision.len() == 64)
+            || !revision
+                .revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid(&format!(
+                "recorded acceptance repository {} has no exact commit revision",
+                revision.repository
+            )));
+        }
+    }
+    Ok(Some(revisions))
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy()),
+        _ => left
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/'])),
+    }
 }
 
 fn recorded_acceptance(issue: &serde_json::Value, task: &str) -> io::Result<AcceptanceBinding> {
@@ -474,6 +818,7 @@ fn validate_recorded_acceptance(
             ))
         })?;
     let candidates = vec![retained.clone()];
+    validate_hierarchy(home, &retained, lead)?;
     validate_completion(bd, project, issue, &retained, purpose, &candidates)?;
 
     let assignment = retained
@@ -542,6 +887,27 @@ fn validate_recorded_acceptance(
             binding.run
         )));
     }
+    let output_role = retained
+        .role
+        .as_deref()
+        .expect("validated completion has a run role");
+    let revisions = match recorded_revisions(issue)? {
+        Some(revisions) => revisions,
+        None => vec![RepositoryRevision {
+            repository: retained.checkout.display().to_string(),
+            checkout: retained.checkout.display().to_string(),
+            revision: binding.revision.clone(),
+        }],
+    };
+    if !revisions
+        .iter()
+        .any(|revision| revision.revision == binding.revision)
+    {
+        return Err(invalid(&format!(
+            "task {task} records accepted revision {}, but its repository revision set does not contain that revision; refusing incomplete evidence",
+            binding.revision
+        )));
+    }
 
     Ok(Accepted {
         executor_session: binding.executor_session.clone(),
@@ -551,6 +917,8 @@ fn validate_recorded_acceptance(
         result: result.sha256.clone(),
         result_locator: Some(result.locator.clone()),
         revision,
+        revisions,
+        output_role: output_role.to_owned(),
         duplicate: true,
     })
 }
@@ -852,18 +1220,28 @@ fn validate_completion(
             retained.run_generation
         ))
     })?;
-    if retained.role.as_deref() != Some("executor") {
-        return Err(ineligible(
-            retained,
-            candidates,
-            "the run role is not executor",
-        ));
-    }
+    let output_role = match retained.role.as_deref() {
+        Some(role @ ("executor" | "lead")) => role,
+        Some(role) => {
+            return Err(ineligible(
+                retained,
+                candidates,
+                &format!("the run role '{role}' is not an executor or Lead output"),
+            ));
+        }
+        None => {
+            return Err(ineligible(
+                retained,
+                candidates,
+                "the run records no output role",
+            ));
+        }
+    };
     if retained.state != "completed" || retained.exit_code != Some(0) {
         return Err(ineligible(
             retained,
             candidates,
-            "the run is not a completed zero-exit executor run",
+            "the run is not a completed zero-exit assignment",
         ));
     }
     if retained
@@ -979,47 +1357,37 @@ fn validate_completion(
             "the run records no clean accepted revision and result identity",
         ));
     }
-    if purpose == Purpose::Ordinary {
-        if !retained.eligibility.eligible || !retained.eligibility.reasons.is_empty() {
-            let reasons = retained.eligibility.reasons.join("; ");
-            return Err(ineligible(
-                retained,
-                candidates,
-                &format!(
-                    "the retained completion is not ordinary acceptance-eligible: {}",
-                    if reasons.is_empty() {
-                        "eligibility is false without a reason".to_owned()
-                    } else {
-                        reasons
-                    }
-                ),
-            ));
-        }
-    } else {
-        let tolerated = format!(
+    let mut tolerated = Vec::new();
+    if output_role == "lead" {
+        tolerated.push("the run role is 'lead', not an ordinary executor".to_owned());
+    }
+    if purpose != Purpose::Ordinary {
+        tolerated.push(format!(
             "board task '{}' purpose '{}' is not ordinary",
             assignment.issue,
             purpose.as_str()
-        );
-        if retained.eligibility.eligible
-            || retained.eligibility.reasons.as_slice() != [tolerated.as_str()]
-        {
-            let reasons = retained.eligibility.reasons.join("; ");
-            return Err(ineligible(
-                retained,
-                candidates,
-                &format!(
-                    "the retained {} completion has acceptance-ineligible facts beyond its nonordinary purpose: {}",
-                    purpose.as_str(),
-                    if reasons.is_empty() {
-                        "eligibility is true without the expected nonordinary-purpose fact"
-                            .to_owned()
-                    } else {
-                        reasons
-                    }
-                ),
-            ));
-        }
+        ));
+    }
+    let hierarchy_eligible = if tolerated.is_empty() {
+        retained.eligibility.eligible && retained.eligibility.reasons.is_empty()
+    } else {
+        !retained.eligibility.eligible
+            && retained.eligibility.reasons.as_slice() == tolerated.as_slice()
+    };
+    if !hierarchy_eligible {
+        let reasons = retained.eligibility.reasons.join("; ");
+        return Err(ineligible(
+            retained,
+            candidates,
+            &format!(
+                "the retained {output_role} completion has acceptance-ineligible facts beyond the allowed hierarchy and purpose: {}",
+                if reasons.is_empty() {
+                    "eligibility is true without the expected role or purpose fact".to_owned()
+                } else {
+                    reasons
+                }
+            ),
+        ));
     }
     Ok(())
 }

@@ -425,6 +425,7 @@ const ACCEPTANCE_LEAD: &str = "lead-acceptance";
 const ACCEPTANCE_LEAD_TURN: &str = "lead-turn-1";
 const ACCEPTANCE_EXECUTOR_SESSION: &str = "executor-session-1";
 const ACCEPTANCE_EXECUTOR_TURN: &str = "executor-turn-1";
+const ACCEPTANCE_DIRECTOR: &str = "director-acceptance";
 const ACCEPTANCE_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// One owned board and executor checkout plus a real loopback control
@@ -601,6 +602,18 @@ impl AcceptanceFixture {
         state: &str,
         source: Option<SourceIdentity>,
     ) -> RetainedCompletion {
+        self.retain_with_role(task, purpose, run, state, source, "executor")
+    }
+
+    fn retain_with_role(
+        &self,
+        task: &str,
+        purpose: Purpose,
+        run: &str,
+        state: &str,
+        source: Option<SourceIdentity>,
+        role: &str,
+    ) -> RetainedCompletion {
         let assignment_sha256 = harness_core::build_identity::hash_bytes(run.as_bytes());
         let assignment = SlotAssignmentBinding {
             source: source.unwrap_or_else(|| self.board_source()),
@@ -609,19 +622,17 @@ impl AcceptanceFixture {
             purpose: Some(purpose.as_str().to_owned()),
             purpose_source: "board".to_owned(),
         };
-        self.retain_bound(
+        self.retain_bound_role(
             run,
             state,
             "executor-slot-binding",
             &format!("handle-{run}"),
             "executor-acceptance",
             assignment,
+            role,
         )
     }
 
-    /// Retain one completion with the exact task binding and generation
-    /// handle a live slot records. Same-task handoffs reuse both identities, so
-    /// a completion alone cannot show that the current startup is finished.
     fn retain_bound(
         &self,
         run: &str,
@@ -630,6 +641,31 @@ impl AcceptanceFixture {
         slot_handle: &str,
         owner: &str,
         assignment: SlotAssignmentBinding,
+    ) -> RetainedCompletion {
+        self.retain_bound_role(
+            run,
+            state,
+            slot_task,
+            slot_handle,
+            owner,
+            assignment,
+            "executor",
+        )
+    }
+
+    /// Retain one completion with the exact task binding and generation
+    /// handle a live slot records. Same-task handoffs reuse both identities, so
+    /// a completion alone cannot show that the current startup is finished.
+    #[allow(clippy::too_many_arguments)]
+    fn retain_bound_role(
+        &self,
+        run: &str,
+        state: &str,
+        slot_task: &str,
+        slot_handle: &str,
+        owner: &str,
+        assignment: SlotAssignmentBinding,
+        role: &str,
     ) -> RetainedCompletion {
         thread::sleep(Duration::from_millis(10));
         let result = self.spawn.base.root.join(format!("result-{run}.txt"));
@@ -648,7 +684,7 @@ impl AcceptanceFixture {
                 handle: Some(slot_handle.to_owned()),
                 assignment: Some(assignment),
                 submitted_assignment: Some(AssignmentSubmission::structured(assignment_sha256)),
-                role: Some("executor".to_owned()),
+                role: Some(role.to_owned()),
                 state: state.to_owned(),
                 exit_code: Some(if state == "completed" { 0 } else { 1 }),
                 session: Some(ACCEPTANCE_EXECUTOR_SESSION.to_owned()),
@@ -657,6 +693,72 @@ impl AcceptanceFixture {
             },
         )
         .unwrap()
+    }
+
+    fn write_mcp_receipt(&self, name: &str, receipt: Value) {
+        let directory = self.home().join("harness/executor-pool/acceptance-fixture");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(format!("mcp-{name}.json")),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_run_receipt(&self, run: &str, role: &str, parent: &str, workspaces: Option<Value>) {
+        let mut receipt = json!({
+            "schema": 1,
+            "run": run,
+            "runGeneration": run,
+            "role": role,
+            "parentThreadId": parent,
+            "rootThreadId": ACCEPTANCE_DIRECTOR,
+            "leadThreadId": parent,
+            "executorThreadId": ACCEPTANCE_EXECUTOR_SESSION,
+            "turnId": ACCEPTANCE_EXECUTOR_TURN,
+            "repository": self.checkout(),
+            "checkout": self.checkout(),
+        });
+        if let Some(workspaces) = workspaces {
+            receipt["workspaces"] = workspaces;
+        }
+        self.write_mcp_receipt(run, receipt);
+    }
+
+    fn make_caller_lead(&self, run: &str) {
+        self.write_mcp_receipt(
+            "caller",
+            json!({
+                "schema": 1,
+                "run": run,
+                "runGeneration": run,
+                "role": "lead",
+                "parentThreadId": ACCEPTANCE_DIRECTOR,
+                "rootThreadId": ACCEPTANCE_DIRECTOR,
+                "leadThreadId": ACCEPTANCE_DIRECTOR,
+                "executorThreadId": self.lead_thread,
+                "turnId": self.lead_turn,
+            }),
+        );
+    }
+
+    fn clean_repository(&self, name: &str) -> (PathBuf, String) {
+        let repository = self.spawn.base.root.join(name);
+        git(
+            &self.spawn.base.root,
+            &[
+                "init",
+                "-q",
+                "--initial-branch=main",
+                repository.to_str().unwrap(),
+            ],
+        );
+        configure(&repository);
+        fs::write(repository.join("README.md"), format!("{name}\n")).unwrap();
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-qm", "base"]);
+        let revision = git_output(&repository, &["rev-parse", "HEAD"]);
+        (repository, revision)
     }
 
     fn set_recorded_ms(&self, run: &str, recorded_ms: u64) {
@@ -1360,6 +1462,137 @@ fn board_bound_assignment_records_verified_task_purpose_and_identity() {
     );
     let shown = fixture.show(&task);
     assert_eq!(shown["metadata"]["harness.purpose"], "ordinary", "{shown}");
+    fixture.drop_fixture();
+}
+
+/// Two parents own separate review scopes by exact run label. The assignment
+/// brief names the selected board issue and owner, while a child whose code
+/// checkout is another repository still binds its durable record to the board
+/// repository and adds no second tracker.
+#[test]
+fn two_lead_inboxes_stay_separate_across_code_repositories() {
+    let fixture = SpawnFixture::with_board("board-inboxes");
+    let configured = fixture.bd_run(&["config", "set", "status.custom", "lead_review:wip"]);
+    assert!(
+        configured.status.success(),
+        "{}",
+        bd_failed("config", &configured)
+    );
+    let feature_a = fixture.create_issue("Lead A block", "feature", None);
+    let feature_b = fixture.create_issue("Lead B block", "feature", None);
+    fixture.bd_json(&["update", &feature_a, "--assignee", "lead-run-a", "--json"]);
+    fixture.bd_json(&["update", &feature_b, "--assignee", "lead-run-b", "--json"]);
+    let task_a = fixture.create_issue("A review", "task", Some(&feature_a));
+    let task_b = fixture.create_issue("B review", "task", Some(&feature_b));
+    for (task, owner) in [(&task_a, "lead-run-a"), (&task_b, "lead-run-b")] {
+        fixture.bd_json(&[
+            "update",
+            task,
+            "--assignee",
+            owner,
+            "--status",
+            "lead_review",
+            "--json",
+        ]);
+    }
+
+    let inbox = |owner: &str| {
+        fixture
+            .bd_json(&[
+                "list",
+                "--status",
+                "lead_review",
+                "--assignee",
+                owner,
+                "--json",
+            ])
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(inbox("lead-run-a"), vec![task_a.clone()]);
+    assert_eq!(inbox("lead-run-b"), vec![task_b.clone()]);
+
+    let code = fixture.base.root.join("other-code");
+    git(
+        &fixture.base.root,
+        &[
+            "init",
+            "-q",
+            "--initial-branch=main",
+            code.to_str().unwrap(),
+        ],
+    );
+    configure(&code);
+    fs::write(code.join("README.md"), "other repository\n").unwrap();
+    git(&code, &["add", "README.md"]);
+    git(&code, &["commit", "-qm", "base"]);
+    let assignment = executor_assignment::Assignment::load(&fixture.assignment(
+        "cross-repository.json",
+        &task_a,
+        Some("ordinary"),
+    ))
+    .unwrap();
+    let binding =
+        executor_assignment::bind_board_task(&assignment, &fixture.base.source, &fixture.bd())
+            .unwrap();
+    let board = fixture.bd_json(&["context", "--json"]);
+    assert_eq!(binding.source.project_id, board["project_id"]);
+    let owner = "lead-run-a";
+    let brief = executor_assignment::brief(
+        &assignment,
+        &executor_assignment::AssignmentContext {
+            checkout: &code,
+            base: &git_output(&code, &["rev-parse", "HEAD"]),
+            owner,
+            source: &fixture.base.source,
+        },
+    )
+    .unwrap();
+    assert!(brief.contains(&format!("owner: {owner}")), "{brief}");
+    assert!(brief.contains(&format!("board task: {task_a}")), "{brief}");
+    assert!(brief.contains("do not create a copied tracker"), "{brief}");
+    assert!(
+        !brief.contains(&format!("board task: {task_b}")),
+        "the other Lead's inbox is not adopted: {brief}"
+    );
+    let feedback = Command::new(manager())
+        .args([
+            "feedback",
+            "record",
+            "--project",
+            fixture.base.source.to_str().unwrap(),
+            "--source",
+            fixture.base.source.to_str().unwrap(),
+            "--bd",
+            fixture.bd().to_str().unwrap(),
+            "--parent",
+            &feature_a,
+            "--observation",
+            "the cross-repository child recorded its feedback on the coordinating board",
+            "--scope",
+            "dispatch",
+            "--reporter",
+            "exec-other-repository",
+            "--episode",
+            "cross-repository-1",
+            "--kind",
+            "executor",
+        ])
+        .current_dir(&code)
+        .output()
+        .unwrap();
+    assert!(feedback.status.success(), "{}", output_text(&feedback));
+    let feedback_rows = fixture.bd_json(&[
+        "list", "--label", "feedback", "--parent", &feature_a, "--json",
+    ]);
+    assert_eq!(
+        feedback_rows.as_array().unwrap().len(),
+        1,
+        "the child's feedback stays on the selected board: {feedback_rows}"
+    );
     fixture.drop_fixture();
 }
 
@@ -2816,6 +3049,161 @@ fn accept_ordinary_binds_exact_turns_emits_one_job_and_repeat_is_a_noop() {
         fixture.acceptance(&task).as_deref(),
         Some(recorded.as_str())
     );
+    fixture.drop_fixture();
+}
+
+#[test]
+fn a_lead_accepts_only_its_own_executor_and_the_director_accepts_a_direct_executor() {
+    let fixture = AcceptanceFixture::new("accept-hierarchy");
+    fixture.make_caller_lead("lead-run-caller");
+    let owned = fixture.create_task("Owned executor result", Some(Purpose::Ordinary));
+    fixture.retain(&owned, Purpose::Ordinary, "run-owned", "completed", None);
+    fixture.write_run_receipt("run-owned", "executor", ACCEPTANCE_LEAD, None);
+    let accepted = fixture.accept(&owned, None);
+    assert_eq!(accepted["review"]["outputRole"], "executor", "{accepted}");
+    assert_eq!(accepted["review"]["acceptingRole"], "lead", "{accepted}");
+    assert_eq!(accepted["review"]["workspaceRelease"], "held", "{accepted}");
+    assert_eq!(accepted["workspaceHeld"], true, "{accepted}");
+
+    let foreign = fixture.create_task("Another Lead's executor result", Some(Purpose::Ordinary));
+    fixture.retain(
+        &foreign,
+        Purpose::Ordinary,
+        "run-foreign",
+        "completed",
+        None,
+    );
+    fixture.write_run_receipt("run-foreign", "executor", "lead-other", None);
+    let refused = fixture.refuse(&foreign, None);
+    assert!(
+        refused.contains("not the accepting conversation"),
+        "{refused}"
+    );
+    assert!(fixture.acceptance(&foreign).is_none(), "{refused}");
+
+    // A root Director is the immediate parent of its direct Executor.
+    let direct = AcceptanceFixture::new("accept-direct-executor");
+    let task = direct.create_task("Direct executor result", Some(Purpose::Ordinary));
+    direct.retain(&task, Purpose::Ordinary, "run-direct", "completed", None);
+    direct.write_run_receipt("run-direct", "executor", ACCEPTANCE_LEAD, None);
+    let accepted = direct.accept(&task, None);
+    assert_eq!(
+        accepted["review"]["acceptingRole"], "director",
+        "{accepted}"
+    );
+    assert_eq!(accepted["review"]["outputRole"], "executor", "{accepted}");
+    direct.drop_fixture();
+    fixture.drop_fixture();
+}
+
+#[test]
+fn director_accepts_a_lead_with_exact_multi_repository_revision_evidence() {
+    let fixture = AcceptanceFixture::new("accept-lead-revisions");
+    let feature = fixture.spawn.create_issue("Lead result", "feature", None);
+    fixture
+        .spawn
+        .set_metadata(&feature, "harness.purpose", "ordinary");
+    let lead_completion = fixture.retain_with_role(
+        &feature,
+        Purpose::Ordinary,
+        "run-lead",
+        "completed",
+        None,
+        "lead",
+    );
+    let (second_repository, second_revision) = fixture.clean_repository("second-repository");
+    let primary_revision = lead_completion.source.revision.unwrap();
+    fixture.write_run_receipt(
+        "run-lead",
+        "lead",
+        ACCEPTANCE_LEAD,
+        Some(json!([
+            {
+                "repository": fixture.project(),
+                "checkout": fixture.checkout(),
+                "base": primary_revision.clone(),
+            },
+            {
+                "repository": second_repository.clone(),
+                "checkout": second_repository.clone(),
+                "base": second_revision.clone(),
+            }
+        ])),
+    );
+
+    let accepted = fixture.accept(&feature, Some("run-lead"));
+    assert_eq!(accepted["review"]["outputRole"], "lead", "{accepted}");
+    assert_eq!(
+        accepted["review"]["acceptingRole"], "director",
+        "{accepted}"
+    );
+    assert_eq!(
+        accepted["revisions"].as_array().unwrap().len(),
+        2,
+        "{accepted}"
+    );
+    let receipt_revisions = accepted["revisions"].as_array().unwrap();
+    assert!(
+        receipt_revisions
+            .iter()
+            .any(|revision| revision["revision"] == primary_revision.as_str())
+    );
+    assert!(
+        receipt_revisions
+            .iter()
+            .any(|revision| revision["revision"] == second_revision.as_str())
+    );
+    let recorded = fixture.show(&feature);
+    let revisions: Vec<harness_core::task_orchestrate::RepositoryRevision> = serde_json::from_str(
+        recorded["metadata"][harness_core::task_orchestrate::ACCEPTANCE_REVISIONS_METADATA]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revisions.len(), 2, "{recorded}");
+    assert!(
+        revisions
+            .iter()
+            .any(|revision| revision.revision == primary_revision)
+    );
+    assert!(
+        revisions
+            .iter()
+            .any(|revision| revision.revision == second_revision)
+    );
+    let repeated = fixture.accept(&feature, Some("run-lead"));
+    assert_eq!(repeated["duplicate"], true, "{repeated}");
+    assert_eq!(repeated["revisions"], accepted["revisions"], "{repeated}");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn lead_acceptance_refuses_an_unfinished_parent_and_never_releases_its_workspace() {
+    let fixture = AcceptanceFixture::new("accept-unfinished-parent");
+    let feature = fixture
+        .spawn
+        .create_issue("Lead block with open child", "feature", None);
+    fixture
+        .spawn
+        .set_metadata(&feature, "harness.purpose", "ordinary");
+    let child = fixture
+        .spawn
+        .create_issue("Unfinished executor task", "task", Some(&feature));
+    fixture.retain_with_role(
+        &feature,
+        Purpose::Ordinary,
+        "run-parent",
+        "completed",
+        None,
+        "lead",
+    );
+    fixture.write_run_receipt("run-parent", "lead", ACCEPTANCE_LEAD, None);
+
+    let refused = fixture.refuse(&feature, None);
+    assert!(refused.contains("unfinished board children"), "{refused}");
+    assert!(refused.contains(&child), "{refused}");
+    assert!(fixture.acceptance(&feature).is_none(), "{refused}");
+    assert_ne!(fixture.show(&feature)["status"], "closed", "{refused}");
     fixture.drop_fixture();
 }
 

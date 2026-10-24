@@ -31,15 +31,34 @@ After init, `bd -C <project>` works. It cannot be used for `init`.
 | Executor feedback | `bd create "…" --type task --labels feedback --parent <feature> --json` |
 | Status | `bd status --json --no-activity` |
 | Feedback list | `bd list --label feedback --json` |
+| Parent children | `bd children <id> --json` |
 | Epic progress | `bd epic status --json` |
 | Resolve | `bd close <id> --reason "…" --json` |
-| Lead inbox | `bd list --status lead_review --json` |
-| Lead work | `bd list --assignee lead --json` |
+| Parent review inbox | `bd list --status lead_review --assignee <run-owner> --json` |
+| Parent follow-ups | `bd list --assignee <run-owner> --json` |
 
 `--type feedback` is rejected. Lead-initiated improvements are tasks, or
 OpenSpec changes when they alter accepted requirements. Public examples stay
 synthetic. Leave project `.beads/` state in the consuming project; disconnect
 does not erase it.
+
+## Run ownership and review inboxes
+
+Each Director or delegated Lead owns a run-specific label for its reviews. The
+assignment brief renders it as `owner`, and the dispatch records the same label
+with its slot. Set the executor card and its feedback children to that exact
+assignee; do not use the old global `lead` assignee, which cannot distinguish
+two Leads' review scopes. A parent reads only its own `lead_review` and
+`assignee=<run-owner>` rows. The Director may inspect every descendant, but
+inspection is not acknowledgement and does not accept a Lead's result.
+
+An assignment's `board task` is the exact existing issue id, never a title or a
+new card inferred by dispatch. When the code checkout is another repository,
+the coordinating board stays selected explicitly: run board and feedback
+commands with `--project <coordinating-repository>` (or `bd -C` after init) and
+keep code paths in the assignment's inputs, outputs and revision evidence.
+Record feedback and decisions on that same issue or its child; do not copy
+state, acceptance or a second tracker into the code repository.
 
 ## Bounded feedback
 
@@ -249,13 +268,14 @@ Custom status `lead_review` (wip): configure with
 
 | Actor | Does |
 | --- | --- |
-| Lead | Creates epics/features/tasks, assigns executor work, records its own follow-ups as tasks assigned to `lead` so a later lead session does not repeat them |
-| Executor | Claims assigned work, implements the outcome, sets `lead_review` when done. Does not `bd close` its own assignment |
-| Lead | Reviews `lead_review` and `assignee=lead` as native wait results arrive and at stage boundaries, then merges, closes or returns to `in_progress` with feedback |
+| Director/Lead | Creates or reuses epics/features/tasks; assigns executor work and its own follow-ups to its run-specific owner label |
+| Executor | Claims its exact assigned work, implements the outcome, sets `lead_review` when done. Does not `bd close` its own assignment |
+| Immediate parent | Reviews its own `lead_review` and `assignee=<run-owner>` rows as native wait results arrive, then merges, closes or returns to `in_progress` with feedback |
 
-On a new lead session: read the board first (`lead_review`, assignee `lead`,
-ready work). Create new tasks for new situation; do not re-open completed
-verification.
+On a new Lead session: read its own board scope first (`lead_review` and
+`assignee=<run-owner>`, then ready work). The Director reads Lead results; it
+does not filter a delegated Lead's Executor inbox into its own acceptance.
+Create new tasks for a new situation; do not re-open completed verification.
 
 ### Structured acceptance
 
@@ -265,18 +285,27 @@ The MCP result is transport evidence; the board remains the durable assignment
 and acceptance record. Do not infer acceptance, merge or slot release from
 delivery, completion, `/agents` navigation or archival.
 
-For a completion that carries exact executor and lead turn provenance, use the
+For a completion that carries exact child and reviewer turn provenance, use the
 owning native acceptance path rather than hand-authoring identity or request
-JSON. It must resolve the assignment, result and turns from the retained
-completion, then record acceptance and close the task. A repeat for the same
-accepted result is a no-op. Foreign leads, stale board scope or purpose, changed
-results, cancelled or unrelated closures, and missing or ambiguous exact turns
-are refused before board effects.
+JSON. It must resolve the assignment, result, parent relationship, turns and
+exact clean repository revisions from the retained completion and run record,
+then record acceptance and close the task. Executor work is accepted by its
+immediate Lead or by the Director when the Executor is direct; a Lead result is
+accepted only by the Director. A repeat for the same accepted result is a
+no-op. Foreign parents, stale board scope or purpose, changed results,
+cancelled or unrelated closures, missing or ambiguous exact turns and
+unfinished child tasks are refused before board effects.
+
+A Lead result records one revision for every declared repository; Git does not
+make those merges atomic. Acceptance of a Lead block waits until its
+non-feedback children are closed. It does not close an OpenSpec change and it
+never releases a worktree. Release remains a separate explicit decision after
+descendants no longer need the workspace.
 
 Automatic reflection requires an active reflection binding, ordinary purpose,
-and exact executor and lead turns. Improvement work and a mode-off binding
-close normally and run no reflection. Tasks without a structured retained
-completion keep the ordinary `bd close` workflow.
+and exact accepted-child and reviewer turns. Improvement work and a mode-off
+binding close normally and run no reflection. Tasks without a structured
+retained completion keep the ordinary `bd close` workflow.
 
 For a requested continuous improvement loop, use `self-improvement-loop` and
 the [sequential comparison record guide](references/self-improvement.md).
