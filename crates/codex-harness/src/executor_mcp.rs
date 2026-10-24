@@ -650,6 +650,19 @@ fn active_requests(home: &Path) -> io::Result<Vec<ActiveRequest>> {
                 if status == "prepared" && !request_process_live(&request) {
                     continue;
                 }
+                if matches!(status, "started" | "thread-started")
+                    && let Some(receipt) = request["receipt"]
+                        .as_str()
+                        .and_then(|path| fs::read(path).ok())
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                {
+                    let released = !receipt["release"].is_null();
+                    let replaced = request["owner"].as_str().is_some()
+                        && request["owner"].as_str() != receipt["run"].as_str();
+                    if released || replaced {
+                        continue;
+                    }
+                }
                 let (Some(parent), Some(role)) =
                     (request["parentThreadId"].as_str(), request["role"].as_str())
                 else {

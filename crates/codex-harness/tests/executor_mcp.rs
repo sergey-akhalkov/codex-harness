@@ -2775,6 +2775,33 @@ fn director_executor_limit_refuses_a_second_direct_child() {
         "{second}"
     );
     assert_eq!(server.requests_for("thread/start").len(), starts_before);
+    let first_run = result(&first)["run"].as_str().unwrap().to_owned();
+    let stopped = stop_run(&mut mcp, 4, DIRECTOR, &first_run);
+    assert_eq!(result(&stopped)["outcome"], "stopped", "{stopped}");
+    let released = release_tool(
+        &mut mcp,
+        5,
+        DIRECTOR,
+        Some(&first_run),
+        "discarded",
+        "free the allowance for a replacement",
+    );
+    assert_eq!(result(&released)["released"], true, "{released}");
+    let replacement = mcp.call(
+        6,
+        json!({
+            "owner": "direct-limit-3",
+            "requestId": "direct-limit-3",
+            "base": base,
+            "assignment": assignment("replacement direct child")
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert_eq!(
+        result(&replacement)["role"],
+        "executor",
+        "a released started request must not consume the parent allowance: {replacement}"
+    );
 
     mcp.finish();
 }
