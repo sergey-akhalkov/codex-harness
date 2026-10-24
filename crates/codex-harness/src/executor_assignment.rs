@@ -31,6 +31,7 @@ use std::{
     collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 /// Version of the assignment document this build accepts.
@@ -43,6 +44,9 @@ pub const MAX_ITEM_BYTES: usize = 512;
 pub const MAX_RELATIVE_PATH_BYTES: usize = 240;
 /// Bound on the rendered brief handed to the executor.
 pub const MAX_BRIEF_BYTES: usize = 16 * 1024;
+/// Bounds on the Lead-only change reference and the evidence retained for it.
+pub const MAX_LEAD_REPOSITORIES: usize = 16;
+pub const MAX_LEAD_EVIDENCE_BYTES: usize = 16 * 1024;
 
 /// Who consumes the returned result when the assignment does not declare a
 /// consumer: the lead that dispatched it is always the direct consumer.
@@ -102,6 +106,57 @@ pub struct Assignment {
     /// standing boundaries apply in every case.
     #[serde(default)]
     pub escalate: Vec<String>,
+    /// Lead-only reference to a prepared OpenSpec change. Executor
+    /// assignments omit it and keep their existing contract and rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_change: Option<LeadChange>,
+}
+
+/// The concrete specification-backed input a Lead assignment carries. A
+/// planning home may differ from a code repository; both name the exact
+/// committed revision they are read at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeadChange {
+    /// Checkout-relative planning repository root containing `openspec/`.
+    pub planning_root: String,
+    /// Exact committed revision of the planning repository.
+    pub base: String,
+    /// Concrete change directory under the planning root, conventionally
+    /// `openspec/changes/<change>`.
+    pub directory: String,
+    /// Selected code repositories and the exact committed base each Lead
+    /// workspace is prepared at.
+    #[serde(default)]
+    pub repositories: Vec<LeadRepository>,
+}
+
+/// One selected code repository. `path` is relative to the allocated
+/// checkout and must name that repository's root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeadRepository {
+    pub path: String,
+    pub base: String,
+}
+
+/// Bounded, recordable facts established before a Lead allocation or model
+/// turn. Paths are checkout-relative with `/` separators; bases are the exact
+/// commits Git resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeadChangeEvidence {
+    pub change: String,
+    pub planning_root: String,
+    pub planning_base: String,
+    pub artifacts: Vec<String>,
+    pub repositories: Vec<LeadRepositoryEvidence>,
+    pub board_task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeadRepositoryEvidence {
+    pub path: String,
+    pub base: String,
 }
 
 /// The actual dispatch context the brief names: the bound checkout, its
@@ -193,6 +248,9 @@ impl Assignment {
         }
         require_paths("inputs", &self.inputs)?;
         require_paths("outputs", &self.outputs)?;
+        if let Some(change) = &self.lead_change {
+            change.validate()?;
+        }
         Ok(())
     }
 
@@ -227,6 +285,49 @@ impl Assignment {
         Ok(hash_bytes(&serde_json::to_vec(self).map_err(|error| {
             io::Error::new(io::ErrorKind::InvalidData, error)
         })?))
+    }
+}
+
+impl LeadChange {
+    /// The checkout-independent part of a Lead reference: field bounds, plain
+    /// relative paths, a concrete OpenSpec change directory and at least one
+    /// distinct repository. Existence, commits and the board are established
+    /// against the checkout by [`validate_lead_assignment`].
+    fn validate(&self) -> io::Result<()> {
+        relative_directory("lead_change.planning_root", &self.planning_root)?;
+        require_text("lead_change.base", &self.base, MAX_ITEM_BYTES)?;
+        require_revision_text("lead_change.base", &self.base)?;
+        let parts = relative_parts("lead_change.directory", &self.directory)?;
+        if parts.len() < 3 || parts[0] != "openspec" || parts[1] != "changes" {
+            return Err(invalid(
+                "lead_change.directory must name a concrete OpenSpec change directory under the planning root as openspec/changes/<change>; a title or board card alone is not a specification",
+            ));
+        }
+        if self.repositories.is_empty() {
+            return Err(invalid(
+                "lead_change.repositories is empty; a Lead assignment names at least one code repository and its committed base",
+            ));
+        }
+        if self.repositories.len() > MAX_LEAD_REPOSITORIES {
+            return Err(invalid(&format!(
+                "lead_change.repositories has {} entries; the limit is {MAX_LEAD_REPOSITORIES}",
+                self.repositories.len()
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for (index, repository) in self.repositories.iter().enumerate() {
+            let field = format!("lead_change.repositories[{index}]");
+            let parts = relative_directory(&format!("{field}.path"), &repository.path)?;
+            let normalized = normalized_relative(&parts);
+            if !seen.insert(normalized.clone()) {
+                return Err(invalid(&format!(
+                    "assignment {field}.path repeats the already declared repository: {normalized}"
+                )));
+            }
+            require_text(&format!("{field}.base"), &repository.base, MAX_ITEM_BYTES)?;
+            require_revision_text(&format!("{field}.base"), &repository.base)?;
+        }
+        Ok(())
     }
 }
 
@@ -411,6 +512,128 @@ fn inherited_nonordinary_purpose(
     Ok(found)
 }
 
+/// Validates a specification-backed Lead assignment against the allocated
+/// checkout before any slot is claimed or model turn is opened. It resolves
+/// the OpenSpec change, requires the applicable planning artifacts at the
+/// exact committed planning revision, checks every selected repository and
+/// base, and reads the board reference without mutating it. The returned
+/// bounded evidence is the value the dispatch owner retains.
+///
+/// Direct Executor assignments do not call this function and keep their
+/// existing contract.
+pub fn validate_lead_assignment(
+    assignment: &Assignment,
+    context: &AssignmentContext<'_>,
+    bd: &Path,
+) -> io::Result<LeadChangeEvidence> {
+    assignment.validate()?;
+    assignment.validate_paths(context.checkout)?;
+    let change = assignment.lead_change.as_ref().ok_or_else(|| {
+        invalid(
+            "a Lead assignment requires lead_change naming a concrete OpenSpec change directory; a title or board card alone is not a specification",
+        )
+    })?;
+    let board_task = assignment.board_task.as_deref().ok_or_else(|| {
+        invalid(
+            "a Lead assignment requires board_task naming the exact board issue it owns; a change reference alone does not supply board ownership",
+        )
+    })?;
+    let root = context.checkout.canonicalize().map_err(|error| {
+        invalid(&format!(
+            "the allocated checkout {} cannot be resolved: {error}",
+            context.checkout.display()
+        ))
+    })?;
+    let planning_parts = relative_directory("lead_change.planning_root", &change.planning_root)?;
+    let planning_root = resolve_declared_directory(
+        &root,
+        &planning_parts,
+        "lead_change.planning_root",
+        &change.planning_root,
+        "checkout",
+    )?;
+    let change_parts = relative_parts("lead_change.directory", &change.directory)?;
+    let change_dir = resolve_declared_directory(
+        &planning_root,
+        &change_parts,
+        "lead_change.directory",
+        &change.directory,
+        "planning root",
+    )?;
+
+    let mut artifacts = Vec::new();
+    let mut frozen = Vec::new();
+    add_required_artifact(
+        &change_dir,
+        "proposal.md",
+        &root,
+        &mut artifacts,
+        &mut frozen,
+    )?;
+    add_required_artifact(&change_dir, "tasks.md", &root, &mut artifacts, &mut frozen)?;
+    let schema = change_schema(&change_dir, &planning_root, &root, &mut frozen)?;
+    if schema == "spec-driven" || change_dir.join("design.md").is_file() {
+        add_required_artifact(&change_dir, "design.md", &root, &mut artifacts, &mut frozen)?;
+    }
+    for spec in spec_artifacts(&change_dir, &root)? {
+        artifacts.push(path_relative(&root, &spec)?);
+        frozen.push(spec);
+    }
+    if artifacts.len() > MAX_LIST_ITEMS {
+        return Err(invalid(&format!(
+            "the change declares {} planning artifacts; the limit is {MAX_LIST_ITEMS}",
+            artifacts.len()
+        )));
+    }
+
+    let planning_repository = planning_repository(&planning_root, &root)?;
+    let planning_base = resolve_commit(&planning_repository, &change.base, "lead_change.base")?;
+    verify_committed(&planning_repository, &planning_base, &frozen)?;
+    let repositories = validate_lead_repositories(&root, &change.repositories)?;
+
+    let board = delivery_reflection::board_source_identity(bd, context.checkout).map_err(|error| {
+        invalid(&format!(
+            "Lead board reference '{board_task}' cannot be read from {}: {error}; the dispatch is refused before allocation or model work",
+            context.checkout.display()
+        ))
+    })?;
+    if !task_worktree::same_repository(Path::new(&board.repo_root), context.checkout) {
+        return Err(invalid(&format!(
+            "Lead board task '{board_task}' belongs to repository {}, not the allocated checkout {}; refusing a foreign board reference",
+            board.repo_root,
+            context.checkout.display()
+        )));
+    }
+    board_cli::show_issue(bd, context.checkout, board_task).map_err(|error| {
+        invalid(&format!(
+            "Lead board task '{board_task}' cannot be resolved in {}: {error}",
+            context.checkout.display()
+        ))
+    })?;
+
+    let evidence = LeadChangeEvidence {
+        change: path_relative(&root, &change_dir)?,
+        planning_root: normalized_relative(&planning_parts),
+        planning_base,
+        artifacts,
+        repositories,
+        board_task: board_task.to_owned(),
+    };
+    let encoded = serde_json::to_vec(&evidence).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Lead change evidence cannot be encoded: {error}"),
+        )
+    })?;
+    if encoded.len() > MAX_LEAD_EVIDENCE_BYTES {
+        return Err(invalid(&format!(
+            "the Lead change evidence is {} bytes; the limit is {MAX_LEAD_EVIDENCE_BYTES}",
+            encoded.len()
+        )));
+    }
+    Ok(evidence)
+}
+
 /// Validates the declared paths and renders the brief an executor session
 /// receives. The same function serves dispatch and the model-free `executor
 /// assignment` path, so a session-role caller can exercise the exact rendering
@@ -522,6 +745,471 @@ fn render_brief(
         )));
     }
     Ok(text)
+}
+
+fn add_required_artifact(
+    change_dir: &Path,
+    name: &str,
+    checkout: &Path,
+    artifacts: &mut Vec<String>,
+    frozen: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    let resolved = resolve_planning_file(&change_dir.join(name), checkout, name)?;
+    artifacts.push(path_relative(checkout, &resolved)?);
+    frozen.push(resolved);
+    Ok(())
+}
+
+/// Resolves a declared relative directory, rejecting traversal, missing
+/// paths and symlink escapes outside `root`.
+fn resolve_declared_directory(
+    root: &Path,
+    parts: &[String],
+    field: &str,
+    declared: &str,
+    scope: &str,
+) -> io::Result<PathBuf> {
+    let joined = joined_path(root, parts);
+    match fs::symlink_metadata(&joined) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(&format!(
+                "{field} {declared} is missing from the checkout at {}; prepare it before dispatch",
+                joined.display()
+            )));
+        }
+        Err(error) => {
+            return Err(invalid(&format!(
+                "{field} {declared} cannot be inspected at {}: {error}",
+                joined.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    let resolved = fs::canonicalize(&joined).map_err(|error| {
+        invalid(&format!(
+            "{field} {declared} cannot be resolved at {}: {error}",
+            joined.display()
+        ))
+    })?;
+    if !resolved.starts_with(root) {
+        return Err(invalid(&format!(
+            "{field} {declared} resolves outside the declared {scope} to {}; the assignment is rejected without reading it",
+            resolved.display()
+        )));
+    }
+    let metadata = fs::metadata(&resolved).map_err(|error| {
+        invalid(&format!(
+            "{field} {declared} is unreadable at {}: {error}",
+            resolved.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(invalid(&format!(
+            "{field} {declared} is not a directory at {}",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Resolves one existing, non-empty planning artifact and proves it stays
+/// inside the allocated checkout.
+fn resolve_planning_file(path: &Path, checkout: &Path, label: &str) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(&format!(
+                "Lead planning artifact {label} is missing at {}; prepare the change before Lead dispatch",
+                path.display()
+            )));
+        }
+        Err(error) => {
+            return Err(invalid(&format!(
+                "Lead planning artifact {label} cannot be inspected at {}: {error}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    let resolved = fs::canonicalize(path).map_err(|error| {
+        invalid(&format!(
+            "Lead planning artifact {label} cannot be resolved at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !resolved.starts_with(checkout) {
+        return Err(invalid(&format!(
+            "Lead planning artifact {label} resolves outside the checkout to {}; the assignment is rejected without reading it",
+            resolved.display()
+        )));
+    }
+    let metadata = fs::metadata(&resolved).map_err(|error| {
+        invalid(&format!(
+            "Lead planning artifact {label} is unreadable at {}: {error}",
+            resolved.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(invalid(&format!(
+            "Lead planning artifact {label} is not a regular file at {}",
+            resolved.display()
+        )));
+    }
+    if metadata.len() == 0 {
+        return Err(invalid(&format!(
+            "Lead planning artifact {label} is empty at {}; a prepared change carries content",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Determines the change's OpenSpec schema. The change-local file wins, then
+/// the planning root's config; the default schema requires a design.
+///
+/// shortcut: only a top-level `schema:` line is read, upgrade if OpenSpec
+/// stores schema selection in nested metadata.
+fn change_schema(
+    change_dir: &Path,
+    planning_root: &Path,
+    checkout: &Path,
+    frozen: &mut Vec<PathBuf>,
+) -> io::Result<String> {
+    for path in [
+        change_dir.join(".openspec.yaml"),
+        planning_root.join("openspec/config.yaml"),
+    ] {
+        if !path.is_file() {
+            continue;
+        }
+        let resolved = resolve_planning_file(&path, checkout, "change schema")?;
+        let text = fs::read_to_string(&resolved).map_err(|error| {
+            invalid(&format!(
+                "change schema {} cannot be read: {error}",
+                resolved.display()
+            ))
+        })?;
+        frozen.push(resolved);
+        if let Some(schema) = top_level_schema(&text) {
+            return Ok(schema);
+        }
+    }
+    Ok("spec-driven".to_owned())
+}
+
+fn top_level_schema(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let Some(value) = line.trim().strip_prefix("schema:") else {
+            continue;
+        };
+        let value = value.split('#').next().unwrap_or_default().trim();
+        let value = value.trim_matches(['"', '\'']);
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn spec_artifacts(change_dir: &Path, checkout: &Path) -> io::Result<Vec<PathBuf>> {
+    let specs = change_dir.join("specs");
+    let entries = fs::read_dir(&specs).map_err(|error| {
+        invalid(&format!(
+            "the change at {} has no readable specs directory for specs/*/spec.md: {error}",
+            change_dir.display()
+        ))
+    })?;
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            invalid(&format!(
+                "the change specs directory {} cannot be read: {error}",
+                specs.display()
+            ))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| {
+                invalid(&format!(
+                    "cannot inspect {}: {error}",
+                    entry.path().display()
+                ))
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+        let spec = entry.path().join("spec.md");
+        if !spec.exists() {
+            continue;
+        }
+        let label = format!("specs/{}/spec.md", entry.file_name().to_string_lossy());
+        found.push(resolve_planning_file(&spec, checkout, &label)?);
+        if found.len() >= MAX_LIST_ITEMS {
+            return Err(invalid(&format!(
+                "the change at {} declares at least {MAX_LIST_ITEMS} capability specifications; the limit is {MAX_LIST_ITEMS}",
+                change_dir.display()
+            )));
+        }
+    }
+    found.sort();
+    if found.is_empty() {
+        return Err(invalid(&format!(
+            "the change at {} has no non-empty specs/*/spec.md; a proposal and tasks alone are not a complete specification",
+            change_dir.display()
+        )));
+    }
+    Ok(found)
+}
+
+/// The repository that owns the planning root. A planning home may differ
+/// from a selected code repository, but its committed inputs must still be
+/// bound inside the allocated checkout.
+fn planning_repository(planning_root: &Path, checkout: &Path) -> io::Result<PathBuf> {
+    let output = run_git(planning_root, &["rev-parse", "--show-toplevel"])?;
+    if !output.status.success() {
+        return Err(invalid(&format!(
+            "lead_change.planning_root {} is not inside a Git repository: {}",
+            planning_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let top = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let top = fs::canonicalize(&top).map_err(|error| {
+        invalid(&format!(
+            "the planning repository {} cannot be resolved: {error}",
+            top.display()
+        ))
+    })?;
+    if !top.starts_with(checkout) {
+        return Err(invalid(&format!(
+            "the planning repository {} is outside the allocated checkout {}; a planning home must remain a declared local input",
+            top.display(),
+            checkout.display()
+        )));
+    }
+    Ok(top)
+}
+
+/// Resolves one declared base to the exact commit Git names. Nonzero or
+/// unparsable answers are refusals, never silent fallbacks.
+fn resolve_commit(repository: &Path, reference: &str, field: &str) -> io::Result<String> {
+    let reference = reference.trim();
+    let output = run_git(
+        repository,
+        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+    )?;
+    if !output.status.success() {
+        return Err(invalid(&format!(
+            "{field} '{reference}' is not a committed revision in {}; name an exact commit that exists there",
+            repository.display()
+        )));
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !matches!(commit.len(), 40 | 64) || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(invalid(&format!(
+            "{field} '{reference}' did not resolve to a commit in {}: {commit}",
+            repository.display()
+        )));
+    }
+    Ok(commit)
+}
+
+/// Proves every planning artifact is present with content at the exact
+/// planning base and that the allocated checkout still carries those same
+/// bytes. A later unannounced edit is refused rather than silently redefining
+/// the Lead's scope.
+fn verify_committed(repository: &Path, base: &str, paths: &[PathBuf]) -> io::Result<()> {
+    let mut relatives = Vec::with_capacity(paths.len());
+    for path in paths {
+        let relative = path.strip_prefix(repository).map_err(|_| {
+            invalid(&format!(
+                "planning artifact {} is outside the planning repository {}; the planning base cannot bind it",
+                path.display(),
+                repository.display()
+            ))
+        })?;
+        let relative = slash_path(relative);
+        if relative.is_empty() {
+            return Err(invalid(
+                "a planning artifact resolves to the planning repository root instead of a file",
+            ));
+        }
+        let size = run_git(
+            repository,
+            &["cat-file", "-s", &format!("{base}:{relative}")],
+        )?;
+        if !size.status.success() {
+            return Err(invalid(&format!(
+                "planning artifact {relative} is not committed at planning base {base} in {}; commit the prepared change or name its exact committed revision",
+                repository.display()
+            )));
+        }
+        let bytes = String::from_utf8_lossy(&size.stdout)
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| {
+                invalid(&format!(
+                    "planning artifact {relative} has no readable size at base {base}: {error}"
+                ))
+            })?;
+        if bytes == 0 {
+            return Err(invalid(&format!(
+                "planning artifact {relative} is empty at planning base {base}; a prepared change carries content"
+            )));
+        }
+        relatives.push(relative);
+    }
+
+    let mut args = vec!["diff", "--quiet", base, "--"];
+    args.extend(relatives.iter().map(String::as_str));
+    let diff = run_git(repository, &args)?;
+    if diff.status.code() == Some(1) {
+        return Err(invalid(&format!(
+            "planning artifacts in {} differ from committed base {base}; the checkout has uncommitted or changed planning inputs. Commit the exact inputs or dispatch the committed revision",
+            repository.display()
+        )));
+    }
+    if !diff.status.success() {
+        return Err(invalid(&format!(
+            "planning artifacts in {} cannot be compared with base {base}: {}",
+            repository.display(),
+            String::from_utf8_lossy(&diff.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lead_repositories(
+    checkout: &Path,
+    repositories: &[LeadRepository],
+) -> io::Result<Vec<LeadRepositoryEvidence>> {
+    let mut seen = BTreeSet::new();
+    let mut evidence = Vec::with_capacity(repositories.len());
+    for (index, repository) in repositories.iter().enumerate() {
+        let field = format!("lead_change.repositories[{index}]");
+        let parts = relative_directory(&format!("{field}.path"), &repository.path)?;
+        let joined = joined_path(checkout, &parts);
+        let resolved = fs::canonicalize(&joined).map_err(|error| {
+            invalid(&format!(
+                "{field}.path {} is missing from the checkout: {error}",
+                repository.path
+            ))
+        })?;
+        if !resolved.starts_with(checkout) {
+            return Err(invalid(&format!(
+                "{field}.path {} resolves outside the checkout to {}",
+                repository.path,
+                resolved.display()
+            )));
+        }
+        let metadata = fs::metadata(&resolved).map_err(|error| {
+            invalid(&format!(
+                "{field}.path {} is unreadable: {error}",
+                resolved.display()
+            ))
+        })?;
+        if !metadata.is_dir() {
+            return Err(invalid(&format!(
+                "{field}.path {} is not a directory",
+                resolved.display()
+            )));
+        }
+        if !seen.insert(resolved.clone()) {
+            return Err(invalid(&format!(
+                "{field}.path {} resolves to a repository already declared by another entry; declare it once",
+                repository.path
+            )));
+        }
+        let top = run_git(&resolved, &["rev-parse", "--show-toplevel"])?;
+        if !top.status.success() {
+            return Err(invalid(&format!(
+                "{field}.path {} is not a Git repository: {}",
+                resolved.display(),
+                String::from_utf8_lossy(&top.stderr).trim()
+            )));
+        }
+        let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
+        let top = fs::canonicalize(&top).map_err(|error| {
+            invalid(&format!(
+                "{field}.path {} has no resolvable repository root: {error}",
+                resolved.display()
+            ))
+        })?;
+        if top != resolved {
+            return Err(invalid(&format!(
+                "{field}.path {} is not the repository root; name {} instead",
+                resolved.display(),
+                top.display()
+            )));
+        }
+        let base = resolve_commit(&resolved, &repository.base, &format!("{field}.base"))?;
+        evidence.push(LeadRepositoryEvidence {
+            path: normalized_relative(&parts),
+            base,
+        });
+    }
+    Ok(evidence)
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> io::Result<std::process::Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| {
+            invalid(&format!(
+                "git {} at {} cannot start: {error}",
+                args.join(" "),
+                cwd.display()
+            ))
+        })
+}
+
+fn normalized_relative(parts: &[String]) -> String {
+    if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn path_relative(root: &Path, path: &Path) -> io::Result<String> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        invalid(&format!(
+            "{} is outside the allocated checkout {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    let relative = slash_path(relative);
+    if relative.is_empty() {
+        return Err(invalid(&format!(
+            "{} names the checkout root instead of a file or change directory",
+            path.display()
+        )));
+    }
+    Ok(relative)
+}
+
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn require_revision_text(field: &str, value: &str) -> io::Result<()> {
+    if value.contains('\0') || value.chars().any(char::is_whitespace) {
+        return Err(invalid(&format!(
+            "assignment {field} must be one exact Git revision without whitespace"
+        )));
+    }
+    if value.trim_start().starts_with('-') {
+        return Err(invalid(&format!(
+            "assignment {field} must be a Git revision, not an option: {value}"
+        )));
+    }
+    Ok(())
 }
 
 /// The declared consumer, or the dispatching lead when the field is omitted
@@ -689,6 +1377,15 @@ fn require_paths(field: &str, values: &[String]) -> io::Result<()> {
 /// traversing, drive-relative and alternate-stream names are rejected before
 /// any filesystem lookup.
 fn relative_parts(field: &str, value: &str) -> io::Result<Vec<String>> {
+    split_relative(field, value, false)
+}
+
+/// The same lexical rules for a directory that may name the checkout root.
+fn relative_directory(field: &str, value: &str) -> io::Result<Vec<String>> {
+    split_relative(field, value, true)
+}
+
+fn split_relative(field: &str, value: &str, allow_current: bool) -> io::Result<Vec<String>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(invalid(&format!("assignment {field} is empty")));
@@ -710,8 +1407,13 @@ fn relative_parts(field: &str, value: &str) -> io::Result<Vec<String>> {
         )));
     }
     let mut parts = Vec::new();
+    let mut saw_current = false;
     for part in trimmed.split(['/', '\\']) {
-        if part.is_empty() || part == "." {
+        if part.is_empty() {
+            continue;
+        }
+        if part == "." {
+            saw_current = true;
             continue;
         }
         if part == ".." {
@@ -726,7 +1428,7 @@ fn relative_parts(field: &str, value: &str) -> io::Result<Vec<String>> {
         }
         parts.push(part.to_owned());
     }
-    if parts.is_empty() {
+    if parts.is_empty() && !(allow_current && saw_current) {
         return Err(invalid(&format!(
             "assignment {field} names no file: {value}"
         )));

@@ -29,6 +29,12 @@ mod control_endpoint;
 #[path = "fixtures/synthetic_role_build.rs"]
 mod synthetic_role_build;
 
+// The production assignment owner is compiled directly so the Lead admission
+// API can be exercised without adding a new CLI surface before dispatch does.
+#[allow(dead_code)]
+#[path = "../src/executor_assignment.rs"]
+mod executor_assignment;
+
 use control_endpoint::{Answer, Bearer, Server};
 
 fn manager() -> PathBuf {
@@ -1355,6 +1361,553 @@ fn board_bound_assignment_records_verified_task_purpose_and_identity() {
     let shown = fixture.show(&task);
     assert_eq!(shown["metadata"]["harness.purpose"], "ordinary", "{shown}");
     fixture.drop_fixture();
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the crate lives under the repository root")
+        .to_path_buf()
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// Minimal prepared change for failure paths. The success test copies the
+/// real change under test instead.
+fn prepare_sample_change(root: &Path, design: bool) -> PathBuf {
+    let change = root.join("openspec/changes/lead-sample");
+    fs::create_dir_all(change.join("specs/capability")).unwrap();
+    fs::write(change.join(".openspec.yaml"), "schema: spec-driven\n").unwrap();
+    fs::write(
+        change.join("proposal.md"),
+        "# Proposal\n\nShip the sample outcome.\n",
+    )
+    .unwrap();
+    fs::write(
+        change.join("tasks.md"),
+        "# Tasks\n\n- [ ] 1.1 Implement the sample outcome.\n",
+    )
+    .unwrap();
+    if design {
+        fs::write(
+            change.join("design.md"),
+            "# Design\n\nThe sample route is deterministic.\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        change.join("specs/capability/spec.md"),
+        "## ADDED Requirements\n\n### Requirement: Sample\n\nThe sample outcome SHALL be checked.\n",
+    )
+    .unwrap();
+    change
+}
+
+fn commit_change(root: &Path, message: &str) -> String {
+    git(root, &["add", "openspec"]);
+    git(root, &["commit", "-qm", message]);
+    git_output(root, &["rev-parse", "HEAD"])
+}
+
+fn lead_assignment(fixture: &SpawnFixture, name: &str, board_task: &str, change: Value) -> PathBuf {
+    fixture.base.assignment_with(
+        name,
+        &[("board_task", json!(board_task)), ("lead_change", change)],
+        &["README.md"],
+        &[],
+    )
+}
+
+fn validate_lead(
+    assignment: &Path,
+    checkout: &Path,
+    bd: &Path,
+) -> std::io::Result<executor_assignment::LeadChangeEvidence> {
+    let assignment = executor_assignment::Assignment::load(assignment)?;
+    let base = git_output(checkout, &["rev-parse", "HEAD"]);
+    executor_assignment::validate_lead_assignment(
+        &assignment,
+        &executor_assignment::AssignmentContext {
+            checkout,
+            base: &base,
+            owner: "director",
+            source: checkout,
+        },
+        bd,
+    )
+}
+
+/// The actual OpenSpec change under this repository, at an exact committed
+/// base, is accepted and returns the recordable evidence without claiming a
+/// slot, writing the checkout or mutating the board.
+#[test]
+fn prepared_openspec_change_validates_and_returns_exact_evidence() {
+    let fixture = SpawnFixture::with_board("lead-prepared");
+    let source_change = workspace_root().join("openspec/changes/add-director-led-orchestration");
+    let target = fixture
+        .base
+        .source
+        .join("openspec/changes/add-director-led-orchestration");
+    copy_tree(&source_change, &target);
+    let head = commit_change(&fixture.base.source, "prepare the lead change");
+    let issue = fixture.create_issue("Prepared Lead change", "task", None);
+    let assignment = lead_assignment(
+        &fixture,
+        "lead-prepared.json",
+        &issue,
+        json!({
+            "planning_root": ".",
+            "base": head,
+            "directory": "openspec/changes/add-director-led-orchestration",
+            "repositories": [{"path": ".", "base": head}],
+        }),
+    );
+    let status_before = git_output(
+        &fixture.base.source,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    let issue_before = fixture.show(&issue);
+    assert!(!fixture.state_dir().exists());
+
+    let evidence = validate_lead(&assignment, &fixture.base.source, &fixture.bd()).unwrap();
+
+    assert_eq!(
+        evidence.change,
+        "openspec/changes/add-director-led-orchestration"
+    );
+    assert_eq!(evidence.planning_root, ".");
+    assert_eq!(evidence.planning_base, head);
+    assert_eq!(evidence.board_task, issue);
+    assert_eq!(
+        evidence.repositories,
+        vec![executor_assignment::LeadRepositoryEvidence {
+            path: ".".to_owned(),
+            base: head.clone(),
+        }]
+    );
+    for artifact in [
+        "proposal.md",
+        "tasks.md",
+        "design.md",
+        "specs/director-orchestration/spec.md",
+        "specs/executor-mcp-plugin/spec.md",
+        "specs/lead-agent-orchestration/spec.md",
+    ] {
+        assert!(
+            evidence
+                .artifacts
+                .iter()
+                .any(|path| path.ends_with(artifact)),
+            "missing {artifact}: {evidence:?}"
+        );
+    }
+    assert!(
+        serde_json::to_vec(&evidence).unwrap().len()
+            <= executor_assignment::MAX_LEAD_EVIDENCE_BYTES
+    );
+    assert_eq!(issue_before, fixture.show(&issue));
+    assert_eq!(
+        status_before,
+        git_output(
+            &fixture.base.source,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        ),
+        "validation must not write the checkout"
+    );
+    assert!(
+        !fixture.state_dir().exists(),
+        "validation must not allocate a pool slot"
+    );
+    fixture.drop_fixture();
+}
+
+#[test]
+fn vague_or_absent_change_reference_is_rejected() {
+    let fixture = SpawnFixture::new("lead-vague");
+    let base = fixture.base.head();
+    let missing_bd = fixture.home.join("absent-bd.exe");
+    let legacy = fixture.legacy_assignment("legacy.json");
+    let error = validate_lead(&legacy, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires lead_change"), "{error}");
+    assert!(error.contains("title or board card"), "{error}");
+
+    for (name, directory) in [
+        ("bare-title.json", "lead-sample"),
+        ("changes-only.json", "openspec/changes"),
+        ("wrong-store.json", "other/changes/lead-sample"),
+    ] {
+        let assignment = lead_assignment(
+            &fixture,
+            name,
+            "lead-vague-1",
+            json!({
+                "planning_root": ".",
+                "base": base,
+                "directory": directory,
+                "repositories": [{"path": ".", "base": base}],
+            }),
+        );
+        let error = executor_assignment::Assignment::load(&assignment)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("openspec/changes/<change>"),
+            "{directory}: {error}"
+        );
+    }
+
+    let no_repositories = lead_assignment(
+        &fixture,
+        "no-repositories.json",
+        "lead-vague-1",
+        json!({
+            "planning_root": ".",
+            "base": base,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [],
+        }),
+    );
+    let error = executor_assignment::Assignment::load(&no_repositories)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("repositories is empty"), "{error}");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn missing_or_empty_planning_artifacts_name_the_missing_path() {
+    let fixture = SpawnFixture::new("lead-artifacts");
+    let change = prepare_sample_change(&fixture.base.source, true);
+    let head = commit_change(&fixture.base.source, "prepare the sample change");
+    let assignment = lead_assignment(
+        &fixture,
+        "lead-artifacts.json",
+        "lead-artifacts-1",
+        json!({
+            "planning_root": ".",
+            "base": head,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": ".", "base": head}],
+        }),
+    );
+    let missing_bd = fixture.home.join("absent-bd.exe");
+
+    for (name, expected) in [
+        ("proposal.md", "proposal.md"),
+        ("tasks.md", "tasks.md"),
+        ("design.md", "design.md"),
+    ] {
+        let path = change.join(name);
+        let content = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let error = validate_lead(&assignment, &fixture.base.source, &missing_bd)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("missing"), "{error}");
+        fs::write(&path, content).unwrap();
+    }
+
+    let spec = change.join("specs/capability/spec.md");
+    let content = fs::read(&spec).unwrap();
+    fs::remove_file(&spec).unwrap();
+    let error = validate_lead(&assignment, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("specs/*/spec.md"), "{error}");
+    fs::write(&spec, content).unwrap();
+
+    let proposal = change.join("proposal.md");
+    fs::write(&proposal, "").unwrap();
+    let error = validate_lead(&assignment, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("proposal.md"), "{error}");
+    assert!(error.contains("empty"), "{error}");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn escaping_paths_empty_and_duplicate_repositories_are_rejected() {
+    let fixture = SpawnFixture::new("lead-paths");
+    let base = fixture.base.head();
+    let cases = [
+        (
+            "escaping-root.json",
+            json!({
+                "planning_root": "../outside",
+                "base": base,
+                "directory": "openspec/changes/lead-sample",
+                "repositories": [{"path": ".", "base": base}],
+            }),
+            "must not traverse with '..'",
+        ),
+        (
+            "escaping-artifact.json",
+            json!({
+                "planning_root": ".",
+                "base": base,
+                "directory": "openspec/changes/../../outside",
+                "repositories": [{"path": ".", "base": base}],
+            }),
+            "must not traverse with '..'",
+        ),
+        (
+            "escaping-repository.json",
+            json!({
+                "planning_root": ".",
+                "base": base,
+                "directory": "openspec/changes/lead-sample",
+                "repositories": [{"path": "../repo", "base": base}],
+            }),
+            "must not traverse with '..'",
+        ),
+        (
+            "rooted-repository.json",
+            json!({
+                "planning_root": ".",
+                "base": base,
+                "directory": "openspec/changes/lead-sample",
+                "repositories": [{"path": "C:\\outside", "base": base}],
+            }),
+            "must be a plain relative path",
+        ),
+        (
+            "empty-repositories.json",
+            json!({
+                "planning_root": ".",
+                "base": base,
+                "directory": "openspec/changes/lead-sample",
+                "repositories": [],
+            }),
+            "repositories is empty",
+        ),
+        (
+            "duplicate-repositories.json",
+            json!({
+                "planning_root": ".",
+                "base": base,
+                "directory": "openspec/changes/lead-sample",
+                "repositories": [
+                    {"path": ".", "base": base},
+                    {"path": "./", "base": base},
+                ],
+            }),
+            "repeats the already declared repository",
+        ),
+        (
+            "empty-repository.json",
+            json!({
+                "planning_root": ".",
+                "base": base,
+                "directory": "openspec/changes/lead-sample",
+                "repositories": [{"path": "", "base": base}],
+            }),
+            "is empty",
+        ),
+    ];
+    for (name, change, expected) in cases {
+        let assignment = lead_assignment(&fixture, name, "lead-paths-1", change);
+        let error = executor_assignment::Assignment::load(&assignment)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+
+    prepare_sample_change(&fixture.base.source, true);
+    let head = commit_change(&fixture.base.source, "prepare the sample change");
+    let missing_bd = fixture.home.join("absent-bd.exe");
+    let broken = fixture.base.source.join("not-a-repository");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join(".git"), "gitdir: nowhere\n").unwrap();
+    let not_repo = lead_assignment(
+        &fixture,
+        "not-a-repository.json",
+        "lead-paths-1",
+        json!({
+            "planning_root": ".",
+            "base": head,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": "not-a-repository", "base": head}],
+        }),
+    );
+    let error = validate_lead(&not_repo, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a Git repository"), "{error}");
+
+    let subdirectory = lead_assignment(
+        &fixture,
+        "subdirectory.json",
+        "lead-paths-1",
+        json!({
+            "planning_root": ".",
+            "base": head,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": "global", "base": head}],
+        }),
+    );
+    let error = validate_lead(&subdirectory, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is not the repository root"), "{error}");
+    fixture.drop_fixture();
+}
+
+#[test]
+fn nonexistent_and_uncommitted_bases_are_rejected() {
+    let fixture = SpawnFixture::new("lead-bases");
+    prepare_sample_change(&fixture.base.source, true);
+    let head = commit_change(&fixture.base.source, "prepare the sample change");
+    let missing_bd = fixture.home.join("absent-bd.exe");
+    let missing = "0".repeat(40);
+
+    let planning_missing = lead_assignment(
+        &fixture,
+        "planning-base-missing.json",
+        "lead-bases-1",
+        json!({
+            "planning_root": ".",
+            "base": missing,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": ".", "base": head}],
+        }),
+    );
+    let error = validate_lead(&planning_missing, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a committed revision"), "{error}");
+    assert!(error.contains(&missing), "{error}");
+
+    let repository_missing = lead_assignment(
+        &fixture,
+        "repository-base-missing.json",
+        "lead-bases-1",
+        json!({
+            "planning_root": ".",
+            "base": head,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": ".", "base": missing}],
+        }),
+    );
+    let error = validate_lead(&repository_missing, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a committed revision"), "{error}");
+
+    let tree = git_output(&fixture.base.source, &["rev-parse", "HEAD^{tree}"]);
+    let not_a_commit = lead_assignment(
+        &fixture,
+        "tree-base.json",
+        "lead-bases-1",
+        json!({
+            "planning_root": ".",
+            "base": tree,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": ".", "base": head}],
+        }),
+    );
+    let error = validate_lead(&not_a_commit, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a committed revision"), "{error}");
+
+    let empty_base = lead_assignment(
+        &fixture,
+        "empty-base.json",
+        "lead-bases-1",
+        json!({
+            "planning_root": ".",
+            "base": "",
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": ".", "base": head}],
+        }),
+    );
+    let error = executor_assignment::Assignment::load(&empty_base)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is empty"), "{error}");
+
+    fs::write(
+        fixture
+            .base
+            .source
+            .join("openspec/changes/lead-sample/proposal.md"),
+        "# Proposal\n\nUncommitted scope.\n",
+    )
+    .unwrap();
+    let uncommitted = lead_assignment(
+        &fixture,
+        "uncommitted-artifact.json",
+        "lead-bases-1",
+        json!({
+            "planning_root": ".",
+            "base": head,
+            "directory": "openspec/changes/lead-sample",
+            "repositories": [{"path": ".", "base": head}],
+        }),
+    );
+    let error = validate_lead(&uncommitted, &fixture.base.source, &missing_bd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("differ from committed base"), "{error}");
+    assert!(error.contains("uncommitted or changed"), "{error}");
+    fixture.drop_fixture();
+}
+
+/// Direct Executor assignments keep the exact schema and rendering: the
+/// optional Lead field is absent from deserialization, serialization and the
+/// brief, and the installed dry-run path still succeeds.
+#[test]
+fn legacy_executor_assignment_still_parses_and_renders_unchanged() {
+    let fixture = Fixture::new("lead-legacy");
+    let path = fixture.assignment("legacy.json", &["README.md"], &[]);
+    let before: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let assignment = executor_assignment::Assignment::load(&path).unwrap();
+    let after = serde_json::to_value(&assignment).unwrap();
+    assert!(after.get("lead_change").is_none());
+    for (key, value) in before.as_object().unwrap() {
+        assert_eq!(
+            after.get(key),
+            Some(value),
+            "legacy field {key} changed after adding the optional Lead reference"
+        );
+    }
+
+    let text = executor_assignment::brief(
+        &assignment,
+        &executor_assignment::AssignmentContext {
+            checkout: &fixture.slot,
+            base: &fixture.head(),
+            owner: "exec-legacy",
+            source: &fixture.source,
+        },
+    )
+    .unwrap();
+    assert!(text.starts_with("Structured executor assignment (schema 1)\n"));
+    assert!(!text.contains("lead_change"), "{text}");
+    assert!(!text.contains("planning_root"), "{text}");
+
+    let out = fixture.check(&path, &[]);
+    let rendered = output_text(&out);
+    assert!(out.status.success(), "{rendered}");
+    assert!(rendered.contains("executor assignment valid"), "{rendered}");
+    assert!(!rendered.contains("lead_change"), "{rendered}");
+    fixture.drop();
 }
 
 /// A known nonordinary purpose on the board lineage is retained on the child

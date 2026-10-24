@@ -3268,6 +3268,7 @@ fn semantic_review_assignment(
         escalate: vec![
             "A declared input is missing, unreadable or cannot be bound to a physical line.".to_owned(),
         ],
+        lead_change: None,
     })
 }
 
