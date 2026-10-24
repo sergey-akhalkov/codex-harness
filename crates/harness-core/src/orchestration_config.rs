@@ -14,13 +14,33 @@ const DEFAULT_WORKTREE_LIMIT: u32 = 6;
 
 use crate::delivery_reflection::ReflectionLimits;
 
+const DEFAULT_DIRECTOR_MAX_LEADS: u32 = 2;
+const DEFAULT_DIRECTOR_MAX_EXECUTORS: u32 = 4;
+const DEFAULT_LEAD_MAX_EXECUTORS: u32 = 6;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Orchestration {
     pub schema: u32,
     pub lead_profile: String,
     pub successor_lead_profile: String,
+    /// Route for Leads dispatched by the root Director. Omitted by
+    /// configurations written before delegated Leads existed; those resolve
+    /// to the first configured executor profile (see
+    /// [`delegated_lead_profile()`]).
+    #[serde(default)]
+    pub delegated_lead_profile: Option<String>,
     pub executor_profiles: Vec<String>,
+    /// Direct Leads admitted under each Director.
+    #[serde(default = "default_director_max_leads")]
+    pub director_max_leads: u32,
+    /// Direct Executors admitted under each Director.
+    #[serde(default = "default_director_max_executors")]
+    pub director_max_executors: u32,
+    /// Direct Executors admitted under each delegated Lead.
+    #[serde(default = "default_lead_max_executors")]
+    pub lead_max_executors: u32,
+    /// Installation-wide active Executor runs across parents and repositories.
     pub max_concurrent_executors: u32,
     /// Independent managed worktree pool capacity (see
     /// `isolated-worktree-workflow`). Omitted in configurations written before
@@ -68,6 +88,18 @@ fn default_self_reflection_enabled() -> bool {
     true
 }
 
+fn default_director_max_leads() -> u32 {
+    DEFAULT_DIRECTOR_MAX_LEADS
+}
+
+fn default_director_max_executors() -> u32 {
+    DEFAULT_DIRECTOR_MAX_EXECUTORS
+}
+
+fn default_lead_max_executors() -> u32 {
+    DEFAULT_LEAD_MAX_EXECUTORS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileBinding {
     pub profile: String,
@@ -99,6 +131,65 @@ pub fn worktree_pool_size(config: &Orchestration) -> u32 {
     config
         .worktree_pool_size
         .unwrap_or(config.max_concurrent_executors)
+}
+
+/// Effective route for delegated Leads. An omitted setting uses the first
+/// configured executor profile only for compatibility with configurations
+/// written before delegated Leads existed; an explicit profile always wins.
+pub fn delegated_lead_profile(config: &Orchestration) -> io::Result<String> {
+    match &config.delegated_lead_profile {
+        Some(profile) => Ok(profile.clone()),
+        None => executor_profile(config, None),
+    }
+}
+
+/// Limits reachable by one parent's next Executor. The effective value is the
+/// smallest of the immediate-parent allowance, installation-wide concurrency,
+/// and total pool capacity; every smallest limit is named as a bottleneck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorCapacityReport {
+    pub parent_limit: u32,
+    pub max_concurrent_executors: u32,
+    pub worktree_pool_size: u32,
+    pub effective_limit: u32,
+    pub bottlenecks: Vec<&'static str>,
+}
+
+impl std::fmt::Display for ExecutorCapacityReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "effective executor capacity {} (parent allowance {}, max_concurrent_executors {}, worktree_pool_size {}): bottleneck {}",
+            self.effective_limit,
+            self.parent_limit,
+            self.max_concurrent_executors,
+            self.worktree_pool_size,
+            self.bottlenecks.join(" + ")
+        )
+    }
+}
+
+pub fn executor_capacity(config: &Orchestration, parent_limit: u32) -> ExecutorCapacityReport {
+    let pool_limit = worktree_pool_size(config);
+    let effective_limit = parent_limit
+        .min(config.max_concurrent_executors)
+        .min(pool_limit);
+    let limits = [
+        ("parent allowance", parent_limit),
+        ("max_concurrent_executors", config.max_concurrent_executors),
+        ("worktree_pool_size", pool_limit),
+    ];
+    let bottlenecks = limits
+        .into_iter()
+        .filter_map(|(name, limit)| (limit == effective_limit).then_some(name))
+        .collect();
+    ExecutorCapacityReport {
+        parent_limit,
+        max_concurrent_executors: config.max_concurrent_executors,
+        worktree_pool_size: pool_limit,
+        effective_limit,
+        bottlenecks,
+    }
 }
 
 pub fn profile_args(profile: &str) -> io::Result<Vec<String>> {
@@ -287,10 +378,24 @@ pub fn validate(config: &Orchestration, installed: &BTreeSet<String>) -> io::Res
             )));
         }
     }
+    if let Some(profile) = &config.delegated_lead_profile {
+        require_profile("delegated_lead_profile", profile, installed)?;
+    }
     if config.max_concurrent_executors == 0 || config.max_concurrent_executors > MAX_EXECUTORS {
         return Err(invalid(
             "orchestration max_concurrent_executors must be a positive integer at most 32",
         ));
+    }
+    for (field, limit) in [
+        ("director_max_leads", config.director_max_leads),
+        ("director_max_executors", config.director_max_executors),
+        ("lead_max_executors", config.lead_max_executors),
+    ] {
+        if limit == 0 || limit > MAX_EXECUTORS {
+            return Err(invalid(&format!(
+                "orchestration {field} must be a positive integer at most {MAX_EXECUTORS}"
+            )));
+        }
     }
     if let Some(pool) = config.worktree_pool_size
         && (pool == 0 || pool > MAX_POOL_SIZE)
@@ -540,6 +645,10 @@ max_events_per_poll = 10
             schema: 1,
             lead_profile: "missing".into(),
             successor_lead_profile: "xai".into(),
+            delegated_lead_profile: None,
+            director_max_leads: 2,
+            director_max_executors: 4,
+            lead_max_executors: 6,
             executor_profiles: vec!["xai".into()],
             max_concurrent_executors: 2,
             worktree_pool_size: None,
@@ -561,6 +670,10 @@ max_events_per_poll = 10
             schema: 1,
             lead_profile: "default".into(),
             successor_lead_profile: "xai".into(),
+            delegated_lead_profile: None,
+            director_max_leads: 2,
+            director_max_executors: 4,
+            lead_max_executors: 6,
             executor_profiles: vec!["xai".into()],
             max_concurrent_executors: 0,
             worktree_pool_size: None,
@@ -582,6 +695,10 @@ max_events_per_poll = 10
             schema: 1,
             lead_profile: "default".into(),
             successor_lead_profile: "xai".into(),
+            delegated_lead_profile: None,
+            director_max_leads: 2,
+            director_max_executors: 4,
+            lead_max_executors: 6,
             executor_profiles: vec!["xai".into()],
             max_concurrent_executors: 2,
             worktree_pool_size: None,
@@ -771,21 +888,28 @@ max_events_per_poll = 10
     }
 
     #[test]
-    fn shipped_defaults_materialize_independent_pool_capacity() {
+    fn shipped_defaults_fix_director_topology_and_capacity() {
         let config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
-        assert_eq!(config.max_concurrent_executors, 6);
-        assert_eq!(config.worktree_pool_size, Some(6));
-        assert_eq!(worktree_pool_size(&config), 6);
+        assert_eq!(config.lead_profile, "default");
+        assert_eq!(config.successor_lead_profile, "default");
+        assert_eq!(config.delegated_lead_profile.as_deref(), Some("ds"));
+        assert_eq!(delegated_lead_profile(&config).unwrap(), "ds");
+        assert_eq!(config.director_max_leads, 2);
+        assert_eq!(config.director_max_executors, 4);
+        assert_eq!(config.lead_max_executors, 6);
+        assert_eq!(config.max_concurrent_executors, 16);
+        assert_eq!(config.worktree_pool_size, Some(18));
+        assert_eq!(worktree_pool_size(&config), 18);
     }
 
     #[test]
-    fn legacy_omission_keeps_the_executor_derived_capacity() {
+    fn legacy_configuration_parses_with_compatible_defaults() {
         let config = parse(
             br#"
 schema = 1
 lead_profile = "default"
 successor_lead_profile = "default"
-executor_profiles = ["ds"]
+executor_profiles = ["legacy-exec"]
 max_concurrent_executors = 5
 vote_threshold = 3
 incubator_size_cap = 32
@@ -794,13 +918,127 @@ worktree_limit = 6
 "#,
         )
         .unwrap();
+        assert_eq!(config.delegated_lead_profile, None);
+        assert_eq!(delegated_lead_profile(&config).unwrap(), "legacy-exec");
+        assert_eq!(config.director_max_leads, 2);
+        assert_eq!(config.director_max_executors, 4);
+        assert_eq!(config.lead_max_executors, 6);
         assert_eq!(config.worktree_pool_size, None);
         assert_eq!(
             worktree_pool_size(&config),
             5,
             "the compatibility worktree_limit never sizes the pool"
         );
-        validate(&config, &installed(&["default", "ds"])).unwrap();
+        validate(&config, &installed(&["default", "legacy-exec"])).unwrap();
+    }
+
+    #[test]
+    fn explicit_local_overrides_win_without_changing_root_profiles() {
+        let config = parse(
+            br#"
+schema = 1
+lead_profile = "default"
+successor_lead_profile = "default"
+delegated_lead_profile = "lead-alt"
+executor_profiles = ["ds"]
+director_max_leads = 1
+director_max_executors = 3
+lead_max_executors = 5
+max_concurrent_executors = 9
+worktree_pool_size = 11
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.lead_profile, "default");
+        assert_eq!(config.successor_lead_profile, "default");
+        assert_eq!(delegated_lead_profile(&config).unwrap(), "lead-alt");
+        assert_eq!(config.director_max_leads, 1);
+        assert_eq!(config.director_max_executors, 3);
+        assert_eq!(config.lead_max_executors, 5);
+        assert_eq!(config.max_concurrent_executors, 9);
+        assert_eq!(worktree_pool_size(&config), 11);
+        validate(&config, &installed(&["default", "ds", "lead-alt"])).unwrap();
+
+        let mut missing = config;
+        missing.delegated_lead_profile = Some("missing-lead".into());
+        let error = validate(&missing, &installed(&["default", "ds"])).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("profile 'missing-lead' is not installed")
+        );
+    }
+
+    #[test]
+    fn parent_limits_reject_zero_and_oversized_values_by_name() {
+        fn set_limit(config: &mut Orchestration, field: &str, value: u32) {
+            match field {
+                "director_max_leads" => config.director_max_leads = value,
+                "director_max_executors" => config.director_max_executors = value,
+                "lead_max_executors" => config.lead_max_executors = value,
+                _ => unreachable!("test field is one of the parent limits"),
+            }
+        }
+
+        for field in [
+            "director_max_leads",
+            "director_max_executors",
+            "lead_max_executors",
+        ] {
+            for value in [0, 33] {
+                let mut config =
+                    parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
+                set_limit(&mut config, field, value);
+                let error = validate(&config, &installed(&["default", "ds"])).unwrap_err();
+                let expected = format!(
+                    "orchestration {field} must be a positive integer at most {MAX_EXECUTORS}"
+                );
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains(&expected), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn effective_executor_capacity_names_the_smallest_binding_limits() {
+        let mut config = parse(include_bytes!("../../../global/orchestration.toml")).unwrap();
+        let report = executor_capacity(&config, config.director_max_executors);
+        assert_eq!(report.effective_limit, 4);
+        assert_eq!(report.bottlenecks, ["parent allowance"]);
+        let rendered = report.to_string();
+        assert!(rendered.contains("parent allowance 4"), "{rendered}");
+        assert!(
+            rendered.contains("max_concurrent_executors 16"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("worktree_pool_size 18"), "{rendered}");
+        assert!(
+            rendered.contains("bottleneck parent allowance"),
+            "{rendered}"
+        );
+
+        config.max_concurrent_executors = 3;
+        let report = executor_capacity(&config, config.director_max_executors);
+        assert_eq!(report.effective_limit, 3);
+        assert_eq!(report.bottlenecks, ["max_concurrent_executors"]);
+
+        config.max_concurrent_executors = 16;
+        config.worktree_pool_size = Some(2);
+        let report = executor_capacity(&config, config.director_max_executors);
+        assert_eq!(report.effective_limit, 2);
+        assert_eq!(report.bottlenecks, ["worktree_pool_size"]);
+
+        config.max_concurrent_executors = 4;
+        config.worktree_pool_size = Some(4);
+        let report = executor_capacity(&config, config.director_max_executors);
+        assert_eq!(
+            report.bottlenecks,
+            [
+                "parent allowance",
+                "max_concurrent_executors",
+                "worktree_pool_size"
+            ]
+        );
     }
 
     #[test]

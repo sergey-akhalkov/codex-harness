@@ -63,19 +63,28 @@ remain the bounded state and result path.
 
 ## Orchestration configuration
 
-Kit-owned [orchestration.toml](../global/orchestration.toml) names the lead
-profile, the successor lead used after a confirmed lead quota failure, the
-executor profiles, the maximum concurrent executor count, and the shared
-worktree pool's directory capacity. Installation check rejects a missing
-profile or a non-positive limit without substituting another route. `default`
-is the native session with no `--profile` flag. Other names must exist as
-`CODEX_HOME/<name>.config.toml` or `[profiles.<name>]`. Pool capacity comes
-from `worktree_pool_size`, independent of `max_concurrent_executors`; the
-shipped default is six for each, and `worktree_limit` stays
-compatibility-only. Install and update materialize the explicit setting for a
-configuration written before the capacity split - including a checkout still
-carrying the old shipped defaults - writing its former effective capacity
-before publication so later executor-limit changes cannot resize the pool.
+Kit-owned [orchestration.toml](../global/orchestration.toml) names the root
+Director route, its successor for a confirmed lead quota failure, the delegated
+Lead route, the Executor profiles, the three immediate-parent limits, the
+installation-wide Executor envelope, and the shared worktree pool's directory
+capacity. `lead_profile` and `successor_lead_profile` remain root-only settings;
+`delegated_lead_profile` selects the route for Leads dispatched by the Director
+and does not inherit root succession authority. Installation check rejects a
+missing profile or a non-positive or oversized limit without substituting
+another route. `default` is the native session with no `--profile` flag. Other
+names must exist as `CODEX_HOME/<name>.config.toml` or `[profiles.<name>]`.
+
+The shipped delegated Lead route is `ds`. A configuration written before
+`delegated_lead_profile` existed remains compatible: omission resolves to its
+first configured Executor profile, so a custom route is not silently replaced
+by `ds`; an explicit local value always wins. The shipped parent limits are 2
+Director Leads, 4 Director Executors and 6 Executors per Lead; the shipped
+installation-wide Executor limit is 16 and pool capacity is 18. Install and
+update materialize an explicit pool setting for a configuration written before
+the capacity split - including a checkout still carrying the old shipped
+defaults - writing its former effective capacity before publication so later
+Executor-limit changes cannot resize the pool. `worktree_limit` stays
+compatibility-only.
 
 Synthetic example (not a live consumer):
 
@@ -83,10 +92,50 @@ Synthetic example (not a live consumer):
 schema = 1
 lead_profile = "default"
 successor_lead_profile = "default"
+delegated_lead_profile = "ds"
 executor_profiles = ["ds"]
-max_concurrent_executors = 6
-worktree_pool_size = 6
+director_max_leads = 2
+director_max_executors = 4
+lead_max_executors = 6
+max_concurrent_executors = 16
+worktree_pool_size = 18
 ```
+
+### Counting and composing limits
+
+`director_max_leads`, `director_max_executors` and `lead_max_executors` count
+managed children by immediate parent and role. A Director's Lead limit counts
+only Leads directly under that Director. Its Executor limit counts only its
+direct Executors, not Executors under those Leads; each delegated Lead has its
+own `lead_max_executors` allowance. Grandchildren therefore do not consume a
+Director's direct-Executor positions. Leads count against their Director's Lead
+limit and their worktree leases, not the installation-wide Executor envelope.
+
+Every admission count includes startup reservations, active runs and runs
+waiting for a reply. Waiting for an answer does not free a position. A stopped
+or terminal run releases concurrency only after its effects are reconciled;
+its worktree stays held, and a completed but unaccepted result also keeps its
+worktree. Explicit release, not completion, stop, archive or release of
+concurrency, frees that worktree.
+
+The immediate-parent allowance, `max_concurrent_executors` and
+`worktree_pool_size` compose rather than replace one another. The parent limit
+is a per-parent gate, the Executor limit is the installation-wide envelope
+across parents and repositories, and pool capacity independently bounds
+directory positions; actual admission also requires a free pool position.
+`max_concurrent_executors` does not include Leads, while pool positions cover
+both Leads and Executors. Capacity for each repository's pool comes from
+`worktree_pool_size`.
+
+The effective configured bottleneck is the smallest of the applicable parent
+allowance, `max_concurrent_executors` and `worktree_pool_size`, with all equal
+minima named. Configuration diagnostics report the reachable limits and this
+binding constraint, so a refusal can be traced to the limit that must change.
+The shipped full tree is `2 * 6 + 4 = 16` Executors plus two Leads, hence
+eighteen workspaces in a single repository. Positions remain lazy and
+reusable. Lower local limits are valid operating choices and never stop healthy
+runs; larger role limits require a deliberate increase of the separate shared
+envelope and pool capacity.
 
 The installed `executors` plugin supplies the ordinary workflow:
 `executor_dispatch`, `executor_status`, `executor_wait`, `executor_message`,
@@ -525,9 +574,11 @@ is no mandatory escalation ladder.
 The [harness profile](../global/harness.config.toml) contains a short standing
 policy and a limit of two concurrent native in-session child threads.
 `executor_dispatch` creates native executor threads governed by
-`max_concurrent_executors` in [orchestration.toml](../global/orchestration.toml);
-the lead is not included in that executor count. Apply each limit only to its
-dispatch mechanism, as specified by the
+its immediate-parent limit, `max_concurrent_executors` and available pool
+capacity in [orchestration.toml](../global/orchestration.toml). Leads use pool
+positions but are not included in the installation-wide Executor count. Apply
+each limit only to its dispatch mechanism, and report the smallest binding
+constraint, as specified by the
 [lead responsibility](../global/roles/lead.md#assignment-and-routing).
 The [former Astra source directory](../global/agents/README.md) remains linked
 at `~/.codex/agents/codex-harness` for installer compatibility and contains no
