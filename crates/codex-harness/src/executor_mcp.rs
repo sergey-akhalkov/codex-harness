@@ -637,6 +637,8 @@ impl RunRole {
 enum RunSide {
     Parent,
     Child,
+    /// A root Director inspecting a descendant that is not its direct child.
+    Ancestor,
 }
 
 struct RunReceipt {
@@ -1325,6 +1327,36 @@ fn matching_receipts(home: &Path, caller: &str) -> io::Result<Vec<RunReceipt>> {
         .collect())
 }
 
+/// Status includes the caller's direct children plus, for a Director, every
+/// descendant recorded under the same root. It still reads only the verified
+/// receipts; wait acknowledgement and question resolution remain owned by the
+/// direct parent.
+fn status_receipts(
+    home: &Path,
+    caller: &str,
+    authority: &CallerAuthority,
+) -> io::Result<Vec<RunReceipt>> {
+    let mut receipts = Vec::new();
+    for receipt in read_receipts(home)? {
+        let parent = receipt.value["parentThreadId"]
+            .as_str()
+            .or_else(|| receipt.value["leadThreadId"].as_str());
+        let child_role = receipt.value["role"].as_str().unwrap_or("executor");
+        let root = receipt.value["rootThreadId"]
+            .as_str()
+            .or_else(|| receipt.value["leadThreadId"].as_str());
+        let direct = parent == Some(caller)
+            || (child_role == "executor"
+                && receipt.value["executorThreadId"].as_str() == Some(caller));
+        let descendant = authority.role == CallerRole::Director && root == Some(caller);
+        if direct || descendant {
+            receipts.push(receipt);
+        }
+    }
+    receipts.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(receipts)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunView {
     Live,
@@ -1388,19 +1420,17 @@ fn verify_run_for(
         RunSide::Parent
     } else if caller == executor_thread {
         RunSide::Child
+    } else if view == RunView::Status && caller == root_thread {
+        RunSide::Ancestor
     } else {
         return Err(invalid(
             "the calling thread is not the recorded lead or executor of this run; no operation was performed",
         ));
     };
-    let role = if caller == lead_thread {
-        RunRole::Lead
-    } else if caller == executor_thread {
-        RunRole::Executor
-    } else {
-        return Err(invalid(
-            "the calling thread is not the recorded lead or executor of this run; no operation was performed",
-        ));
+    let role = match side {
+        RunSide::Parent => RunRole::Lead,
+        RunSide::Child => RunRole::Executor,
+        RunSide::Ancestor => child_role,
     };
     let title = required_text(value, "title")?.to_owned();
     let base = required_text(value, "base")?.to_owned();
@@ -2462,8 +2492,7 @@ fn status(operation: &Operation) -> io::Result<Value> {
     let _: StatusArgs = serde_json::from_value(operation.arguments.clone())
         .map_err(|error| invalid(format!("executor_status arguments are invalid: {error}")))?;
     let home = native_launcher::codex_home()?;
-    let receipts = matching_receipts(&home, &caller)?;
-    if receipts.is_empty() {
+    if matching_receipts(&home, &caller)?.is_empty() {
         return Ok(json!({
             "callerThreadId": caller,
             "role": Value::Null,
@@ -2473,6 +2502,7 @@ fn status(operation: &Operation) -> io::Result<Value> {
         }));
     }
     let caller_role = caller_authority(&home, &caller)?;
+    let receipts = status_receipts(&home, &caller, &caller_role)?;
     let truncated = receipts.len() > MAX_STATUS_RUNS;
     let mut runs = Vec::new();
     for receipt in receipts.into_iter().take(MAX_STATUS_RUNS) {
@@ -2497,7 +2527,7 @@ fn status(operation: &Operation) -> io::Result<Value> {
         for (index, (run, _)) in runs.iter().enumerate() {
             let caller_thread = match run.side {
                 RunSide::Parent => &run.lead_thread,
-                RunSide::Child => &run.executor_thread,
+                RunSide::Child | RunSide::Ancestor => &run.executor_thread,
             };
             let caller_id = caller_thread.clone();
             handles.push((
@@ -2508,7 +2538,7 @@ fn status(operation: &Operation) -> io::Result<Value> {
                     native_status_or_release(
                         run,
                         caller_thread,
-                        run.side == RunSide::Child,
+                        run.side != RunSide::Parent,
                         STATUS_NATIVE_READ_BOUND,
                     )
                 }),
@@ -3492,17 +3522,19 @@ fn message(operation: &Operation) -> io::Result<Value> {
     }
     let home = native_launcher::codex_home()?;
     let receipts = read_receipts(&home)?;
-    let is_executor = receipts
-        .iter()
-        .any(|receipt| receipt.value["executorThreadId"].as_str() == Some(caller.as_str()));
-    let is_lead = receipts
-        .iter()
-        .any(|receipt| receipt.value["leadThreadId"].as_str() == Some(caller.as_str()));
-    if is_executor && is_lead {
-        return Err(invalid(
-            "the calling thread is recorded as both a lead and an executor; refusing an ambiguous message direction",
-        ));
-    }
+    // A delegated Lead is a child of the Director, but its ordinary message
+    // direction is downward to its Executors; upward questions use the
+    // dedicated ask operation.
+    let is_executor = receipts.iter().any(|receipt| {
+        receipt.value["executorThreadId"].as_str() == Some(caller.as_str())
+            && receipt.value["role"].as_str() != Some("lead")
+    });
+    let is_lead = receipts.iter().any(|receipt| {
+        receipt.value["parentThreadId"]
+            .as_str()
+            .or_else(|| receipt.value["leadThreadId"].as_str())
+            == Some(caller.as_str())
+    });
     if is_executor {
         if args.request_id.is_some() || args.run.is_some() {
             return Err(invalid(

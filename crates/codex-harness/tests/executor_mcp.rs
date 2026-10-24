@@ -336,6 +336,13 @@ impl SimThread {
         }
     }
 
+    fn with_ds(mut self) -> Self {
+        self.model = "deepseek-flash".into();
+        self.model_provider = "deepseek".into();
+        self.reasoning_effort = "max".into();
+        self
+    }
+
     fn state(&self) -> &'static str {
         if self.turns.iter().any(|turn| turn["status"] == "inProgress") {
             "active"
@@ -927,6 +934,29 @@ fn delegated_lead_run(home: &Path, root: &Path, server: &Server) -> (PathBuf, Va
     });
     fs::write(&receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
     (repository, value)
+}
+
+fn delegated_child_run(home: &Path, server: &Server) -> (SyntheticRun, Value, String) {
+    let run = synthetic_run(home, LEAD, EXECUTOR, server);
+    let request_id = "lead-000000000000000000000001".to_owned();
+    let mut value: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    value["role"] = json!("executor");
+    value["parentThreadId"] = json!(LEAD);
+    value["rootThreadId"] = json!(DIRECTOR);
+    value["runGeneration"] = json!("child-generation");
+    value["leadMessages"] = json!([{
+        "schema": 1,
+        "id": request_id,
+        "kind": "reply-request",
+        "status": "pending",
+        "contentId": "pending-content",
+        "method": "turn/start",
+        "turnId": "initial-turn",
+        "attempts": 0,
+        "requestedMs": 1
+    }]);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    (run, value, request_id)
 }
 
 fn bd_executable() -> PathBuf {
@@ -1903,6 +1933,168 @@ fn a_missing_role_tool_catalogue_fails_before_the_turn() {
     );
     assert_eq!(server.requests_for("thread/start").len(), starts + 1);
     assert_eq!(server.requests_for("turn/start").len(), turns);
+    mcp.finish();
+}
+
+#[test]
+fn director_status_inspects_descendants_without_acknowledging_the_lead_result() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, lead) = delegated_lead_run(home.path(), root.path(), &server);
+    let (child, child_value, request_id) = delegated_child_run(home.path(), &server);
+    let mut sim = NativeSim::new(DIRECTOR, EXECUTOR, &repository, false, false);
+    sim.threads.insert(
+        LEAD.to_owned(),
+        SimThread::idle(LEAD, Path::new(lead["checkout"].as_str().unwrap())),
+    );
+    sim.threads.insert(
+        EXECUTOR.to_owned(),
+        SimThread::active(
+            EXECUTOR,
+            child._checkout.path(),
+            child_value["turnId"].as_str().unwrap(),
+        ),
+    );
+    server.answer_fn(native_responder(Arc::new(Mutex::new(sim))));
+    let mut mcp = Mcp::start(home.path());
+
+    let status = mcp.call_tool(
+        2,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let status = result(&status);
+    let runs = status["runs"].as_array().unwrap();
+    assert!(runs.iter().any(|run| run["run"] == lead["run"]), "{status}");
+    let child_summary = runs
+        .iter()
+        .find(|run| run["run"] == child_value["run"])
+        .unwrap_or_else(|| panic!("descendant missing: {status}"));
+    assert_eq!(child_summary["parentThreadId"], LEAD, "{child_summary}");
+    assert_eq!(child_summary["rootThreadId"], DIRECTOR, "{child_summary}");
+    assert_eq!(
+        child_summary["pendingRequests"][0]["requestId"], request_id,
+        "{child_summary}"
+    );
+
+    let waited = mcp.call_tool(
+        3,
+        "executor_wait",
+        json!({"run": child_value["run"], "timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let waited = result(&waited);
+    assert_eq!(waited["state"], "question", "{waited}");
+    assert_eq!(waited["pendingRequests"][0]["requestId"], request_id);
+
+    let again = mcp.call_tool(
+        4,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let again = result(&again);
+    let child_again = again["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["run"] == child_value["run"])
+        .unwrap();
+    assert_eq!(
+        child_again["pendingRequests"][0]["requestId"], request_id,
+        "Director inspection must not acknowledge the Lead's result: {again}"
+    );
+
+    drop(child);
+    mcp.finish();
+}
+
+#[test]
+fn delegated_lead_asks_upward_and_the_director_replies() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, _lead) = delegated_lead_run(home.path(), root.path(), &server);
+    let mut sim = NativeSim::new(DIRECTOR, LEAD, &repository, false, false);
+    sim.threads.insert(
+        DIRECTOR.to_owned(),
+        SimThread::idle(DIRECTOR, &repository).with_ds(),
+    );
+    sim.threads.insert(
+        LEAD.to_owned(),
+        SimThread::idle(LEAD, &repository).with_ds(),
+    );
+    let sim = Arc::new(Mutex::new(sim));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let asked = mcp.call_tool(
+        2,
+        "executor_ask_lead",
+        json!({"text": "upward decision?", "clientMessageId": "lead-up"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let asked = result(&asked);
+    assert_eq!(asked["delivery"]["status"], "delivered", "{asked}");
+    let request_id = asked["requestId"].as_str().unwrap().to_owned();
+    let replied = mcp.call_tool(
+        3,
+        "executor_reply",
+        json!({"requestId": request_id, "text": "director answer"}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let replied = result(&replied);
+    assert_eq!(replied["delivery"]["status"], "delivered", "{replied}");
+
+    mcp.finish();
+}
+
+#[test]
+fn delegated_lead_messages_downward_and_a_sibling_lead_is_rejected() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, _lead) = delegated_lead_run(home.path(), root.path(), &server);
+    let (child, child_value, _) = delegated_child_run(home.path(), &server);
+    let sibling_run = synthetic_run(home.path(), OTHER_LEAD, OTHER_EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        child._checkout.path(),
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let sent = mcp.call_tool(
+        2,
+        "executor_message",
+        json!({"run": child_value["run"], "text": "downward instruction"}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let sent = result(&sent);
+    assert_eq!(sent["delivery"]["status"], "delivered", "{sent}");
+
+    let sibling = mcp.call_tool(
+        3,
+        "executor_message",
+        json!({"run": child_value["run"], "text": "cross-team"}),
+        Some(json!({"threadId": OTHER_LEAD})),
+    );
+    assert!(
+        tool_error(&sibling).contains("owned by the calling lead"),
+        "{sibling}"
+    );
+
+    drop(child);
+    drop(sibling_run);
+    drop(repository);
     mcp.finish();
 }
 
