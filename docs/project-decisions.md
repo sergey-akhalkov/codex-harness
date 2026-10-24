@@ -615,6 +615,29 @@ while memory, onboarding, introspection, text-search,
 `restart_language_server` is revisited only on recorded recurring
 LSP-stall evidence. Core delivery follows the normal deploy lifecycle.
 
+**Serena plugin delivery (2026-10-24, confirmed by
+[deliver-serena-plugin](../openspec/changes/deliver-serena-plugin/proposal.md)):**
+Serena is delivered independently as `serena@coding-agents-harness` through the
+existing Codex marketplace mechanism. The package carries a verified prebuilt
+native runtime and portable data; ordinary consumers do not need harness core,
+the launcher, a source checkout, Rust/MSVC installed solely for harness, or a
+global `codex-harness` PATH entry. The native plugin lifecycle owns package
+install, update, disablement and removal, while `PLUGIN_DATA` holds writable
+dependency, ownership and recovery state across package versions.
+
+First use is an explicit packaged setup operation. Status, Check and startup
+remain read-only; only explicit preparation may acquire the pinned selected
+prerequisites, and it must reuse compatible discovered packages before
+provisioning. The accepted selection remains Serena for semantic navigation
+and edits plus Nuphus for authorized UI work. Nuphus, executors, shared
+packages, project files and unrelated settings retain their current owners.
+The source-linked code-tools route remains a development route and an upgrade
+path; installing the plugin alone never retires its legacy Serena connection.
+Owned cutover occurs only after packaged semantic verification, refuses a
+foreign edit and remains recoverable. Publication, a separate clean physical
+PC, successful packaged semantic use and the conditional C#/Pascal operations
+remain open acceptance items until recorded by that change.
+
 ## Subscriptions
 
 SuperGrok Heavy is delivered as the native `codex --profile xai` provider with

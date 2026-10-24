@@ -66,6 +66,11 @@ Codex and OpenSpec remain bootstrap prerequisites. Selected MCP dependencies are
 handled by the explicit [code-tool lifecycle](code-tools.md); ordinary startup
 and Check never provision or download packages.
 
+Those are prerequisites for the source-linked harness and its development
+route. A consumer of the released Serena plugin needs supported Windows x64
+and native Codex; it does not need harness core, the launcher, a checkout,
+Rust/MSVC installed solely for harness, or symlink privilege for the plugin.
+
 ## Install and verify
 
 ### First installation on a new machine
@@ -298,6 +303,67 @@ MCP warning presentation is unavailable in Codex 0.164; the cache guard exposes
 its warning text and threshold evidence in receipt/status/wait, which the user
 accepted as the current limitation. `executor_status` and `executor_wait`
 remain the verified machine-readable state and result paths.
+
+### Serena plugin lifecycle
+
+The released `serena@coding-agents-harness` plugin is the ordinary consumer
+route for Serena language tools. It is independent of harness core and the
+source checkout. The existing source-linked
+`install --code-tools-only` route remains available for checkout development
+and for installations that have not completed the owned migration.
+
+A producer emits the Windows x64 package and a marketplace tree from a verified
+release build:
+
+```powershell
+codex-harness serena-plugin package --source <CHECKOUT> --binary <VERIFIED-RELEASE>\codex-harness.exe --output <MARKETPLACE-ROOT>
+```
+
+The emitted package uses the portable root `plugin.json` and `mcp.json`, one
+`serena-plugin` stdio server, package-relative wrappers, generated copies of
+`global/code-tools.json` and `global/tool-resources.json`, and recorded
+binary/resource provenance. On verified Codex CLI **0.164.0**, `${PLUGIN_ROOT}`
+resolved in the server arguments and `cwd`, and Codex supplied `PLUGIN_ROOT`
+and stable writable `PLUGIN_DATA`. Install from the produced marketplace:
+
+```powershell
+codex plugin marketplace add <MARKETPLACE-ROOT> --json
+codex plugin add serena@coding-agents-harness --json
+codex mcp get serena-plugin --json
+```
+
+Resolve the installed paths from that native declaration, then use the packaged
+read-only checks and explicit setup. `PLUGIN_DATA` survives package updates;
+`CODEX_HOME/harness/serena-plugin` is only a fallback when the native host does
+not supply it.
+
+```powershell
+$server = codex mcp get serena-plugin --json | ConvertFrom-Json
+$env:PLUGIN_ROOT = $server.transport.env.PLUGIN_ROOT
+$env:PLUGIN_DATA = $server.transport.env.PLUGIN_DATA
+& (Join-Path $PLUGIN_ROOT 'bin\serena-setup.cmd') status
+& (Join-Path $PLUGIN_ROOT 'bin\serena-setup.cmd') check
+& (Join-Path $PLUGIN_ROOT 'bin\serena-setup.cmd') prepare
+```
+
+Status, Check and package verification are read-only. Preparation is the only
+package-acquisition path: it reuses compatible discovered packages and
+provisions missing pinned prerequisites into owned state. MCP startup never
+downloads, installs or changes a project. Start or refresh Codex after
+preparation before claiming that the current session discovered Serena.
+
+Do not remove an existing harness-owned Serena registration by hand. The
+packaged preparation path verifies the new provider before the explicit owned
+cutover; foreign edits are preserved and reported, and Nuphus, executors,
+shared packages and unrelated settings retain their owners. Interrupted removal
+uses the existing code-tools recovery journal.
+
+Packaging, package-relative status/check, missing-registry failure and an
+isolated native install are verified. Successful packaged preparation, real
+Python/Rust Serena operations, publication and a separate clean physical PC
+remain explicit acceptance work; see [code tools](code-tools.md). The plugin
+sets no startup or tool timeout of its own, so native Codex host defaults
+apply.
 
 ### Ponytail setup
 
