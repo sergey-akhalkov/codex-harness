@@ -19,8 +19,10 @@ const PROTOCOL: &str = "2024-11-05";
 const TOOL_DEADLINE: Duration = Duration::from_secs(60);
 const EXECUTOR_WAIT_DEADLINE: Duration = Duration::from_secs(1860);
 
+const EXECUTOR_WAIT_TOOL: &str = "executor_wait";
+
 fn operation_deadline(name: &str) -> io::Result<Deadline> {
-    Deadline::after(if name == "executor_wait" {
+    Deadline::after(if name == EXECUTOR_WAIT_TOOL {
         EXECUTOR_WAIT_DEADLINE
     } else {
         TOOL_DEADLINE
@@ -50,6 +52,7 @@ pub struct Operation {
 
 struct Active {
     id: Value,
+    name: String,
     deadline: Deadline,
     cancellation: Cancellation,
     answered: bool,
@@ -276,11 +279,38 @@ impl Session {
         let operation = self.queue.pop_front()?;
         self.active = Some(Active {
             id: operation.id.clone(),
+            name: operation.name.clone(),
             deadline: operation.deadline,
             cancellation: operation.cancellation.clone(),
             answered: false,
         });
         Some(operation)
+    }
+
+    /// Yields an active long wait to newer queued work. This is observation
+    /// cancellation only: executor work, receipts and pool ownership are
+    /// untouched. A client-side interrupt may not arrive as an MCP
+    /// `notifications/cancelled`, and the single tool slot must not starve the
+    /// next call until that wait's much longer deadline.
+    pub fn yield_wait_to_queued_work(&mut self) -> io::Result<Option<Message>> {
+        if self.queue.is_empty() {
+            return Ok(None);
+        }
+        let Some(active) = &mut self.active else {
+            return Ok(None);
+        };
+        if active.name != EXECUTOR_WAIT_TOOL || active.answered {
+            return Ok(None);
+        }
+        active.cancellation.cancel();
+        active.answered = true;
+        Message::error(
+            Some(&active.id),
+            -32000,
+            "executor_wait yielded to a newer MCP request; observation stopped without stopping executor work or releasing its slot. Call executor_wait again when ready.",
+            None,
+        )
+        .map(Some)
     }
 
     /// Call only once the owned worker has completed cleanup. Foreign errors

@@ -164,7 +164,7 @@ fn actual_stdio_preserves_unicode_exact_ids_and_output_purity() {
     server.send(json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}));
     assert_eq!(
         server.reply()["result"]["tools"].as_array().unwrap().len(),
-        5
+        6
     );
     server.eof();
     assert!(server.finish(0, Duration::from_secs(5)).is_empty());
@@ -202,6 +202,29 @@ fn cancellation_reclaims_active_handler_before_queued_work_starts() {
     let reply = server.reply();
     assert_eq!(reply["id"], 7, "cancelled request must not send a response");
     assert!(start.elapsed() >= Duration::from_millis(70));
+    server.eof();
+    assert!(server.finish(0, Duration::from_secs(5)).is_empty());
+}
+
+#[test]
+fn a_new_call_preempts_an_uninterrupted_executor_wait() {
+    let mut server = Server::start();
+    server.initialize();
+    server.call(json!("waiting"), "executor_wait");
+    server.call(json!(7), "echo");
+    let started = Instant::now();
+
+    let yielded = server.reply();
+    assert_eq!(yielded["id"], "waiting");
+    assert_eq!(yielded["error"]["code"], -32000);
+    assert!(
+        yielded["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("yielded to a newer MCP request"))
+    );
+    assert_eq!(server.reply()["id"], 7);
+    assert!(started.elapsed() < Duration::from_secs(2));
+
     server.eof();
     assert!(server.finish(0, Duration::from_secs(5)).is_empty());
 }

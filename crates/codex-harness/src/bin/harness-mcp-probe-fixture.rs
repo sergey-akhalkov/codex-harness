@@ -569,6 +569,7 @@ fn main() {
                 vec![
                     json!({"name":"echo","inputSchema":{"type":"object","properties":{}}}),
                     json!({"name":"wait","inputSchema":{"type":"object","properties":{}}}),
+                    json!({"name":"executor_wait","inputSchema":{"type":"object","properties":{}}}),
                     json!({"name":"wait-panic","inputSchema":{"type":"object","properties":{}}}),
                     json!({"name":"wait-error","inputSchema":{"type":"object","properties":{}}}),
                     json!({"name":"flood","inputSchema":{"type":"object","properties":{}}}),
@@ -587,7 +588,7 @@ fn main() {
                     }
                     if matches!(
                         operation.name.as_str(),
-                        "wait" | "wait-panic" | "wait-error"
+                        "wait" | "executor_wait" | "wait-panic" | "wait-error"
                     ) {
                         while !operation.cancellation.is_cancelled()
                             && !operation.deadline.expired()

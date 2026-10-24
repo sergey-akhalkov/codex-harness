@@ -280,6 +280,11 @@ where
             for reply in session.tick()? {
                 emit(&mut writer, reply, &stop, lifetime)?;
             }
+            if task.as_ref().is_some_and(|task| !task.worker.is_finished())
+                && let Some(reply) = session.yield_wait_to_queued_work()?
+            {
+                emit(&mut writer, reply, &stop, lifetime)?;
+            }
             if task.as_ref().is_some_and(|task| task.worker.is_finished()) {
                 let task = task.take().unwrap();
                 let response = task
