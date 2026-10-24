@@ -379,6 +379,14 @@ acceptance fixtures use the supported model names too, so test output cannot
 suggest that a retired provider was invoked. A local canned transport remains
 distinct from actual model execution.
 
+**2026-10-24, confirmed:** DeepSeek executor traffic uses the existing owned
+loopback Responses transport because Codex can place an app-owned item between
+a tool call and its output, which DeepSeek rejects for the whole saved thread.
+The DeepSeek route moves matching outputs ahead of those inserted items,
+preserves the original `GET`/`HEAD`/`POST` method, and forwards credentials
+without storing them. It selects the DeepSeek upstream explicitly; xAI is not
+part of the DeepSeek data path, and provider/model selection is unchanged.
+
 **2026-10-16, verified delivery:** shared principles, role fragments and skill
 membership have separate declared owners in `global/roles.toml`. Ordinary
 sessions use the lead context and managed executors use the executor context.

@@ -1343,6 +1343,7 @@ fn send_response(
             url: &url,
             headers,
             body: request_body,
+            method: "POST",
         },
         harness_core::process::Deadline::after(Duration::from_secs(15)).unwrap(),
         &harness_core::process::Cancellation::default(),

@@ -160,6 +160,14 @@ fallback-metadata warning; verify the catalog with
 new thread when it appears. Startup notices already shown in a thread remain
 there; open a new Codex process after changing these settings.
 
+DeepSeek sessions also use the kit-owned loopback Responses route so inserted
+user, developer and reasoning items cannot separate a tool call from its
+output. The native launcher starts and verifies that route automatically for
+the `ds` profile and for managed app-server profile overrides; restart a
+previously rejected saved thread to consume it. See
+[agent selection](agent-delegation.md#agent-selection-and-visible-conversations)
+for the routing contract.
+
 The shipped orchestration profile also sets `self_reflection_enabled = true`.
 Ordinary interactive `codex` automatically prepares its current session's
 reflection transport and project lifecycle; no separate lead-start or

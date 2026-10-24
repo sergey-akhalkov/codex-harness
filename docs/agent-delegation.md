@@ -20,6 +20,15 @@ The DeepSeek profile must set `[features] code_mode = false`: its
 and function tools remain available. Keep this compatibility setting in the
 local `ds.config.toml` profile; the shared default can keep Code Mode enabled.
 
+The launcher also routes DeepSeek requests through the kit-owned loopback
+Responses shim. DeepSeek rejects an input when Codex inserts a developer, user
+or reasoning item between a tool call and its output; the shim moves the
+matching outputs ahead of those inserted items before forwarding to
+`https://api.deepseek.com`. The route is selected from `--profile ds` and from
+the `-c model_provider="deepseek"`/`-c model="deepseek-flash"` overrides used by
+managed app-server sessions. Restart a saved thread after installation so its
+next app-server uses the corrected route.
+
 The removed Astra names migrate to these direct arguments. This table preserves
 their former meaning; it does not prescribe an effort for every new assignment.
 

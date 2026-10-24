@@ -764,17 +764,88 @@ pub fn loopback_listener_owner(port: u16) -> io::Result<Option<u32>> {
 }
 
 /// Route one session's `codex` command at the verified endpoint. Only a
-/// differing port adds an override; the profile's own URL stays authoritative
-/// whenever the selected generation serves the usual port. An explicit later
-/// user override still outranks this routing.
+/// differing port adds an xAI override; the profile's own URL stays
+/// authoritative whenever the selected generation serves the usual port. An
+/// explicit later user override still outranks this routing.
 #[cfg(windows)]
 fn xai_route_command(command: Command, port: u16) -> Command {
+    provider_route_command(
+        command,
+        format!("model_providers.xai.base_url=\"http://127.0.0.1:{port}/v1\""),
+    )
+}
+
+/// The DeepSeek profile normally names the provider directly. Replace its
+/// existing `base_url` override in place so app-server arguments inserted by a
+/// managed plan still point at the owned loopback route, without adding a
+/// trailing option after an `exec` prompt.
+fn deepseek_route_command(command: Command, port: u16) -> Command {
+    let setting =
+        format!("model_providers.deepseek.base_url=\"http://127.0.0.1:{port}/deepseek/v1\"");
+    let mut args = Vec::new();
+    let mut replaced = false;
+    let source = command
+        .get_args()
+        .map(|arg| arg.to_os_string())
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    while index < source.len() {
+        let arg = source[index].to_string_lossy();
+        if arg == "--" {
+            args.extend(source[index..].iter().cloned());
+            break;
+        }
+        if arg == "-c" || arg == "--config" {
+            args.push(source[index].clone());
+            if let Some(next) = source.get(index + 1) {
+                if is_deepseek_base_url(&next.to_string_lossy()) {
+                    args.push(setting.clone().into());
+                    replaced = true;
+                } else {
+                    args.push(next.clone());
+                }
+            }
+            index += 2;
+            continue;
+        }
+        if let Some((prefix, value)) = arg
+            .strip_prefix("--config=")
+            .map(|value| ("--config=", value))
+            .or_else(|| arg.strip_prefix("-c=").map(|value| ("-c=", value)))
+        {
+            if is_deepseek_base_url(value) {
+                args.push(format!("{prefix}{setting}").into());
+                replaced = true;
+            } else {
+                args.push(source[index].clone());
+            }
+            index += 1;
+            continue;
+        }
+        args.push(source[index].clone());
+        index += 1;
+    }
+    if !replaced {
+        args.splice(0..0, [OsString::from("-c"), OsString::from(&setting)]);
+    }
+    routed_command(command, args)
+}
+
+fn is_deepseek_base_url(setting: &str) -> bool {
+    setting
+        .split_once('=')
+        .is_some_and(|(key, _)| key.trim() == "model_providers.deepseek.base_url")
+}
+
+fn provider_route_command(command: Command, setting: String) -> Command {
+    let mut args = vec![OsString::from("-c"), OsString::from(setting)];
+    args.extend(command.get_args().map(|arg| arg.to_os_string()));
+    routed_command(command, args)
+}
+
+fn routed_command(command: Command, args: Vec<OsString>) -> Command {
     let mut routed = Command::new(command.get_program());
-    routed.arg("-c");
-    routed.arg(format!(
-        "model_providers.xai.base_url=\"http://127.0.0.1:{port}/v1\""
-    ));
-    routed.args(command.get_args());
+    routed.args(args);
     if let Some(directory) = command.get_current_dir() {
         routed.current_dir(directory);
     }
@@ -1907,12 +1978,14 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
     let (uncapped, args) = take_uncapped_session_selector(args)?;
     let (command, task_control, goal_recovery, _, harness_ready) =
         prepared_command(executable, home, &args)?;
-    // An xAI session routes only to a verified owned generation of this build.
-    // The owner lease lives until this launcher exits, so the generation
-    // retires with its sessions instead of being replaced under a live
-    // stream; a differing selected endpoint is carried into this session's
-    // routing without touching any other session.
-    let (command, _xai_endpoint) = if launcher::xai_shim_requested(&args) {
+    // A compatibility-shim session routes only to a verified owned generation
+    // of this build. The owner lease lives until this launcher exits, so the
+    // generation retires with its sessions instead of being replaced under a
+    // live stream; a differing selected endpoint is carried into this
+    // session's routing without touching any other session.
+    let xai_shim = launcher::xai_shim_requested(&args);
+    let deepseek_shim = launcher::deepseek_shim_requested(&args);
+    let (command, _shim_endpoint) = if xai_shim || deepseek_shim {
         let manager = executable
             .canonicalize()?
             .parent()
@@ -1922,7 +1995,9 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
         {
             let endpoint =
                 ensure_xai_endpoint(&manager, home, crate::xai_responses_shim::DEFAULT_PORT)?;
-            let command = if endpoint.port() == crate::xai_responses_shim::DEFAULT_PORT {
+            let command = if deepseek_shim {
+                deepseek_route_command(command, endpoint.port())
+            } else if endpoint.port() == crate::xai_responses_shim::DEFAULT_PORT {
                 command
             } else {
                 eprintln!(
@@ -1937,6 +2012,11 @@ pub fn run(executable: &Path, home: &Path, args: &[OsString]) -> io::Result<i32>
         #[cfg(not(windows))]
         {
             ensure_xai_shim(&manager, crate::xai_responses_shim::DEFAULT_PORT)?;
+            let command = if deepseek_shim {
+                deepseek_route_command(command, crate::xai_responses_shim::DEFAULT_PORT)
+            } else {
+                command
+            };
             (command, None)
         }
     } else {
@@ -3076,6 +3156,40 @@ mod tests {
                 worker.join().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn deepseek_route_uses_the_owned_loopback_path_for_every_port() {
+        let mut source = std::process::Command::new("codex");
+        source.args([
+            "app-server",
+            "-c",
+            "model_providers.deepseek.base_url=\"https://api.deepseek.com\"",
+        ]);
+        let command = super::deepseek_route_command(source, 56122);
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "app-server -c model_providers.deepseek.base_url=\"http://127.0.0.1:56122/deepseek/v1\""
+        );
+    }
+
+    #[test]
+    fn deepseek_route_does_not_append_options_after_an_exec_prompt() {
+        let mut source = std::process::Command::new("codex");
+        source.args(["exec", "--profile", "ds", "hello"]);
+        let command = super::deepseek_route_command(source, 56122);
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "-c model_providers.deepseek.base_url=\"http://127.0.0.1:56122/deepseek/v1\" exec --profile ds hello"
+        );
     }
 
     #[test]

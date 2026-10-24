@@ -1,4 +1,9 @@
-//! Kit-owned compatibility shim between the Codex CLI and api.x.ai.
+//! Kit-owned compatibility shim between the Codex CLI and Responses providers.
+//!
+//! The xAI route applies the wire adaptations documented below. The `/deepseek`
+//! route forwards to api.deepseek.com and repairs the stricter tool-call/output
+//! ordering DeepSeek requires; it shares this process only for loopback
+//! lifecycle, ownership and credential pass-through.
 //!
 //! Codex echoes Responses `reasoning` input items with an explicit
 //! `content: null` field; api.x.ai rejects exactly that shape on every
@@ -77,6 +82,10 @@ pub const ROOT_ENV: &str = "HARNESS_XAI_SHIM_ROOT";
 /// is honored, so a redirected shim can never carry provider credentials to a
 /// remote third party.
 const UPSTREAM_ENV: &str = "HARNESS_XAI_SHIM_UPSTREAM";
+/// Test-only loopback upstream override for the DeepSeek route. As with the
+/// xAI override, a non-loopback value is ignored so credentials cannot be
+/// redirected to a remote third party.
+const DEEPSEEK_UPSTREAM_ENV: &str = "HARNESS_DEEPSEEK_SHIM_UPSTREAM";
 const POLL_ENV: &str = "HARNESS_XAI_SHIM_POLL_MS";
 const GRACE_ENV: &str = "HARNESS_XAI_SHIM_GRACE_MS";
 const OWNER_FILE: &str = "owners.json";
@@ -93,6 +102,97 @@ const MAX_SSE_LINE: usize = 4 * 1024 * 1024;
 /// A retired shim stops accepting immediately and drains in-flight streams for
 /// at most this long, so both the port and the process are released promptly.
 const RETIRE_DRAIN: Duration = Duration::from_secs(60);
+
+/// DeepSeek shares the owned loopback transport but needs a strict tool-call
+/// ordering repair rather than the xAI wire adaptations.
+const DEEPSEEK_PREFIX: &str = "/deepseek";
+const DEEPSEEK_UPSTREAM: &str = "https://api.deepseek.com";
+
+fn deepseek_target(target: &str) -> Option<&str> {
+    target
+        .strip_prefix(DEEPSEEK_PREFIX)
+        .filter(|rest| rest.starts_with('/'))
+}
+
+fn is_tool_call(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    )
+}
+
+fn is_tool_output(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    )
+}
+
+/// Keep a DeepSeek call batch contiguous with its matching outputs. Codex may
+/// insert app-owned messages or reasoning while a tool call is pending; moving
+/// those items after the exchange preserves their content and the provider's
+/// call/output integrity.
+pub(crate) fn adapt_deepseek_request_body(body: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(body).ok()?;
+    let items = value.get_mut("input")?.as_array_mut()?;
+    if !separate_tool_outputs(items) {
+        return None;
+    }
+    serde_json::to_vec(&value).ok()
+}
+
+fn separate_tool_outputs(items: &mut Vec<Value>) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+    while index < items.len() {
+        if !is_tool_call(&items[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < items.len() && is_tool_call(&items[index]) {
+            index += 1;
+        }
+        let call_ids = items[start..index]
+            .iter()
+            .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        if call_ids.is_empty() {
+            continue;
+        }
+        let outputs = (index..items.len())
+            .filter(|position| {
+                let item = &items[*position];
+                is_tool_output(item)
+                    && item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|call_id| call_ids.contains(call_id))
+            })
+            .collect::<Vec<_>>();
+        if outputs.is_empty() {
+            continue;
+        }
+        let contiguous = outputs
+            .iter()
+            .enumerate()
+            .all(|(offset, position)| *position == index + offset);
+        if !contiguous {
+            let mut moved = Vec::with_capacity(outputs.len());
+            for position in outputs.iter().rev() {
+                moved.push(items.remove(*position));
+            }
+            moved.reverse();
+            for (offset, output) in moved.into_iter().enumerate() {
+                items.insert(index + offset, output);
+            }
+            changed = true;
+        }
+        index += outputs.len();
+    }
+    changed
+}
 
 pub struct Options {
     pub port: u16,
@@ -163,9 +263,13 @@ fn run_with_ready(options: &Options, ready: impl FnOnce() -> io::Result<()>) -> 
     };
     let (poll, grace) = effective_timings(options);
     let upstream = effective_upstream(options);
+    let deepseek_upstream = effective_deepseek_upstream();
     let result = serve_with_control(
         listener,
-        &upstream,
+        Upstreams {
+            xai: &upstream,
+            deepseek: &deepseek_upstream,
+        },
         keep_running,
         poll,
         grace,
@@ -212,6 +316,13 @@ fn effective_upstream(options: &Options) -> String {
     }
 }
 
+fn effective_deepseek_upstream() -> String {
+    match std::env::var(DEEPSEEK_UPSTREAM_ENV) {
+        Ok(value) if loopback_http(&value) => value,
+        _ => DEEPSEEK_UPSTREAM.to_string(),
+    }
+}
+
 fn loopback_http(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("http://") else {
         return false;
@@ -227,13 +338,17 @@ fn loopback_http(value: &str) -> bool {
 pub(crate) fn serve(
     listener: TcpListener,
     upstream: &str,
+    deepseek_upstream: &str,
     keep_running: Arc<dyn Fn() -> bool + Send + Sync>,
     poll_interval: Duration,
     startup_grace: Duration,
 ) -> io::Result<()> {
     serve_with_control(
         listener,
-        upstream,
+        Upstreams {
+            xai: upstream,
+            deepseek: deepseek_upstream,
+        },
         keep_running,
         poll_interval,
         startup_grace,
@@ -242,9 +357,9 @@ pub(crate) fn serve(
     )
 }
 
-pub(crate) fn serve_with_control(
+fn serve_with_control(
     listener: TcpListener,
-    upstream: &str,
+    upstreams: Upstreams<'_>,
     keep_running: Arc<dyn Fn() -> bool + Send + Sync>,
     poll_interval: Duration,
     startup_grace: Duration,
@@ -285,14 +400,21 @@ pub(crate) fn serve_with_control(
                     continue;
                 }
                 active.fetch_add(1, Ordering::SeqCst);
-                let upstream = upstream.to_string();
+                let upstream = upstreams.xai.to_string();
+                let deepseek_upstream = upstreams.deepseek.to_string();
                 let active = Arc::clone(&active);
                 let retire = Arc::clone(&retire);
                 let control = control.clone();
                 thread::Builder::new()
                     .name("xai-responses-shim".to_string())
                     .spawn(move || {
-                        handle_connection(stream, &upstream, &retire, control.as_ref());
+                        handle_connection(
+                            stream,
+                            &upstream,
+                            &deepseek_upstream,
+                            &retire,
+                            control.as_ref(),
+                        );
                         active.fetch_sub(1, Ordering::SeqCst);
                     })?;
             }
@@ -316,6 +438,11 @@ struct Request {
     body: Vec<u8>,
 }
 
+struct Upstreams<'a> {
+    xai: &'a str,
+    deepseek: &'a str,
+}
+
 enum ReadOutcome {
     Request(Box<Request>),
     Reject(&'static str),
@@ -325,6 +452,7 @@ enum ReadOutcome {
 fn handle_connection(
     mut stream: TcpStream,
     upstream: &str,
+    deepseek_upstream: &str,
     retire: &AtomicBool,
     control: Option<&Arc<Control>>,
 ) {
@@ -341,7 +469,7 @@ fn handle_connection(
     // Local generation-control plane: the launcher verifies this exact
     // generation before routing traffic and retires only with this
     // generation's authority. Handling happens before the upstream hop so it
-    // never reaches api.x.ai. Every control answer requires the receipt token;
+    // never reaches a provider. Every control answer requires the receipt token;
     // an unmanaged or foreign listener never authenticates.
     if request.method == "GET" && request.target == IDENTITY_PATH {
         match control {
@@ -392,15 +520,26 @@ fn handle_connection(
         }
         return;
     }
+    let (upstream, target, deepseek) = match deepseek_target(&request.target) {
+        Some(target) => (deepseek_upstream, target.to_owned(), true),
+        None => (upstream, request.target.clone(), false),
+    };
+    let method = request.method.clone();
     let mut body = request.body;
     let mut adaptation = ToolAdaptation::default();
-    if request.method == "POST" && request.target.contains("/responses") {
-        adaptation = ToolAdaptation::parse(&body);
-        if let Some(adapted) = adapt_request_body(&body, &adaptation) {
-            body = adapted;
+    if request.method == "POST" && target.contains("/responses") {
+        if deepseek {
+            if let Some(adapted) = adapt_deepseek_request_body(&body) {
+                body = adapted;
+            }
+        } else {
+            adaptation = ToolAdaptation::parse(&body);
+            if let Some(adapted) = adapt_request_body(&body, &adaptation) {
+                body = adapted;
+            }
         }
     }
-    let url = format!("{}{}", upstream, request.target);
+    let url = format!("{upstream}{target}");
     let deadline = match Deadline::after(REQUEST_DEADLINE) {
         Ok(deadline) => deadline,
         Err(_) => {
@@ -411,7 +550,7 @@ fn handle_connection(
     let cancel = Cancellation::default();
     let root = BrokerRoot::prepare();
     let forwarder = Forwarder::new();
-    let rewriting = adaptation.needs_stream_rewrite();
+    let rewriting = !deepseek && adaptation.needs_stream_rewrite();
     let headers = if rewriting {
         request
             .headers
@@ -444,6 +583,7 @@ fn handle_connection(
                 url: &url,
                 headers: &headers,
                 body: &body,
+                method: &method,
             },
             deadline,
             &cancel,
@@ -528,8 +668,10 @@ fn read_request(stream: &mut TcpStream) -> io::Result<ReadOutcome> {
             content_length = value.trim().parse::<usize>().ok();
         }
     }
-    let Some(content_length) = content_length else {
-        return Ok(ReadOutcome::Reject("411 Length Required"));
+    let content_length = match content_length {
+        Some(length) => length,
+        None if method == "GET" || method == "HEAD" => 0,
+        None => return Ok(ReadOutcome::Reject("411 Length Required")),
     };
     if content_length > BODY_LIMIT {
         return Ok(ReadOutcome::Reject("413 Content Too Large"));
@@ -1725,6 +1867,84 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_moves_inserted_items_after_the_tool_exchange() {
+        let body = json!({
+            "model": "deepseek-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call", "call_id": "call_a", "name": "exec_command", "arguments": "{}"},
+                {"type": "message", "role": "developer", "content": "goal paused"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "done"}
+            ]
+        })
+        .to_string();
+        let adapted = adapt_deepseek_request_body(body.as_bytes()).unwrap();
+        let value: Value = serde_json::from_slice(&adapted).unwrap();
+        let items = value["input"].as_array().unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "message",
+                "function_call",
+                "function_call_output",
+                "message"
+            ]
+        );
+        assert_eq!(items[2]["output"], "done");
+        assert_eq!(items[3]["content"], "goal paused");
+    }
+
+    #[test]
+    fn deepseek_keeps_parallel_calls_together_before_their_outputs() {
+        let body = json!({
+            "model": "deepseek-flash",
+            "input": [
+                {"type": "function_call", "call_id": "call_a", "name": "one", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_b", "name": "two", "arguments": "{}"},
+                {"type": "message", "role": "developer", "content": "inserted"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "a"},
+                {"type": "function_call_output", "call_id": "call_b", "output": "b"}
+            ]
+        })
+        .to_string();
+        let adapted = adapt_deepseek_request_body(body.as_bytes()).unwrap();
+        let value: Value = serde_json::from_slice(&adapted).unwrap();
+        let items = value["input"].as_array().unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+                "message"
+            ]
+        );
+        assert_eq!(items[2]["call_id"], "call_a");
+        assert_eq!(items[3]["call_id"], "call_b");
+    }
+
+    #[test]
+    fn deepseek_leaves_valid_and_unrelated_bodies_untouched() {
+        let valid = json!({
+            "input": [
+                {"type": "function_call", "call_id": "call_a", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "done"}
+            ]
+        })
+        .to_string();
+        assert!(adapt_deepseek_request_body(valid.as_bytes()).is_none());
+        assert!(adapt_deepseek_request_body(br#"{"input": {"nested": true}}"#).is_none());
+        assert!(adapt_deepseek_request_body(b"not json").is_none());
+    }
+
+    #[test]
     fn adapt_removes_tool_choice_when_no_tools_remain() {
         let body = br#"{"model":"grok-4.6","input":[],"tool_choice":"auto"}"#;
         let adapted = adapt_request_body(body, &ToolAdaptation::default()).unwrap();
@@ -2172,7 +2392,10 @@ mod tests {
                     listener,
                     // An upstream that cannot answer proves control requests
                     // never leave the local shim.
-                    "http://127.0.0.1:1",
+                    Upstreams {
+                        xai: "http://127.0.0.1:1",
+                        deepseek: "http://127.0.0.1:1",
+                    },
                     Arc::new(|| true),
                     Duration::from_millis(20),
                     Duration::from_secs(30),
@@ -2290,6 +2513,7 @@ mod tests {
         serve(
             listener,
             "https://api.x.ai",
+            DEEPSEEK_UPSTREAM,
             Arc::new(|| false),
             Duration::from_millis(20),
             Duration::from_millis(30),
@@ -2307,6 +2531,7 @@ mod tests {
             serve(
                 listener,
                 "https://api.x.ai",
+                DEEPSEEK_UPSTREAM,
                 Arc::new(move || worker_keeper.load(Ordering::SeqCst)),
                 Duration::from_millis(20),
                 Duration::from_millis(30),
@@ -2389,6 +2614,7 @@ mod tests {
             serve(
                 shim,
                 &format!("http://127.0.0.1:{upstream_port}"),
+                DEEPSEEK_UPSTREAM,
                 Arc::new(|| true),
                 Duration::from_millis(20),
                 Duration::from_secs(30),
@@ -2502,6 +2728,7 @@ mod tests {
             serve(
                 shim,
                 &format!("http://127.0.0.1:{upstream_port}"),
+                DEEPSEEK_UPSTREAM,
                 Arc::new(|| true),
                 Duration::from_millis(20),
                 Duration::from_secs(30),
@@ -2549,6 +2776,160 @@ mod tests {
         assert!(
             text.contains("50925") && !text.contains("50925.0"),
             "{text}"
+        );
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deepseek_route_reorders_a_full_request_at_the_upstream_boundary() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let shim = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let shim_port = shim.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 65536);
+            }
+            let head = String::from_utf8_lossy(&request).into_owned();
+            assert!(
+                head.starts_with("POST /v1/responses HTTP/1.1\r\n"),
+                "{head}"
+            );
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("authorization: bearer token")
+            );
+            let length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            let items = value["input"].as_array().unwrap();
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item["type"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["function_call", "function_call_output", "message"]
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        let _worker = thread::spawn(move || {
+            serve(
+                shim,
+                "http://127.0.0.1:1",
+                &format!("http://127.0.0.1:{upstream_port}"),
+                Arc::new(|| true),
+                Duration::from_millis(20),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        });
+        let request_body = json!({
+            "model": "deepseek-flash",
+            "input": [
+                {"type": "function_call", "call_id": "call_a", "name": "exec_command", "arguments": "{}"},
+                {"type": "message", "role": "developer", "content": "goal paused"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "done"}
+            ]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", shim_port)).unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /deepseek/v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    request_body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).unwrap();
+        assert!(
+            String::from_utf8_lossy(&received).starts_with("HTTP/1.1 200 OK\r\n"),
+            "{}",
+            String::from_utf8_lossy(&received)
+        );
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deepseek_route_forwards_a_bodyless_model_list_request() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let shim = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let shim_port = shim.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 65536);
+            }
+            let head = String::from_utf8_lossy(&request);
+            assert!(
+                head.starts_with("GET /v1/models?client_version=0.164.0 HTTP/1.1\r\n"),
+                "{head}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        let _worker = thread::spawn(move || {
+            serve(
+                shim,
+                "http://127.0.0.1:1",
+                &format!("http://127.0.0.1:{upstream_port}"),
+                Arc::new(|| true),
+                Duration::from_millis(20),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", shim_port)).unwrap();
+        client
+            .write_all(
+                b"GET /deepseek/v1/models?client_version=0.164.0 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).unwrap();
+        assert!(
+            String::from_utf8_lossy(&received).starts_with("HTTP/1.1 200 OK\r\n"),
+            "{}",
+            String::from_utf8_lossy(&received)
         );
         drop(client);
         server.join().unwrap();

@@ -286,6 +286,13 @@ pub fn per_model_effort(args: &[OsString], native: NativePreferences<'_>) -> Vec
 /// Grok through the kit profile needs the local Responses shim. Detect the
 /// explicit `xai` profile only; default/harness/zai launches must not start it.
 pub fn xai_shim_requested(args: &[OsString]) -> bool {
+    requested_profile(args) == Some("xai")
+}
+
+/// DeepSeek through the kit profile needs the same owned endpoint for its
+/// stricter tool-call/output ordering. Managed app-server sessions carry the
+/// profile as dotted `-c` overrides rather than `--profile`.
+pub fn deepseek_shim_requested(args: &[OsString]) -> bool {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].to_str().unwrap_or("");
@@ -293,17 +300,70 @@ pub fn xai_shim_requested(args: &[OsString]) -> bool {
             break;
         }
         if arg == "--profile" || arg == "-p" {
-            return args
+            if args.get(i + 1).and_then(|value| value.to_str()) == Some("ds") {
+                return true;
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(profile) = arg.strip_prefix("--profile=")
+            && profile == "ds"
+        {
+            return true;
+        }
+        if arg == "-c" || arg == "--config" {
+            if args
                 .get(i + 1)
                 .and_then(|value| value.to_str())
-                .is_some_and(|value| value == "xai");
+                .is_some_and(deepseek_config)
+            {
+                return true;
+            }
+            i += 2;
+            continue;
         }
-        if let Some(value) = arg.strip_prefix("--profile=") {
-            return value == "xai";
+        if arg
+            .strip_prefix("--config=")
+            .or_else(|| arg.strip_prefix("-c="))
+            .is_some_and(deepseek_config)
+        {
+            return true;
         }
         i += 1;
     }
     false
+}
+
+fn deepseek_config(setting: &str) -> bool {
+    let Some((key, value)) = setting.split_once('=') else {
+        return false;
+    };
+    let key = key.trim();
+    if key.starts_with("model_providers.deepseek.") {
+        return true;
+    }
+    let value = value.trim().trim_matches(['"', '\'']);
+    (matches!(key, "model_provider" | "model_provider_id")
+        && value.eq_ignore_ascii_case("deepseek"))
+        || (key == "model" && value.to_ascii_lowercase().starts_with("deepseek"))
+}
+
+fn requested_profile(args: &[OsString]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].to_str().unwrap_or("");
+        if arg == "--" {
+            break;
+        }
+        if arg == "--profile" || arg == "-p" {
+            return args.get(i + 1).and_then(|value| value.to_str());
+        }
+        if let Some(value) = arg.strip_prefix("--profile=") {
+            return Some(value);
+        }
+        i += 1;
+    }
+    None
 }
 
 pub fn profile_arguments(args: &[OsString]) -> Vec<OsString> {

@@ -95,7 +95,7 @@ impl Gateway {
                             stage = "admission-and-forward";
                             Gate::new(&executable)?.forward(
                                 &Forwarder::new()?, &root,
-                                ForwardRequest { url: &url, headers: &request.headers, body: &request.body },
+                                ForwardRequest { url: &url, headers: &request.headers, body: &request.body, method: "POST" },
                                 Deadline::after(Duration::from_secs(24 * 60 * 60))?, &cancel,
                                 |bytes| { sent = true; socket.write_all(bytes) },
                             )

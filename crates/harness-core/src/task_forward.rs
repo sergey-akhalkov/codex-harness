@@ -34,11 +34,13 @@ impl Forwarder {
         mut output: impl FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         let uri: tungstenite::http::Uri = request.url.parse().map_err(|_| invalid())?;
+        let method = request.method;
         if uri.authority().is_none_or(|a| a.as_str().contains('@'))
             || !matches!(uri.scheme_str(), Some("https") | Some("http"))
             || (uri.scheme_str() == Some("http") && uri.host() != Some("127.0.0.1"))
             || request.url.contains('#')
             || request.body.len() > 64 * 1024 * 1024
+            || !matches!(method, "GET" | "HEAD" | "POST")
         {
             return Err(invalid());
         }
@@ -48,14 +50,18 @@ impl Forwarder {
                 "forwarding cancelled before dispatch",
             ));
         }
-        let mut body = tempfile::NamedTempFile::new_in(root.path())?;
-        body.write_all(request.body)?;
-        body.flush()?;
-        let mut config = format!(
-            "url = {}\ndata-binary = {}\n",
-            quoted(request.url)?,
-            quoted(&format!("@{}", body.path().to_str().ok_or_else(invalid)?))?
-        );
+        let mut config = format!("url = {}\n", quoted(request.url)?);
+        let mut _body = None;
+        if method != "GET" && method != "HEAD" {
+            let mut file = tempfile::NamedTempFile::new_in(root.path())?;
+            file.write_all(request.body)?;
+            file.flush()?;
+            config.push_str(&format!(
+                "data-binary = {}\n",
+                quoted(&format!("@{}", file.path().to_str().ok_or_else(invalid)?))?
+            ));
+            _body = Some(file);
+        }
         for (name, value) in request.headers {
             if !name
                 .bytes()
@@ -115,7 +121,7 @@ impl Forwarder {
             "--raw",
             "--no-buffer",
             "--request",
-            "POST",
+            method,
             "--proto",
             "=http,https",
             "--max-redirs",
@@ -182,6 +188,7 @@ pub struct ForwardRequest<'a> {
     pub url: &'a str,
     pub headers: &'a [(String, String)],
     pub body: &'a [u8],
+    pub method: &'a str,
 }
 
 fn invalid() -> io::Error {
@@ -275,6 +282,7 @@ mod tests {
                         url: &url,
                         headers: &[("Authorization".into(), "Bearer owned-test-token".into())],
                         body: b"{}",
+                        method: "POST",
                     },
                     Deadline::after(Duration::from_secs(15)).unwrap(),
                     &Cancellation::default(),
@@ -355,6 +363,7 @@ mod tests {
                 url: &url,
                 headers: &[],
                 body: b"{}",
+                method: "POST",
             },
             Deadline::after(Duration::from_secs(10)).unwrap(),
             &cancel,

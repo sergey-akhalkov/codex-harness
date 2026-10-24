@@ -334,7 +334,9 @@ fn run() -> io::Result<i32> {
             "codex-harness subscription-login xai|zai --source CHECKOUT --codex-home DIRECTORY --user-home DIRECTORY [--package-root DIRECTORY] [--key-file FILE] [--no-open-browser]"
         );
         println!("codex-harness xai-responses-probe --user-home DIRECTORY --evidence DIRECTORY");
-        println!("codex-harness xai-responses-shim [--port N] [--upstream https://api.x.ai]");
+        println!(
+            "codex-harness xai-responses-shim [--port N] [--upstream https://api.x.ai] (also serves /deepseek)"
+        );
         println!("codex-harness xai-token --codex-home DIRECTORY");
         println!(
             "codex-harness executor spawn --source CHECKOUT --codex-home DIRECTORY [--workspace DIRECTORY] [--profile ID] [--base REV] [--owner ID] (--exec PROMPT|- | --assignment FILE)\ncodex-harness executor assignment --source CHECKOUT --slot N --assignment FILE [--base REV] [--owner ID]\ncodex-harness executor release --source CHECKOUT --codex-home DIRECTORY --slot N --disposition merged|discarded --reason TEXT [--base REV]\ncodex-harness executor pool --source CHECKOUT --codex-home DIRECTORY\ncodex-harness executor succeed --request PATH"

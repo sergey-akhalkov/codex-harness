@@ -1,7 +1,7 @@
 //! Accepted script-launcher dispatch cases, ported as argument-vector oracles.
 use harness_core::launcher::{
-    NativePreferences, additional_roots, daemon_opt_out, executor_limited, per_model_effort,
-    profile_arguments, task_arguments, xai_shim_requested,
+    NativePreferences, additional_roots, daemon_opt_out, deepseek_shim_requested, executor_limited,
+    per_model_effort, profile_arguments, task_arguments, xai_shim_requested,
 };
 use std::ffi::OsString;
 
@@ -224,6 +224,43 @@ fn xai_shim_starts_only_for_the_explicit_xai_profile() {
         "--",
         "--profile",
         "xai"
+    ])));
+}
+
+#[test]
+fn deepseek_shim_starts_only_for_the_explicit_ds_profile() {
+    assert!(deepseek_shim_requested(&argv(&["--profile", "ds"])));
+    assert!(deepseek_shim_requested(&argv(&[
+        "exec",
+        "--profile=ds",
+        "hi"
+    ])));
+    assert!(deepseek_shim_requested(&argv(&["-p", "ds", "exec"])));
+    assert!(!deepseek_shim_requested(&argv(&[])));
+    assert!(!deepseek_shim_requested(&argv(&["--profile", "deepseek"])));
+    assert!(!deepseek_shim_requested(&argv(&["--profile", "xai"])));
+    assert!(!deepseek_shim_requested(&argv(&[
+        "exec",
+        "--",
+        "--profile",
+        "ds"
+    ])));
+    assert!(deepseek_shim_requested(&argv(&[
+        "app-server",
+        "-c",
+        "model=\"deepseek-flash\"",
+        "-c",
+        "model_provider=\"deepseek\""
+    ])));
+    assert!(deepseek_shim_requested(&argv(&[
+        "app-server",
+        "-c",
+        "model_providers.deepseek.base_url=\"https://api.deepseek.com\""
+    ])));
+    assert!(!deepseek_shim_requested(&argv(&[
+        "app-server",
+        "-c",
+        "model=\"gpt-6-astra\""
     ])));
 }
 
