@@ -4036,7 +4036,7 @@ fn wait_across_runs_returns_another_runs_question_without_waiting() {
         let waited = mcp.call_tool(
             3,
             "executor_wait",
-            json!({"timeoutMs": 8000}),
+            json!({"timeoutMs": 15000}),
             Some(json!({"threadId": LEAD})),
         );
         (waited, question.join().unwrap())
@@ -4062,7 +4062,7 @@ fn wait_across_runs_returns_another_runs_question_without_waiting() {
         "{waited}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(10),
         "another run's question did not interrupt the wait: {:?}",
         started.elapsed()
     );

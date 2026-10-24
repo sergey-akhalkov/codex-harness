@@ -2454,7 +2454,17 @@ fn verify_run_for(
                     "the registered lead endpoint records no app-server process; no operation was performed",
                 )
             })?;
-            if endpoint.process.as_ref() != Some(&lease.app_server) {
+            if endpoint.process.as_ref() == Some(&lease.app_server) {
+                (Some(*endpoint), None)
+            } else if view != RunView::Live && !value["release"].is_null() {
+                (
+                    None,
+                    Some(
+                        "the registered lead endpoint no longer matches the released run lease; native status is unavailable"
+                            .to_owned(),
+                    ),
+                )
+            } else {
                 let same_process = current_process.pid == lease.app_server.pid
                     && current_process.creation_time == lease.app_server.creation_time;
                 if !same_process {
@@ -2497,8 +2507,8 @@ fn verify_run_for(
                         )));
                     }
                 }
+                (Some(*endpoint), None)
             }
-            (Some(*endpoint), None)
         }
         RegisteredLead::Unavailable(reason) => (None, Some(reason)),
     };
