@@ -513,6 +513,47 @@ fn write_request(path: &Path, request: &Value) -> io::Result<()> {
     control::write_staged(path, &serde_json::to_vec_pretty(request)?)
 }
 
+fn subtree_stop_path(home: &Path, parent: &str) -> io::Result<PathBuf> {
+    if !valid_thread_id(parent) {
+        return Err(invalid(
+            "a subtree stop identity must be a bounded parent thread id",
+        ));
+    }
+    Ok(requests_root(home).join(parent).join("STOPPED.json"))
+}
+
+fn subtree_stopped(home: &Path, parent: &str) -> bool {
+    subtree_stop_path(home, parent)
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
+fn mark_subtree_stopped(home: &Path, parent: &str, reason: &str) -> io::Result<PathBuf> {
+    let path = subtree_stop_path(home, parent)?;
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    control::write_staged(
+        &path,
+        &serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "parentThreadId": parent,
+            "reason": excerpt(reason, 400),
+            "stoppedMs": u64::try_from(now_nanos() / 1_000_000).unwrap_or(u64::MAX)
+        }))?,
+    )?;
+    Ok(path)
+}
+
+fn clear_subtree_stop(home: &Path, parent: &str) -> io::Result<()> {
+    let path = subtree_stop_path(home, parent)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn request_intent(
     role: &str,
     parent: &str,
@@ -661,6 +702,14 @@ fn prepare_request(
     intent: &str,
     owner: &str,
 ) -> io::Result<RequestState> {
+    if subtree_stopped(home, parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "the parent subtree {parent} is stopped; explicit executor_resume of the stopped Lead is required before any new child dispatch"
+            ),
+        ));
+    }
     let path = request_path(home, parent, request_id)?;
     let root_dir = requests_root(home);
     fs::create_dir_all(root_dir.join(parent))?;
@@ -1325,6 +1374,19 @@ fn dispatch(operation: &Operation) -> io::Result<Value> {
             ),
         ));
     }
+    if subtree_stopped(&codex_home, &caller) {
+        let _ = update_request(
+            &request_path,
+            &mut request_value,
+            "uncertain",
+            Some(&executor_thread),
+            None,
+            Some("the parent subtree was stopped during startup; no model turn was started"),
+        );
+        return Err(invalid(format!(
+            "the parent subtree was stopped while executor thread {executor_thread} was starting; no turn was started and the child is preserved for inspection or release"
+        )));
+    }
     let thread = match conversation.read_thread_state(&executor_thread) {
         Ok(thread) => thread,
         Err(error) => {
@@ -1672,6 +1734,19 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
                 "delegated Lead thread {lead_thread} was created but the dispatch request could not be recorded: {error}; the thread and pool claim are preserved"
             ),
         ));
+    }
+    if subtree_stopped(&codex_home, &caller) {
+        let _ = update_request(
+            &request_path,
+            &mut request_value,
+            "uncertain",
+            Some(&lead_thread),
+            None,
+            Some("the Director subtree was stopped during startup; no model turn was started"),
+        );
+        return Err(invalid(format!(
+            "the Director subtree was stopped while delegated Lead thread {lead_thread} was starting; no turn was started and the child is preserved"
+        )));
     }
     let thread = match conversation.read_thread_state(&lead_thread) {
         Ok(thread) => thread,
@@ -3317,6 +3392,176 @@ fn status(operation: &Operation) -> io::Result<Value> {
     }))
 }
 
+fn reconcile_stopped_requests(home: &Path, lead_thread: &str) -> io::Result<Vec<Value>> {
+    let directory = requests_root(home).join(lead_thread);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut reconciled = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".json") || name == "STOPPED.json" {
+            continue;
+        }
+        let path = entry.path();
+        let Some(mut request) = read_request(&path)? else {
+            continue;
+        };
+        let status = request["status"].as_str().unwrap_or_default();
+        if !matches!(status, "prepared" | "starting" | "thread-started") {
+            continue;
+        }
+        let child = request["childThreadId"].as_str().map(str::to_owned);
+        let receipt = request["receipt"].as_str().map(PathBuf::from);
+        if update_request(
+            &path,
+            &mut request,
+            "uncertain",
+            child.as_deref(),
+            receipt.as_deref(),
+            Some("subtree stopped before the child turn and receipt were recorded"),
+        )
+        .is_ok()
+        {
+            reconciled.push(json!({
+                "requestId": request["requestId"],
+                "run": request["owner"],
+                "childThreadId": child,
+                "state": "uncertain",
+                "detail": "subtree stopped during startup; no model turn was started"
+            }));
+        }
+    }
+    Ok(reconciled)
+}
+
+fn stop_subtree(home: &Path, caller: &str, lead: &VerifiedRun) -> io::Result<Value> {
+    let marker = mark_subtree_stopped(
+        home,
+        &lead.executor_thread,
+        &format!("stop requested by {caller}"),
+    )?;
+    let children: Vec<RunReceipt> = read_receipts(home)?
+        .into_iter()
+        .filter(|receipt| {
+            receipt.value["parentThreadId"]
+                .as_str()
+                .or_else(|| receipt.value["leadThreadId"].as_str())
+                == Some(lead.executor_thread.as_str())
+                && receipt.value["role"].as_str() != Some("lead")
+                && receipt.value["release"].is_null()
+        })
+        .collect();
+    let mut partial = false;
+    let mut runs = Vec::new();
+    for child in children {
+        let child = match verify_run_for(home, child, &lead.executor_thread, RunView::Live) {
+            Ok(child) => child,
+            Err(error) => {
+                partial = true;
+                runs.push(json!({
+                    "outcome": "observation-error",
+                    "error": error.to_string()
+                }));
+                continue;
+            }
+        };
+        let Some(endpoint) = child.endpoint.clone() else {
+            partial = true;
+            runs.push(json!({
+                "run": child.run,
+                "role": "executor",
+                "outcome": "unavailable",
+                "error": child.endpoint_unavailable
+            }));
+            continue;
+        };
+        match executor_cli::mcp_stop(
+            &child.receipt,
+            &endpoint,
+            &child.executor_thread,
+            DEFAULT_BOUND,
+        ) {
+            Ok(mut result) => {
+                if matches!(
+                    result["outcome"].as_str(),
+                    Some("partial") | Some("unsupported") | Some("error")
+                ) || result["containment"]["status"].as_str() == Some("partial")
+                {
+                    partial = true;
+                }
+                result["run"] = Value::String(child.run);
+                result["role"] = Value::String("executor".into());
+                result["parentThreadId"] = Value::String(lead.executor_thread.clone());
+                runs.push(result);
+            }
+            Err(error) => {
+                partial = true;
+                runs.push(json!({
+                    "run": child.run,
+                    "role": "executor",
+                    "outcome": "error",
+                    "error": error.to_string()
+                }));
+            }
+        }
+    }
+    let lead_stop = match lead.endpoint.clone() {
+        Some(endpoint) => match executor_cli::mcp_stop(
+            &lead.receipt,
+            &endpoint,
+            &lead.executor_thread,
+            DEFAULT_BOUND,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                partial = true;
+                json!({"outcome": "error", "error": error.to_string()})
+            }
+        },
+        None => {
+            partial = true;
+            json!({
+                "outcome": "unavailable",
+                "error": lead.endpoint_unavailable
+            })
+        }
+    };
+    if matches!(
+        lead_stop["outcome"].as_str(),
+        Some("partial") | Some("unsupported") | Some("error")
+    ) || lead_stop["containment"]["status"].as_str() == Some("partial")
+    {
+        partial = true;
+    }
+    let pending = reconcile_stopped_requests(home, &lead.executor_thread)?;
+    Ok(json!({
+        "run": lead.run,
+        "role": "lead",
+        "subtree": true,
+        "outcome": if partial { "partial" } else { "stopped" },
+        "lead": lead_stop,
+        "runs": runs,
+        "uncertainRequests": pending,
+        "subtreeStop": marker,
+        "preserved": {
+            "checkout": lead.checkout,
+            "base": lead.base,
+            "slot": lead.slot,
+            "owner": lead.run,
+            "receipt": lead.receipt,
+            "reset": false,
+            "released": false
+        },
+        "detail": "admission for this Lead subtree is closed; the Lead and its recorded Executors were interrupted through their exact threads; sibling teams and direct Executors were not targeted"
+    }))
+}
+
 fn stop(operation: &Operation) -> io::Result<Value> {
     let caller = caller_thread(&operation.metadata)?;
     let args: StopArgs = serde_json::from_value(operation.arguments.clone())
@@ -3326,6 +3571,9 @@ fn stop(operation: &Operation) -> io::Result<Value> {
         Some(run) => lead_run_by_id(&home, &caller, run)?,
         None => single_run(&home, &caller, RunRole::Lead)?,
     };
+    if run.child_role == RunRole::Lead && run.side == RunSide::Parent {
+        return stop_subtree(&home, &caller, &run);
+    }
     let endpoint = run.endpoint.clone().ok_or_else(|| {
         invalid(format!(
             "the exact run's registered app-server endpoint is unavailable ({}); no process was targeted",
@@ -3860,6 +4108,11 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "workspace": evidence,
                 "detail": "resumed the exact native thread with the preserved assignment; the assignment was not resubmitted and the slot was not reset or reassigned"
             });
+            if run.child_role == RunRole::Lead
+                && let Err(error) = clear_subtree_stop(&home, &run.executor_thread)
+            {
+                response["subtreeStopError"] = Value::String(error.to_string());
+            }
             attach_cache_guard(&home, &run, &mut response);
             Ok(response)
         }
@@ -3944,6 +4197,11 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "workspace": evidence,
                 "detail": "created one new bound thread on the same shared app-server; the predecessor thread remains retained, the slot stayed bound, and the preserved assignment was submitted once in the new thread"
             });
+            if run.child_role == RunRole::Lead
+                && let Err(error) = clear_subtree_stop(&home, &run.executor_thread)
+            {
+                response["subtreeStopError"] = Value::String(error.to_string());
+            }
             attach_cache_guard(&home, &run, &mut response);
             Ok(response)
         }

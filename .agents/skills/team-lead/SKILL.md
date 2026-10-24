@@ -19,6 +19,24 @@ has not entered the role must not spawn executors, create board records, or
 write orchestration state. Leaving the role or stopping orchestration is
 explicit and preserves partial work.
 
+## Director, delegated Lead and Executor
+
+The root session is the Director. It may work directly, dispatch an Executor
+with `executor_dispatch`, or dispatch a delegated Lead with `lead_dispatch`
+when the work is a prepared OpenSpec change. A delegated Lead owns that change,
+may dispatch Executors for its slices, must accept their work, and reports the
+combined result to the Director; it cannot dispatch another Lead or activate
+this skill. Executors report only to their immediate parent. A title, board card
+or verbal scope is not a Lead assignment: the change must carry its applicable
+planning artifacts, committed inputs, repositories, board issue and testable
+acceptance, and `lead_dispatch` validates them before allocation.
+
+The default topology is two direct Leads, four direct Executors per Director and
+six Executors per Lead, composing with the installation-wide Executor limit and
+the independent worktree pool. Admission counts startup reservations, active
+turns and reply-waiting runs by immediate parent and role. Use the configured
+profiles only; a Lead and an Executor share `ds` routing but not tool authority.
+
 ## Operating objective
 
 Maximize delivery speed of the accepted result while minimizing avoidable lead
@@ -67,19 +85,22 @@ activation reports no utilization and spawns nothing.
 
 ## Discover roles
 
-Read kit `global/orchestration.toml` (lead profile, successor lead, executor
-profiles, max concurrent executors). Installation check already rejects missing
-profiles and non-positive limits. Dispatch uses exactly those profiles; an
-explicit user `codex --profile <id>` keeps native precedence. The configured
-profile is each assignment's complete model/effort selection: its native
-configuration already fixes both, and `executor_dispatch` takes no per-assignment
+Read kit `global/orchestration.toml` (lead profile, successor lead, delegated
+Lead profile, executor profiles, parent limits, max concurrent executors).
+Installation check already rejects missing profiles and non-positive limits.
+Dispatch uses exactly those profiles; an explicit user `codex --profile <id>`
+keeps native precedence. The configured profile is each assignment's complete
+model/effort selection: its native configuration already fixes both, and
+`executor_dispatch`/`lead_dispatch` take no per-assignment
 model or effort by design. With `executor_profiles = ["ds"]`, every assignment
 runs DeepSeek V4.1-Flash at `max`; a single executor profile is full configured
 capacity, never a reason to keep executor-suitable work in the lead. Routing
 wording that seems to demand another model or per-task arguments is reported as
 a discrepancy while dispatch proceeds; only an MCP-reported capability failure
 blocks dispatch. `worktree_pool_size` sizes the shared worktree pool independently
-of that executor limit, and `executor_dispatch` - not the lead - allocates its slots.
+of that executor limit, and the MCP dispatch owners - not the caller - allocate
+slots. Parent limits are separate from the installation-wide Executor limit;
+report the effective bottleneck rather than assuming the pool is the only cap.
 Apply the dispatch-specific concurrency rule in the
 [lead responsibility](../../../global/roles/lead.md#assignment-and-routing):
 the native child-thread cap is not a second limit on harness executors.
@@ -309,6 +330,13 @@ Reconcile planning artifacts explicitly on
 integration: an executor's tasks.md or spec edits apply on top of the
 integrated state, never over it - diff and merge checkboxes and deltas instead
 of copying files wholesale.
+
+Acceptance follows the hierarchy. A delegated Lead accepts and integrates its
+Executors' work and reports the combined revision set; the Director accepts
+that Lead result and any direct Executor output, including their combined
+behavior. A green per-Executor check does not prove the integrated path.
+Director inspection of a descendant does not acknowledge the Lead's pending
+result, resolve its question or accept its work.
 
 Executor slots are pool-owned, not task-owned: the pool never grows past
 `worktree_pool_size`, and slots are reused while conversations are not. MCP

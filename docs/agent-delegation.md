@@ -208,8 +208,9 @@ installed build recorded - [roles.toml](../global/roles.toml) and the
 fragments it names in the kit checkout - through the runtime's shared role
 resolver, then composes the result with the applicable native user, project,
 profile and session context before any model request. `executor_dispatch`
-resolves the executor role for its new thread; a managed lead session resolves
-the lead role. The consuming checkout never needs to own kit role assets, and
+resolves the executor role for its new thread, `lead_dispatch` resolves the
+delegated-Lead role, and a managed root session resolves the Director/lead
+role. The consuming checkout never needs to own kit role assets, and
 native precedence is preserved: an explicit user `--profile` still wins,
 retained explicit skill disables and unrelated or project skills stay untouched,
 and no shared user configuration is mutated. Missing or inconsistent role
@@ -227,7 +228,7 @@ context rather than claiming it loaded a newly resolved revision. Role
 configuration that cannot be resolved blocks dispatch before model work.
 
 Inspect a composition without a model call:
-`codex-harness skills catalogue --role lead|executor [--profile ID]`
+`codex-harness skills catalogue --role lead|delegated-lead|executor [--profile ID]`
 applies the installed build's resolved role to the native skill read and
 refuses when those role inputs are missing instead of reporting a set the
 managed session would not see. Passing `--profile ID` selects the native
@@ -239,6 +240,23 @@ native read; the command reports
 routing. The `codex-harness check` report lists each role as `resolved` with
 its revision or as a `gap` naming the exact missing input; a gap blocks
 only the sessions whose role inputs are missing and fails nothing else.
+
+### Director and delegated Lead
+
+The root is the Director. It may implement directly, dispatch an Executor with
+`executor_dispatch`, or dispatch a prepared OpenSpec change to a delegated Lead
+with `lead_dispatch`. A Lead assignment needs the change's applicable planning
+artifacts, exact committed inputs, repositories, board issue, objective and
+testable acceptance; a title or board card alone is refused before allocation.
+The delegated Lead may dispatch Executors, must accept and integrate their work,
+and reports the combined result to the Director. It cannot dispatch another Lead
+or activate `team-lead`. Executors report only to their immediate parent.
+
+The Director sees the hierarchy's thread and descendant status, but inspecting a
+descendant does not acknowledge the Lead's pending result, resolve its question
+or accept its work. `executor_wait` remains a direct-child wait. Stop, resume and
+release keep their existing exact-run meaning; subtree stop and explicit
+restoration are separate operations.
 
 ## Executor utilization
 

@@ -2491,6 +2491,103 @@ fn delegated_lead_messages_downward_and_a_sibling_lead_is_rejected() {
 }
 
 #[test]
+fn stopping_a_lead_closes_its_subtree_and_leaves_a_direct_sibling_running() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, lead) = delegated_lead_run(home.path(), root.path(), &server);
+    let (child, child_value, _) = delegated_child_run(home.path(), &server);
+    let sibling = synthetic_run(home.path(), DIRECTOR, OTHER_EXECUTOR, &server);
+    let mut sim = NativeSim::new(DIRECTOR, LEAD, &repository, false, false);
+    sim.threads.insert(
+        LEAD.to_owned(),
+        SimThread::active(LEAD, &repository, "lead-turn").with_ds(),
+    );
+    sim.threads.insert(
+        EXECUTOR.to_owned(),
+        SimThread::active(
+            EXECUTOR,
+            child._checkout.path(),
+            child_value["turnId"].as_str().unwrap(),
+        ),
+    );
+    sim.threads.insert(
+        OTHER_EXECUTOR.to_owned(),
+        SimThread::active(OTHER_EXECUTOR, sibling._checkout.path(), "initial-turn"),
+    );
+    let sim = Arc::new(Mutex::new(sim));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let stopped = mcp.call_tool(
+        2,
+        "executor_stop",
+        json!({"run": lead["run"]}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let stopped = result(&stopped);
+    assert_eq!(stopped["subtree"], true, "{stopped}");
+    assert_eq!(stopped["outcome"], "stopped", "{stopped}");
+    assert_eq!(stopped["lead"]["outcome"], "stopped", "{stopped}");
+    assert!(
+        stopped["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["run"] == child_value["run"]),
+        "{stopped}"
+    );
+    assert_eq!(sim.lock().unwrap().threads[LEAD].state(), "idle");
+    assert_eq!(sim.lock().unwrap().threads[EXECUTOR].state(), "idle");
+    assert_eq!(
+        sim.lock().unwrap().threads[OTHER_EXECUTOR].state(),
+        "active",
+        "a direct Executor outside the Lead subtree must keep running"
+    );
+    let marker = home
+        .path()
+        .join("harness/executor-pool/requests")
+        .join(LEAD)
+        .join("STOPPED.json");
+    assert!(marker.is_file(), "the subtree stop marker was not written");
+
+    let starts_before = server.requests_for("thread/start").len();
+    let refused = mcp.call(
+        3,
+        json!({
+            "owner": "after-stop-child",
+            "requestId": "after-stop-child",
+            "base": child_value["base"],
+            "assignment": assignment("must not start after stop")
+        }),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&refused).contains("subtree") && tool_error(&refused).contains("stopped"),
+        "{refused}"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+
+    let resumed = mcp.call_tool(
+        4,
+        "executor_resume",
+        json!({"run": lead["run"], "mode": "exact"}),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let resumed = result(&resumed);
+    assert!(resumed["subtreeStopError"].is_null(), "{resumed}");
+    assert!(
+        !marker.exists(),
+        "explicit Lead resume must clear the subtree stop marker"
+    );
+
+    drop(child);
+    drop(sibling);
+    mcp.finish();
+}
+
+#[test]
 fn wait_returns_a_pending_question_and_a_terminal_result_separately() {
     let home = home();
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));
