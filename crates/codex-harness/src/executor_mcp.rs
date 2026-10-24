@@ -323,7 +323,7 @@ fn stop_tool_definition() -> Value {
 fn resume_tool_definition() -> Value {
     json!({
         "name": RESUME_TOOL,
-        "description": "Explicitly continue one stopped child run owned by the verified calling lead, including a delegated Lead. exact resumes the same thread with the preserved assignment and bounded progress, without resubmitting the assignment, changing the recorded hierarchy or repositories, or resetting the pool. fresh starts one new thread on the same shared app-server with the preserved assignment, role, parent, root, repository set and ds binding, rebinds recorded children to that successor, retains the predecessor, and asks the model to inspect interrupted effects. Missing or stale authority is refused before native work, and an explicit stop is never restarted automatically.",
+        "description": "Explicitly continue one stopped child run owned by the verified calling lead, including a delegated Lead. exact resumes the same thread with the preserved assignment and bounded progress, without resubmitting the assignment, changing the recorded hierarchy or repositories, or resetting the pool. fresh starts one new thread on the same shared app-server with the preserved assignment, role, parent, root, repository set and ds binding, rebinds recorded children to that successor, reconciles interrupted child starts without replaying completed work, retains the predecessor, and asks the model to inspect interrupted effects. Missing or stale authority is refused before native work, and an explicit stop is never restarted automatically.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -711,6 +711,68 @@ fn active_requests(home: &Path) -> io::Result<Vec<ActiveRequest>> {
     Ok(active)
 }
 
+/// Finds a nonterminal request that already owns this run identity, including
+/// one recorded under a retained parent. A retry from a successor must not
+/// allocate a second writer for the same run.
+fn unresolved_owner_request(
+    home: &Path,
+    parent: &str,
+    request_id: &str,
+    owner: &str,
+) -> io::Result<Option<Value>> {
+    let root = requests_root(home);
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    for directory in fs::read_dir(&root)? {
+        let directory = directory?;
+        if !directory.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(directory.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Some(request) = read_request(&entry.path())? else {
+                continue;
+            };
+            if request["owner"].as_str() != Some(owner)
+                || (request["parentThreadId"].as_str() == Some(parent)
+                    && request["requestId"].as_str() == Some(request_id))
+            {
+                continue;
+            }
+            let status = request["status"].as_str().unwrap_or_default();
+            if status == "failed" || (status == "prepared" && !request_process_live(&request)) {
+                continue;
+            }
+            if let Some(receipt) = request["receipt"]
+                .as_str()
+                .and_then(|path| fs::read(path).ok())
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                && (!receipt["release"].is_null() || receipt["run"].as_str() != Some(owner))
+            {
+                continue;
+            }
+            return Ok(Some(json!({
+                "requestId": request["requestId"],
+                "parentThreadId": request["parentThreadId"],
+                "run": request["owner"],
+                "status": request["status"],
+                "childThreadId": request["childThreadId"],
+                "receipt": request["receipt"]
+            })));
+        }
+    }
+    Ok(None)
+}
+
 fn prepare_request(
     home: &Path,
     source: &Path,
@@ -795,6 +857,14 @@ fn prepare_request(
                 )));
             }
         }
+    }
+    if let Some(existing) = unresolved_owner_request(home, parent, request_id, owner)? {
+        return Err(invalid(format!(
+            "owner {owner} already has an unresolved dispatch request {} under parent {} (state {}); no second child was allocated. Inspect, resume or release that run instead of reusing its owner",
+            existing["requestId"].as_str().unwrap_or("unknown"),
+            existing["parentThreadId"].as_str().unwrap_or("unknown"),
+            existing["status"].as_str().unwrap_or("unknown")
+        )));
     }
 
     let config = orchestration_config::load(source)?;
@@ -3464,7 +3534,33 @@ fn status(operation: &Operation) -> io::Result<Value> {
     }))
 }
 
+fn reconcile_started_requests(home: &Path, lead_thread: &str) -> io::Result<Vec<Value>> {
+    reconcile_requests(
+        home,
+        lead_thread,
+        &["starting", "thread-started"],
+        true,
+        "explicit continuation found no recorded child turn or receipt; the child start remains uncertain and must not be dispatched again",
+    )
+}
+
 fn reconcile_stopped_requests(home: &Path, lead_thread: &str) -> io::Result<Vec<Value>> {
+    reconcile_requests(
+        home,
+        lead_thread,
+        &["prepared", "starting", "thread-started"],
+        false,
+        "subtree stopped before the child turn and receipt were recorded",
+    )
+}
+
+fn reconcile_requests(
+    home: &Path,
+    lead_thread: &str,
+    statuses: &[&str],
+    skip_live: bool,
+    reason: &str,
+) -> io::Result<Vec<Value>> {
     let directory = requests_root(home).join(lead_thread);
     if !directory.is_dir() {
         return Ok(Vec::new());
@@ -3485,7 +3581,15 @@ fn reconcile_stopped_requests(home: &Path, lead_thread: &str) -> io::Result<Vec<
             continue;
         };
         let status = request["status"].as_str().unwrap_or_default();
-        if !matches!(status, "prepared" | "starting" | "thread-started") {
+        if !statuses.contains(&status) {
+            continue;
+        }
+        if skip_live
+            && (request_process_live(&request)
+                || request["receipt"]
+                    .as_str()
+                    .is_some_and(|receipt| Path::new(receipt).is_file()))
+        {
             continue;
         }
         let child = request["childThreadId"].as_str().map(str::to_owned);
@@ -3496,7 +3600,7 @@ fn reconcile_stopped_requests(home: &Path, lead_thread: &str) -> io::Result<Vec<
             "uncertain",
             child.as_deref(),
             receipt.as_deref(),
-            Some("subtree stopped before the child turn and receipt were recorded"),
+            Some(reason),
         )
         .is_ok()
         {
@@ -3505,7 +3609,7 @@ fn reconcile_stopped_requests(home: &Path, lead_thread: &str) -> io::Result<Vec<
                 "run": request["owner"],
                 "childThreadId": child,
                 "state": "uncertain",
-                "detail": "subtree stopped during startup; no model turn was started"
+                "detail": reason
             }));
         }
     }
@@ -4149,6 +4253,11 @@ fn resume(operation: &Operation) -> io::Result<Value> {
             "the last stop reported partial containment; no continuation was started. Repeat executor_stop until the exact thread and its background terminals are verified gone, or preserve the run for explicit inspection",
         ));
     }
+    let uncertain_requests = if run.child_role == RunRole::Lead {
+        reconcile_started_requests(&home, &run.executor_thread)?
+    } else {
+        Vec::new()
+    };
     let prompt = required_text(&run.value, "prompt")?.to_owned();
     let evidence = workspace_evidence(&run.checkout, &run.base);
     let from_turn = run.value["turnId"].as_str().map(str::to_owned);
@@ -4199,6 +4308,7 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "checkout": run.checkout,
                 "base": run.base,
                 "slot": run.slot,
+                "uncertainRequests": uncertain_requests,
                 "role": run.child_role.as_str(),
                 "parentThreadId": run.parent_thread,
                 "rootThreadId": run.root_thread,
@@ -4374,6 +4484,7 @@ fn resume(operation: &Operation) -> io::Result<Value> {
                 "profile": run.identity,
                 "workspaceRoots": workspace_roots,
                 "workspaces": run.value["workspaces"],
+                "uncertainRequests": uncertain_requests,
                 "successorAttachment": successor_attachment,
                 "receipt": run.receipt,
                 "workspace": evidence,

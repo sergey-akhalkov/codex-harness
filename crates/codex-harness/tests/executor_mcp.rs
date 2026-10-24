@@ -170,6 +170,13 @@ impl Mcp {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
+
+    /// Closes the MCP transport by ending its process, without an orderly
+    /// stdio shutdown. The recorded runs and their shared app-server remain.
+    fn disconnect(mut self) {
+        self.child.kill().unwrap();
+        let _ = self.child.wait();
+    }
 }
 
 fn home() -> tempfile::TempDir {
@@ -6502,6 +6509,268 @@ fn fresh_lead_recovery_reattaches_preexisting_children_to_the_successor() {
     assert_eq!(released["state"], "released", "{released}");
     mcp.finish();
     drop(released_child);
+    drop(child);
+    drop(lead);
+}
+
+#[test]
+fn reopen_and_explicit_resume_preserve_child_work_and_reconcile_an_uncertain_start() {
+    const COMPLETED_TEXT: &str = "completed but not accepted";
+    const LOST_CHILD: &str = "01a00000-0000-7000-8000-000000000008";
+    const LOST_OWNER: &str = "lost-child-start";
+    const LOST_REQUEST: &str = "lost-child-request";
+
+    let home = home();
+    let kit = tempfile::tempdir().unwrap();
+    install_kit(home.path(), kit.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let lead = delegated_lead_continuation_run(home.path(), &server);
+    let (child, child_value, pending_request) = delegated_child_run(home.path(), &server);
+    let request_path = home
+        .path()
+        .join("harness/executor-pool/requests")
+        .join(LEAD)
+        .join(format!("{LOST_REQUEST}.json"));
+    fs::create_dir_all(request_path.parent().unwrap()).unwrap();
+    fs::write(
+        &request_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "requestId": LOST_REQUEST,
+            "parentThreadId": LEAD,
+            "rootThreadId": DIRECTOR,
+            "role": "executor",
+            "intent": "a child start whose acknowledgement was lost",
+            "owner": LOST_OWNER,
+            "status": "thread-started",
+            "createdMs": 1,
+            "childThreadId": LOST_CHILD,
+            "receipt": null,
+            "error": null,
+            "process": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let partial = child._checkout.path().join("partial-work.txt");
+    fs::write(&partial, "uncommitted partial work\n").unwrap();
+
+    let mut sim = NativeSim::new(DIRECTOR, LEAD, &lead.primary, false, false);
+    sim.threads.insert(
+        LEAD.to_owned(),
+        recorded_lead_thread(lead.value["title"].as_str().unwrap(), &lead.primary, false),
+    );
+    let mut completed = SimThread::idle(EXECUTOR, child._checkout.path());
+    completed.turns = vec![json!({
+        "id": child_value["turnId"],
+        "status": "completed",
+        "items": [{"id": "completed-result", "type": "agentMessage", "text": COMPLETED_TEXT}]
+    })];
+    sim.threads.insert(EXECUTOR.to_owned(), completed);
+    sim.threads.insert(
+        LOST_CHILD.to_owned(),
+        SimThread::idle(LOST_CHILD, child._checkout.path()),
+    );
+    let sim = Arc::new(Mutex::new(sim));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+
+    let lifecycle = |value: &Value| {
+        json!({
+            "observation": value["observation"],
+            "stop": value["stop"],
+            "release": value["release"],
+            "turnId": value["turnId"],
+            "leadMessages": value["leadMessages"],
+            "waitAcknowledgements": value["waitAcknowledgements"]
+        })
+    };
+    let child_before = lifecycle(&child_value);
+    let lead_before: Value = serde_json::from_slice(&fs::read(&lead.run.receipt).unwrap()).unwrap();
+    let lead_before = lifecycle(&lead_before);
+    let starts_before = server.requests_for("thread/start").len();
+    let turns_before = turn_requests(&server);
+    let resumes_before = server.requests_for("thread/resume").len();
+
+    let inspect = |mcp: &mut Mcp, next: u64| {
+        let status = mcp.call_tool(
+            next,
+            "executor_status",
+            json!({}),
+            Some(json!({"threadId": DIRECTOR})),
+        );
+        let status = result(&status);
+        let child_status = status["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["run"] == child_value["run"])
+            .unwrap_or_else(|| panic!("preserved child missing after reopen: {status}"));
+        assert_eq!(
+            child_status["pendingRequests"][0]["requestId"], pending_request,
+            "{child_status}"
+        );
+        assert!(child_status["stop"].is_null(), "{child_status}");
+        assert!(child_status["release"].is_null(), "{child_status}");
+
+        let waited = mcp.call_tool(
+            next + 1,
+            "executor_wait",
+            json!({"run": child_value["run"], "timeoutMs": 0}),
+            Some(json!({"threadId": LEAD})),
+        );
+        let waited = result(&waited);
+        assert_eq!(waited["state"], "question", "{waited}");
+        assert_eq!(
+            waited["pendingRequests"][0]["requestId"], pending_request,
+            "{waited}"
+        );
+        assert_eq!(waited["result"]["finalMessage"], COMPLETED_TEXT, "{waited}");
+    };
+
+    let mut orderly = Mcp::start(home.path());
+    inspect(&mut orderly, 2);
+    orderly.finish();
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+    assert_eq!(turn_requests(&server), turns_before);
+    assert_eq!(server.requests_for("thread/resume").len(), resumes_before);
+    assert_eq!(
+        lifecycle(&serde_json::from_slice::<Value>(&fs::read(&child.receipt).unwrap()).unwrap()),
+        child_before,
+        "orderly MCP closure changed the child's work or delivery state"
+    );
+
+    let mut disconnected = Mcp::start(home.path());
+    inspect(&mut disconnected, 4);
+    disconnected.disconnect();
+    assert_eq!(server.requests_for("thread/start").len(), starts_before);
+    assert_eq!(turn_requests(&server), turns_before);
+    assert_eq!(server.requests_for("thread/resume").len(), resumes_before);
+    assert_eq!(
+        lifecycle(&serde_json::from_slice::<Value>(&fs::read(&child.receipt).unwrap()).unwrap()),
+        child_before,
+        "abrupt MCP disconnection changed the child's work or delivery state"
+    );
+    assert_eq!(
+        fs::read_to_string(&partial).unwrap(),
+        "uncommitted partial work\n"
+    );
+
+    let mut recovered = Mcp::start(home.path());
+    let resumed = recovered.call_tool(
+        6,
+        "executor_resume",
+        json!({
+            "run": lead.value["run"],
+            "mode": "fresh",
+            "progress": "The controlling CLI closed after the child completed; inspect before reusing it."
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let resumed = result(&resumed);
+    let successor = resumed["threadId"].as_str().unwrap();
+    assert_eq!(
+        resumed["uncertainRequests"][0]["requestId"], LOST_REQUEST,
+        "{resumed}"
+    );
+    assert_eq!(
+        resumed["uncertainRequests"][0]["run"], LOST_OWNER,
+        "{resumed}"
+    );
+    assert_eq!(
+        resumed["uncertainRequests"][0]["childThreadId"], LOST_CHILD,
+        "{resumed}"
+    );
+    assert_eq!(
+        resumed["uncertainRequests"][0]["state"], "uncertain",
+        "{resumed}"
+    );
+    assert_eq!(resumed["successorAttachment"]["count"], 1, "{resumed}");
+    assert_eq!(server.requests_for("thread/start").len(), starts_before + 1);
+    assert_eq!(turn_requests(&server), turns_before + 1);
+    let uncertain: Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+    assert_eq!(uncertain["status"], "uncertain", "{uncertain}");
+    assert_eq!(uncertain["childThreadId"], LOST_CHILD, "{uncertain}");
+    let child_after: Value = serde_json::from_slice(&fs::read(&child.receipt).unwrap()).unwrap();
+    assert_eq!(child_after["parentThreadId"], successor, "{child_after}");
+    assert_eq!(child_after["leadThreadId"], successor, "{child_after}");
+    assert_eq!(
+        lifecycle(&child_after),
+        child_before,
+        "fresh recovery replayed or accepted the completed child result"
+    );
+    assert_eq!(
+        fs::read_to_string(&partial).unwrap(),
+        "uncommitted partial work\n"
+    );
+    let lead_after: Value = serde_json::from_slice(&fs::read(&lead.run.receipt).unwrap()).unwrap();
+    assert_eq!(
+        json!({
+            "observation": lead_after["observation"],
+            "stop": lead_after["stop"],
+            "release": lead_after["release"],
+            "leadMessages": lead_after["leadMessages"],
+            "waitAcknowledgements": lead_after["waitAcknowledgements"]
+        }),
+        json!({
+            "observation": lead_before["observation"],
+            "stop": lead_before["stop"],
+            "release": lead_before["release"],
+            "leadMessages": lead_before["leadMessages"],
+            "waitAcknowledgements": lead_before["waitAcknowledgements"]
+        }),
+        "fresh recovery changed the preserved Lead lifecycle"
+    );
+
+    let status = recovered.call_tool(
+        7,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": successor})),
+    );
+    let status = result(&status);
+    let child_status = status["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["run"] == child_value["run"])
+        .unwrap_or_else(|| panic!("attached child missing from its successor: {status}"));
+    assert_eq!(
+        child_status["pendingRequests"][0]["requestId"], pending_request,
+        "{child_status}"
+    );
+    assert!(
+        child_after["waitAcknowledgements"].is_null(),
+        "inspection acknowledged the completed child result: {child_after}"
+    );
+
+    let retry_starts = server.requests_for("thread/start").len();
+    let retry_turns = turn_requests(&server);
+    let retry = recovered.call_tool(
+        8,
+        "executor_dispatch",
+        json!({
+            "owner": LOST_OWNER,
+            "requestId": LOST_REQUEST,
+            "base": child_value["base"],
+            "assignment": assignment("must not allocate a duplicate writer")
+        }),
+        Some(json!({"threadId": successor})),
+    );
+    assert!(
+        tool_error(&retry).contains("unresolved dispatch request"),
+        "{retry}"
+    );
+    assert_eq!(
+        server.requests_for("thread/start").len(),
+        retry_starts,
+        "an uncertain child owner allocated a duplicate thread"
+    );
+    assert_eq!(
+        turn_requests(&server),
+        retry_turns,
+        "an uncertain child owner started duplicate model work"
+    );
+    recovered.finish();
     drop(child);
     drop(lead);
 }

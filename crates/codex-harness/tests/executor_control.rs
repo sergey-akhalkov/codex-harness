@@ -953,6 +953,67 @@ fn an_unanswered_lead_message_keeps_the_idle_thread_reply_capable_without_resume
 }
 
 #[test]
+fn reopening_a_view_changes_no_lifecycle_state_and_starts_no_model_work() {
+    let (root, server, mut conversation, job) = start_held(json!([{
+        "id": "lead-0123456789abcdef01234567",
+        "kind": "reply-request",
+        "status": "delivered"
+    }]));
+    conversation
+        .assign("inspect the preserved question")
+        .unwrap();
+    server.push(json!({
+        "method": "turn/started",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}}
+    }));
+    server.push(json!({
+        "method": "turn/completed",
+        "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+    }));
+    let _ = drain(&mut conversation, 2);
+    let partial = root.path().join("slot/partial.txt");
+    fs::write(&partial, "uncommitted partial work\n").unwrap();
+    let receipt_path = root.path().join("spawn-1.json");
+    let receipt_before = fs::read(&receipt_path).unwrap();
+    let lifecycle_before = conversation.lifecycle();
+    assert_ne!(lifecycle_before, Some(Lifecycle::Completed));
+
+    let endpoint = Endpoint::read(&root.path().join("endpoint-1.json")).unwrap();
+    for _ in 0..2 {
+        let mut view = Conversation::attach(&endpoint, WAIT).expect("inspection attaches");
+        let thread = view
+            .call(
+                "thread/read",
+                json!({"threadId": THREAD, "includeTurns": true}),
+            )
+            .expect("the view reads the exact thread");
+        assert_eq!(thread["thread"]["id"], THREAD, "{thread}");
+        drop(view);
+    }
+
+    assert_eq!(conversation.lifecycle(), lifecycle_before);
+    assert_eq!(conversation.thread_id(), THREAD);
+    assert_eq!(server.requests_for("thread/start").len(), 1);
+    assert_eq!(server.requests_for("turn/start").len(), 1);
+    assert!(
+        server.requests_for("thread/resume").is_empty(),
+        "view navigation resumed the thread"
+    );
+    assert!(
+        server.requests_for("turn/interrupt").is_empty(),
+        "view navigation interrupted the run"
+    );
+    assert_eq!(server.requests_for("thread/read").len(), 2);
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+    assert_eq!(
+        fs::read_to_string(&partial).unwrap(),
+        "uncommitted partial work\n"
+    );
+    drop(conversation);
+    drop(job);
+}
+
+#[test]
 fn a_notification_alone_does_not_keep_the_turn_open() {
     let (root, server, mut conversation, job) = start_held(json!([{
         "id": "lead-notice",
