@@ -3441,7 +3441,7 @@ fn wait_times_out_without_model_work_and_refuses_an_executor_caller() {
 fn wait_does_not_repeat_a_reply_that_was_already_delivered() {
     let home = home();
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));
-    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let run = release_run(home.path(), LEAD, EXECUTOR, &server);
     let mut receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
     receipt["leadMessages"] = json!([{
         "schema": 1,
@@ -3460,7 +3460,7 @@ fn wait_does_not_repeat_a_reply_that_was_already_delivered() {
     let sim = Arc::new(Mutex::new(NativeSim::new(
         LEAD,
         EXECUTOR,
-        run._checkout.path(),
+        &run.checkout,
         false,
         false,
     )));
@@ -3483,6 +3483,15 @@ fn wait_does_not_repeat_a_reply_that_was_already_delivered() {
             .is_none_or(Vec::is_empty),
         "{waited}"
     );
+    let released = release_tool(
+        &mut mcp,
+        3,
+        LEAD,
+        Some(&run.run),
+        "discarded",
+        "the referenced question was answered",
+    );
+    assert_eq!(result(&released)["released"], true, "{released}");
 
     mcp.finish();
     drop(run);

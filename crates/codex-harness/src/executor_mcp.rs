@@ -3926,7 +3926,7 @@ fn release_receipt(home: &Path, caller: &str, selected: Option<&str>) -> io::Res
 }
 
 fn require_release_ready(run: &VerifiedRun) -> io::Result<()> {
-    let (pending, _) = pending_requests(run);
+    let (pending, _) = actionable_requests(run);
     if !pending.is_empty() {
         let ids: Vec<&Value> = pending
             .iter()
