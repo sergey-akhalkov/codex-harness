@@ -3835,6 +3835,15 @@ fn prepare_reserved_checkout(
     }
     match slot_presence(&legacy, &registered) {
         SlotPresence::Registered => {
+            let lease =
+                pool_state_dir(codex_home, &pool.source)?.join(format!("lease-{index}.json"));
+            if lease.is_file() {
+                return Err(pool_error(&format!(
+                    "legacy slot {index} {} still has a recorded host lease {}; stop or release that host before hierarchy migration",
+                    legacy.display(),
+                    lease.display()
+                )));
+            }
             let status = slot_status(&legacy)?;
             if !only_serena_tool_state(&status) {
                 return Err(pool_error(&format!(

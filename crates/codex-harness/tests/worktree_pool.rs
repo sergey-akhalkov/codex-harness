@@ -1927,6 +1927,53 @@ fn held_legacy_worktree_stays_put_and_safe_reuse_migrates_to_its_label() {
 }
 
 #[test]
+fn hierarchy_migration_refuses_a_legacy_host_lease() {
+    let fixture = Fixture::new("hierarchy-live-lease", 18, 16);
+    let base = git_output(&fixture.source, &["rev-parse", "HEAD"]);
+    let ordinary = harness_core::task_worktree::acquire_task(
+        &fixture.home,
+        &fixture.source,
+        18,
+        "legacy-lease-task",
+        Some(&base),
+        &|_| false,
+    )
+    .unwrap();
+    let legacy = fixture.root.join("proj-wt1");
+    harness_core::task_worktree::release_task(
+        &fixture.home,
+        &fixture.source,
+        "legacy-lease-task",
+        harness_core::task_worktree::SlotDisposition::Discarded,
+        "test release before live host migration",
+        &base,
+        ordinary.handle.as_deref(),
+        &|_| false,
+    )
+    .unwrap();
+    fixture.record_live_lease(&fixture.source, 1, "live-legacy-host");
+    let startup = harness_core::task_worktree::current_startup_reservation().unwrap();
+    let request = [harness_core::task_worktree::WorkspaceStartupRequest {
+        source: &fixture.source,
+        base: &base,
+    }];
+    let error = harness_core::task_worktree::acquire_hierarchy_workspaces_for_startup(
+        &fixture.home,
+        18,
+        "migrated-live-hierarchy",
+        harness_core::task_worktree::HierarchyRole::DirectorExecutor,
+        &request,
+        &startup,
+        &|_| false,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("recorded host lease"), "{error}");
+    assert!(legacy.is_dir(), "a live legacy host must keep its checkout");
+    assert!(!fixture.root.join("proj-de1").exists());
+    fixture.drop();
+}
+
+#[test]
 fn hierarchy_allocation_refuses_a_foreign_labeled_path() {
     let fixture = Fixture::new("hierarchy-foreign", 18, 16);
     let foreign = fixture.root.join("proj-de1");
