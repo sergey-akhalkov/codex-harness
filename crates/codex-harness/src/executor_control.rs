@@ -1961,11 +1961,13 @@ impl Conversation {
             };
             if value.get("method").is_some() {
                 // Notifications that arrive while a request is in flight are
-                // observed by the next pump, in arrival order.
+                // observed by the next pump, in arrival order. Keep that queue
+                // bounded under a long turn: observe the oldest notification
+                // before evicting it so terminal lifecycle state is retained.
                 if self.pending.len() >= MAX_EVENTS_PER_PUMP {
-                    return Err(invalid(
-                        "the control event queue exceeded its bound while awaiting an answer",
-                    ));
+                    if let Some(oldest) = self.pending.pop_front() {
+                        self.observe(oldest);
+                    }
                 }
                 self.pending.push_back(value);
                 continue;

@@ -523,6 +523,16 @@ fn broadcast(state: &Arc<Mutex<Canned>>, notification: serde_json::Value) {
     }
 }
 
+fn flush_notifications(wire: &mut Wire, queue: &Arc<Mutex<VecDeque<serde_json::Value>>>) -> bool {
+    let queued: Vec<serde_json::Value> = queue.lock().unwrap().drain(..).collect();
+    for value in queued {
+        if wire.write_text(&value.to_string()).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// A clonable push handle for a responder that must emit notifications while
 /// it answers a request. It is deliberately separate from the answer callback
 /// lock, so a responder may enqueue a notification without deadlocking.
@@ -701,11 +711,8 @@ fn converse(
     queue: &Arc<Mutex<VecDeque<serde_json::Value>>>,
 ) -> bool {
     while !stop.load(Ordering::SeqCst) {
-        let queued: Vec<serde_json::Value> = queue.lock().unwrap().drain(..).collect();
-        for value in queued {
-            if wire.write_text(&value.to_string()).is_err() {
-                return false;
-            }
+        if !flush_notifications(wire, queue) {
+            return false;
         }
         match wire.poll_text(Duration::from_millis(5)) {
             Ok(Poll::Message(text)) => {
@@ -722,9 +729,15 @@ fn converse(
                     canned.requests.push(value.clone());
                     (canned.take_answer(&method), canned.responder.clone())
                 };
+                let from_responder = responder.is_some();
                 let answer = responder
                     .as_ref()
                     .map_or(canned_answer, |responder| Some(responder(&value)));
+                // A responder's notifications were emitted before its answer;
+                // send them first, as a native app-server would.
+                if from_responder && !flush_notifications(wire, queue) {
+                    return false;
+                }
                 if !answers {
                     continue;
                 }

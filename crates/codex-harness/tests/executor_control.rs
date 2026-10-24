@@ -22,7 +22,7 @@ mod executor_control;
 
 use executor_control::{
     BoundIdentity, ControlPaths, ControlPlan, Conversation, Endpoint, EndpointProcess,
-    FinalMessage, Lifecycle, MAX_EVENTS_PER_PUMP, app_server_spec, endpoint_process_live,
+    FinalMessage, Lifecycle, MAX_EVENTS_PER_PUMP, Reply, app_server_spec, endpoint_process_live,
 };
 use harness_core::{
     build_identity,
@@ -1623,6 +1623,66 @@ fn one_pump_is_bounded_and_leaves_the_rest_queued() {
     let rest = drain(&mut conversation, 8);
     assert_eq!(rest.len(), 8);
     assert_eq!(conversation.lifecycle(), Some(Lifecycle::Running));
+}
+
+#[test]
+fn a_notification_flood_does_not_fail_the_awaited_request_or_lose_terminal_state() {
+    let recorded = recorded();
+    let mut conversation = recorded.attach();
+    let notifier = recorded.server.notifier();
+    recorded.server.answer_fn(move |request| {
+        if request["method"] != "thread/read" {
+            return Answer::Error(json!({"code": -32601, "message": "unexpected request"}));
+        }
+        notifier.push(json!({
+            "method": "thread/started",
+            "params": {"thread": {"id": THREAD}}
+        }));
+        notifier.push(json!({
+            "method": "turn/started",
+            "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress"}}
+        }));
+        notifier.push(json!({
+            "method": "turn/completed",
+            "params": {"threadId": THREAD, "turn": {"id": TURN, "status": "completed"}}
+        }));
+        for index in 0..MAX_EVENTS_PER_PUMP + 8 {
+            notifier.push(json!({
+                "method": "item/updated",
+                "params": {
+                    "threadId": THREAD,
+                    "item": {
+                        "id": format!("flood-{index}"),
+                        "type": "agentMessage",
+                        "text": "partial"
+                    }
+                }
+            }));
+        }
+        Answer::Result(json!({"thread": {"id": THREAD}, "floodAnswer": "survived"}))
+    });
+    match conversation
+        .request(
+            "thread/read",
+            json!({"threadId": THREAD, "includeTurns": true}),
+        )
+        .expect("a notification flood is not a transport failure")
+    {
+        Reply::Result(result) => assert_eq!(result["floodAnswer"], "survived"),
+        Reply::Rejected(error) => panic!("the request was rejected: {error}"),
+        Reply::Unanswered => panic!("the request was left unanswered"),
+    }
+    let events = drain(&mut conversation, MAX_EVENTS_PER_PUMP);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.method.as_deref() == Some("item/updated"))
+    );
+    assert_eq!(
+        conversation.lifecycle(),
+        Some(Lifecycle::Completed),
+        "evicting a terminal notification must keep its lifecycle state"
+    );
 }
 
 #[test]
