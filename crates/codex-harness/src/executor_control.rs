@@ -547,6 +547,58 @@ fn compare_field(reported: &Value, expected: &str, field: &str) -> Result<(), St
     }
 }
 
+fn verify_workspace_roots(plan: &ControlPlan, started: &Value) -> Result<(), String> {
+    if plan.workspace_roots.is_empty() {
+        return Ok(());
+    }
+    let reported = started["runtimeWorkspaceRoots"]
+        .as_array()
+        .ok_or_else(|| "thread/start reports no runtimeWorkspaceRoots".to_owned())?;
+    let mut actual = Vec::with_capacity(reported.len());
+    for value in reported {
+        let path = value
+            .as_str()
+            .ok_or_else(|| "thread/start reports a non-string workspace root".to_owned())?;
+        if !Path::new(path).is_absolute() {
+            return Err(format!(
+                "thread/start reports workspace root {path} as a relative path"
+            ));
+        }
+        actual.push(Path::new(path).canonicalize().map_err(|error| {
+            format!("reported workspace root {path} cannot be resolved: {error}")
+        })?);
+    }
+    actual.sort();
+    actual.dedup();
+    let mut expected = Vec::with_capacity(plan.workspace_roots.len());
+    for path in &plan.workspace_roots {
+        expected.push(path.canonicalize().map_err(|error| {
+            format!(
+                "declared workspace root {} cannot be resolved: {error}",
+                path.display()
+            )
+        })?);
+    }
+    expected.sort();
+    expected.dedup();
+    if actual != expected {
+        return Err(format!(
+            "thread/start reports {} instead of the declared {}",
+            actual
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            expected
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// One planned control-backed executor conversation: the process identity, the
 /// conversation identity and the state files of a single pooled run.
 #[derive(Debug, Clone)]
@@ -574,6 +626,9 @@ pub struct ControlPlan {
     /// Additional `thread/start` config overrides the resolved profile needs
     /// beyond the binding, for example a provider route the profile carries.
     pub overrides: BTreeMap<String, Value>,
+    /// Declared repositories visible to this thread. The primary slot must be
+    /// one of them. An empty set keeps the native default workspace context.
+    pub workspace_roots: Vec<PathBuf>,
     /// Additional `codex app-server` arguments, appended after the subcommand.
     pub args: Vec<OsString>,
     /// The loopback port the child must serve. The default reserves a free
@@ -638,6 +693,7 @@ impl ControlPlan {
             approval_policy: None,
             sandbox: None,
             overrides: BTreeMap::new(),
+            workspace_roots: Vec::new(),
             args: Vec::new(),
             port: None,
             env: BTreeMap::new(),
@@ -649,6 +705,62 @@ impl ControlPlan {
             bound: DEFAULT_BOUND,
             poll: DEFAULT_POLL,
         }
+    }
+
+    /// Binds the complete repository set selected for this conversation to the
+    /// thread rather than changing global configuration. Validation happens
+    /// before any native request, so an unusable path or an omitted primary
+    /// checkout cannot start dependent model work.
+    pub fn declare_workspace_roots(
+        &mut self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> io::Result<()> {
+        let primary = self.slot.canonicalize().map_err(|error| {
+            invalid(format!(
+                "the primary workspace {} cannot be resolved: {error}",
+                self.slot.display()
+            ))
+        })?;
+        if !primary.is_dir() {
+            return Err(invalid(format!(
+                "the primary workspace {} is not a directory",
+                primary.display()
+            )));
+        }
+        let mut declared = Vec::new();
+        let mut identities = Vec::new();
+        for root in roots {
+            if !root.is_absolute() {
+                return Err(invalid(format!(
+                    "workspace root {} is not absolute",
+                    root.display()
+                )));
+            }
+            let identity = root.canonicalize().map_err(|error| {
+                invalid(format!(
+                    "declared workspace {} cannot be resolved: {error}",
+                    root.display()
+                ))
+            })?;
+            if !identity.is_dir() {
+                return Err(invalid(format!(
+                    "declared workspace {} is not a directory",
+                    root.display()
+                )));
+            }
+            if !identities.contains(&identity) {
+                identities.push(identity);
+                declared.push(root);
+            }
+        }
+        if !identities.contains(&primary) {
+            return Err(invalid(format!(
+                "the primary workspace {} is missing from the declared repository set",
+                primary.display()
+            )));
+        }
+        self.workspace_roots = declared;
+        Ok(())
     }
 }
 
@@ -2250,6 +2362,11 @@ impl Conversation {
                 "the profile binding was not preserved: {mismatch}; the conversation was refused instead of running with different routing"
             )));
         }
+        if let Err(mismatch) = verify_workspace_roots(plan, &started) {
+            return Err(invalid(format!(
+                "the declared workspace set was not preserved: {mismatch}; the conversation was refused before any model turn"
+            )));
+        }
         self.call(
             "thread/name/set",
             json!({"threadId": id, "name": plan.title}),
@@ -2756,6 +2873,9 @@ fn valid_process_id(id: &str) -> bool {
 fn thread_params(plan: &ControlPlan) -> Value {
     let mut params = Map::new();
     params.insert("cwd".into(), json!(plan.slot));
+    if !plan.workspace_roots.is_empty() {
+        params.insert("runtimeWorkspaceRoots".into(), json!(plan.workspace_roots));
+    }
     // A fallback would silently change the routed model the binding recorded.
     params.insert("allowProviderModelFallback".into(), json!(false));
     if let Some(model) = &plan.identity.model {

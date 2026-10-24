@@ -2880,7 +2880,9 @@ pub struct StartupWorkspace {
 /// Acquire a fresh workspace for each requested repository under one startup
 /// reservation. If a later repository cannot be prepared, only the leases
 /// created by this call are handed back through the normal release rules;
-/// pre-existing work and uncertain effects are preserved.
+/// pre-existing work and uncertain effects are preserved. Repository locks are
+/// taken in stable identity order while the returned workspaces keep the
+/// assignment's declared order.
 pub fn acquire_workspaces_for_startup(
     codex_home: &Path,
     size: u32,
@@ -2889,13 +2891,31 @@ pub fn acquire_workspaces_for_startup(
     startup: &StartupReservation,
     is_live: &dyn Fn(&str) -> bool,
 ) -> io::Result<Vec<StartupWorkspace>> {
-    let mut acquired = Vec::with_capacity(requests.len());
-    for request in requests {
+    let mut ordered = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            repository_identity(request.source).map(|identity| (index, identity.common_dir))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    ordered.sort_by(|(left_index, left), (right_index, right)| {
+        left.cmp(right).then(left_index.cmp(right_index))
+    });
+
+    let mut acquired: Vec<Option<StartupWorkspace>> = requests.iter().map(|_| None).collect();
+    let mut started: Vec<usize> = Vec::with_capacity(requests.len());
+    for (index, _) in ordered {
+        let request = &requests[index];
         let inventory = match task_inventory(codex_home, request.source, size) {
             Ok(inventory) => inventory,
             Err(error) => {
+                let started = started
+                    .iter()
+                    .rev()
+                    .filter_map(|index| acquired[*index].take())
+                    .collect();
                 return Err(release_started_workspaces(
-                    codex_home, owner, acquired, is_live, error,
+                    codex_home, owner, started, is_live, error,
                 ));
             }
         };
@@ -2903,10 +2923,15 @@ pub fn acquire_workspaces_for_startup(
             .iter()
             .any(|slot| slot.owner.as_deref() == Some(owner) && slot.state != TaskState::Free)
         {
+            let started = started
+                .iter()
+                .rev()
+                .filter_map(|index| acquired[*index].take())
+                .collect();
             return Err(release_started_workspaces(
                 codex_home,
                 owner,
-                acquired,
+                started,
                 is_live,
                 pool_error(&format!(
                     "workspace {} already has a recorded run for owner '{owner}'; a workspace set acquires fresh bindings only",
@@ -2923,18 +2948,40 @@ pub fn acquire_workspaces_for_startup(
             startup,
             is_live,
         ) {
-            Ok(slot) => acquired.push(StartupWorkspace {
-                repository: request.source.to_path_buf(),
-                slot,
-            }),
+            Ok(slot) => {
+                acquired[index] = Some(StartupWorkspace {
+                    repository: request.source.to_path_buf(),
+                    slot,
+                });
+                started.push(index);
+            }
             Err(error) => {
+                let started = started
+                    .iter()
+                    .rev()
+                    .filter_map(|index| acquired[*index].take())
+                    .collect();
                 return Err(release_started_workspaces(
-                    codex_home, owner, acquired, is_live, error,
+                    codex_home, owner, started, is_live, error,
                 ));
             }
         }
     }
-    Ok(acquired)
+    if started.len() != requests.len() {
+        let started = started
+            .iter()
+            .rev()
+            .filter_map(|index| acquired[*index].take())
+            .collect();
+        return Err(release_started_workspaces(
+            codex_home,
+            owner,
+            started,
+            is_live,
+            pool_error("workspace-set acquisition did not bind every declared repository"),
+        ));
+    }
+    Ok(acquired.into_iter().flatten().collect())
 }
 
 fn release_started_workspaces(

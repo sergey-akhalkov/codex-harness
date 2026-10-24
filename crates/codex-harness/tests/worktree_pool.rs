@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        OnceLock,
+        Arc, Barrier, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -1813,6 +1813,86 @@ fn workspace_set_failure_releases_only_its_new_workspace() {
         preserved.is_file(),
         "pre-existing work must survive cleanup"
     );
+    fixture.drop();
+}
+
+#[test]
+fn concurrent_workspace_sets_take_repository_locks_in_stable_order() {
+    let fixture = Fixture::new("workspace-set-race", 1, 2);
+    let app = fixture.consumer("app");
+    let web = fixture.consumer("web");
+    let app_base = git_output(&app, &["rev-parse", "HEAD"]);
+    let web_base = git_output(&web, &["rev-parse", "HEAD"]);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut attempts = Vec::new();
+    for (owner, first, first_base, second, second_base) in [
+        (
+            "workspace-race-a",
+            web.clone(),
+            web_base.clone(),
+            app.clone(),
+            app_base.clone(),
+        ),
+        (
+            "workspace-race-b",
+            app.clone(),
+            app_base.clone(),
+            web.clone(),
+            web_base.clone(),
+        ),
+    ] {
+        let home = fixture.home.clone();
+        let barrier = Arc::clone(&barrier);
+        attempts.push(std::thread::spawn(move || {
+            let startup = harness_core::task_worktree::current_startup_reservation().unwrap();
+            let requests = [
+                harness_core::task_worktree::WorkspaceStartupRequest {
+                    source: &first,
+                    base: &first_base,
+                },
+                harness_core::task_worktree::WorkspaceStartupRequest {
+                    source: &second,
+                    base: &second_base,
+                },
+            ];
+            barrier.wait();
+            let result = harness_core::task_worktree::acquire_workspaces_for_startup(
+                &home,
+                1,
+                owner,
+                &requests,
+                &startup,
+                &|_| false,
+            );
+            (
+                owner,
+                result
+                    .map(|workspaces| workspaces.len())
+                    .map_err(|error| error.to_string()),
+            )
+        }));
+    }
+    barrier.wait();
+    let results: Vec<_> = attempts
+        .into_iter()
+        .map(|attempt| attempt.join().unwrap())
+        .collect();
+    let winners: Vec<_> = results
+        .iter()
+        .filter(|(_, result)| result.as_ref().is_ok_and(|count| *count == 2))
+        .collect();
+    assert_eq!(winners.len(), 1, "{results:?}");
+    let winner = winners[0].0;
+    for (repository, base) in [(&app, &app_base), (&web, &web_base)] {
+        let inventory =
+            harness_core::task_worktree::task_inventory(&fixture.home, repository, 1).unwrap();
+        assert_eq!(inventory.len(), 1, "{inventory:?}");
+        assert_eq!(inventory[0].owner.as_deref(), Some(winner), "{inventory:?}");
+        assert_eq!(
+            git_output(&inventory[0].path, &["rev-parse", "HEAD"]),
+            base.as_str()
+        );
+    }
     fixture.drop();
 }
 

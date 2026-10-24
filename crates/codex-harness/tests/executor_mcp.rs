@@ -14,12 +14,13 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Barrier, Mutex},
     time::{Duration, Instant},
 };
 
 const LEAD: &str = "01a00000-0000-7000-8000-000000000001";
 const DIRECTOR: &str = "01a00000-0000-7000-8000-00000000000d";
+const OTHER_DIRECTOR: &str = "01a00000-0000-7000-8000-00000000000e";
 const OTHER_LEAD: &str = "01a00000-0000-7000-8000-000000000002";
 const EXECUTOR: &str = "01a00000-0000-7000-8000-000000000003";
 const OTHER_EXECUTOR: &str = "01a00000-0000-7000-8000-000000000004";
@@ -319,6 +320,7 @@ fn workspace_slot_record(home: &Path, repository: &Path, index: u32) -> Value {
 struct SimThread {
     id: String,
     cwd: PathBuf,
+    workspace_roots: Vec<PathBuf>,
     name: Option<String>,
     model: String,
     model_provider: String,
@@ -333,6 +335,7 @@ impl SimThread {
         Self {
             id: id.to_owned(),
             cwd: cwd.to_path_buf(),
+            workspace_roots: Vec::new(),
             name: None,
             model: "test-model".into(),
             model_provider: "test-provider".into(),
@@ -347,6 +350,7 @@ impl SimThread {
         Self {
             id: id.to_owned(),
             cwd: cwd.to_path_buf(),
+            workspace_roots: Vec::new(),
             name: None,
             model: "test-model".into(),
             model_provider: "test-provider".into(),
@@ -601,6 +605,12 @@ fn native_responder(
                 sim.next_thread += 1;
                 let cwd = request["params"]["cwd"].as_str().unwrap_or_default();
                 let mut thread = SimThread::idle(&id, Path::new(cwd));
+                thread.workspace_roots = request["params"]["runtimeWorkspaceRoots"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|root| root.as_str().map(PathBuf::from))
+                    .collect();
                 if let Some(model) = request["params"]["model"].as_str() {
                     thread.model = model.to_owned();
                 }
@@ -620,10 +630,12 @@ fn native_responder(
                         .filter_map(|tool| tool.as_str().map(str::to_owned))
                         .collect();
                 }
+                let workspace_roots = thread.workspace_roots.clone();
                 sim.threads.insert(id.clone(), thread);
                 Answer::Result(json!({
                     "thread": {"id": id},
                     "cwd": cwd,
+                    "runtimeWorkspaceRoots": workspace_roots,
                     "model": request["params"]["model"],
                     "modelProvider": request["params"]["modelProvider"],
                     "reasoningEffort": request["params"]["config"]["model_reasoning_effort"]
@@ -2041,6 +2053,8 @@ fn director_lead_dispatch_records_distinct_repository_workspaces() {
     let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
     let consumer = repository.join("consumer");
     let consumer_base = git_repo(&consumer);
+    let outside = root.path().join("outside");
+    git_repo(&outside);
     let sim = Arc::new(Mutex::new(NativeSim::new(
         DIRECTOR,
         "unused",
@@ -2048,6 +2062,7 @@ fn director_lead_dispatch_records_distinct_repository_workspaces() {
         false,
         false,
     )));
+    let observed_sim = Arc::clone(&sim);
     server.answer_fn(native_responder(sim));
     let mut mcp = Mcp::start(home.path());
 
@@ -2152,6 +2167,29 @@ fn director_lead_dispatch_records_distinct_repository_workspaces() {
             .canonicalize()
             .unwrap()
     );
+    let declared_roots: Vec<PathBuf> = starts[0]["params"]["runtimeWorkspaceRoots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| PathBuf::from(root.as_str().unwrap()))
+        .collect();
+    let expected_roots: Vec<PathBuf> = workspaces
+        .iter()
+        .map(|workspace| PathBuf::from(workspace["checkout"].as_str().unwrap()))
+        .collect();
+    assert_eq!(declared_roots, expected_roots, "{starts:?}");
+    assert!(
+        !declared_roots
+            .iter()
+            .any(|root| root.canonicalize().unwrap() == outside.canonicalize().unwrap()),
+        "an undeclared repository leaked into the Lead workspace roots"
+    );
+    let lead_thread = lead["executorThreadId"].as_str().unwrap();
+    assert_eq!(
+        observed_sim.lock().unwrap().threads[lead_thread].workspace_roots,
+        declared_roots,
+        "the Lead's tool context retained another session's roots"
+    );
     let primary = workspace_slot_record(home.path(), &consumer, 1);
     let root = workspace_slot_record(home.path(), &repository, 1);
     assert_eq!(primary["owner"], lead["run"], "{primary}");
@@ -2161,7 +2199,181 @@ fn director_lead_dispatch_records_distinct_repository_workspaces() {
     let receipt: Value =
         serde_json::from_slice(&fs::read(lead["receipt"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(receipt["workspaces"], lead["workspaces"], "{receipt}");
+    assert_eq!(
+        receipt["workspaceRoots"],
+        json!(declared_roots),
+        "{receipt}"
+    );
     assert_eq!(receipt["primaryCwd"], lead["primaryCwd"], "{receipt}");
+
+    mcp.finish();
+}
+
+#[test]
+fn simultaneous_lead_workspace_contexts_do_not_retarget() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
+    endpoint(home.path(), OTHER_DIRECTOR, OTHER_DIRECTOR, server.port, 0);
+    let first_consumer = repository.join("first-consumer");
+    let first_base = git_repo(&first_consumer);
+    let second_consumer = repository.join("second-consumer");
+    let second_base = git_repo(&second_consumer);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        OTHER_DIRECTOR,
+        &repository,
+        false,
+        false,
+    )));
+    let observed_sim = Arc::clone(&sim);
+    server.answer_fn(native_responder(sim));
+    let mut mcp = Mcp::start(home.path());
+
+    let first = mcp.call_tool(
+        2,
+        "lead_dispatch",
+        json!({
+            "requestId": "lead-context-first",
+            "assignment": prepared_lead_assignment_with(
+                &issue,
+                &base,
+                json!([
+                    {"path": "first-consumer", "base": first_base},
+                    {"path": ".", "base": base}
+                ])
+            )
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    let first = result(&first);
+    let second = mcp.call_tool(
+        3,
+        "lead_dispatch",
+        json!({
+            "requestId": "lead-context-second",
+            "assignment": prepared_lead_assignment_with(
+                &issue,
+                &base,
+                json!([
+                    {"path": "second-consumer", "base": second_base},
+                    {"path": ".", "base": base}
+                ])
+            )
+        }),
+        Some(json!({"threadId": OTHER_DIRECTOR})),
+    );
+    let second = result(&second);
+
+    let expected = |lead: &Value| -> Vec<PathBuf> {
+        lead["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|workspace| PathBuf::from(workspace["checkout"].as_str().unwrap()))
+            .collect()
+    };
+    let first_roots = expected(&first);
+    let second_roots = expected(&second);
+    let observed = observed_sim.lock().unwrap();
+    assert_eq!(
+        observed.threads[first["executorThreadId"].as_str().unwrap()].workspace_roots,
+        first_roots
+    );
+    assert_eq!(
+        observed.threads[second["executorThreadId"].as_str().unwrap()].workspace_roots,
+        second_roots
+    );
+    assert!(
+        !second_roots
+            .iter()
+            .any(|root| root.canonicalize().unwrap() == first_consumer.canonicalize().unwrap())
+    );
+    assert!(
+        !first_roots
+            .iter()
+            .any(|root| root.canonicalize().unwrap() == second_consumer.canonicalize().unwrap())
+    );
+    drop(observed);
+
+    let starts = server.requests_for("thread/start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert_eq!(
+        starts[0]["params"]["runtimeWorkspaceRoots"],
+        json!(first_roots),
+        "{starts:?}"
+    );
+    assert_eq!(
+        starts[1]["params"]["runtimeWorkspaceRoots"],
+        json!(second_roots),
+        "{starts:?}"
+    );
+
+    mcp.finish();
+}
+
+#[test]
+fn lead_dispatch_refuses_a_thread_that_drops_a_declared_workspace() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (repository, base, issue) = prepared_repository(home.path(), root.path(), &server);
+    let consumer = repository.join("consumer");
+    let consumer_base = git_repo(&consumer);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        "unused",
+        &repository,
+        false,
+        false,
+    )));
+    let responder = native_responder(sim);
+    server.answer_fn(move |request| {
+        let mut answer = responder(request);
+        if request["method"] == "thread/start"
+            && let Answer::Result(value) = &mut answer
+            && let Some(roots) = value["runtimeWorkspaceRoots"].as_array_mut()
+        {
+            roots.pop();
+        }
+        answer
+    });
+    let mut mcp = Mcp::start(home.path());
+
+    let refused = mcp.call_tool(
+        2,
+        "lead_dispatch",
+        json!({
+            "assignment": prepared_lead_assignment_with(
+                &issue,
+                &base,
+                json!([
+                    {"path": "consumer", "base": consumer_base},
+                    {"path": ".", "base": base}
+                ])
+            )
+        }),
+        Some(json!({"threadId": DIRECTOR})),
+    );
+    assert!(
+        tool_error(&refused).contains("declared workspace set was not preserved"),
+        "{refused}"
+    );
+    assert!(
+        server.requests_for("turn/start").is_empty(),
+        "workspace validation must precede model work"
+    );
+    for repository in [&repository, &consumer] {
+        let inventory = task_worktree::task_inventory(home.path(), repository, 6).unwrap();
+        assert_ne!(
+            inventory[0].state,
+            task_worktree::TaskState::Free,
+            "an uncertain started thread keeps its workspace: {inventory:?}"
+        );
+    }
 
     mcp.finish();
 }
@@ -2380,6 +2592,139 @@ fn installation_wide_executor_limit_refuses_a_second_child() {
     assert_eq!(server.requests_for("thread/start").len(), starts_before);
 
     mcp.finish();
+}
+
+#[test]
+fn cross_repository_admission_race_keeps_one_global_allowance() {
+    let home = home();
+    let root = tempfile::tempdir().unwrap();
+    install_kit(home.path(), root.path());
+    write_limits(
+        root.path(),
+        "director_max_leads = 2\ndirector_max_executors = 4\nlead_max_executors = 6\nmax_concurrent_executors = 1",
+    );
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let (first_repository, first_base, _issue) =
+        prepared_repository(home.path(), root.path(), &server);
+    let second_repository = root.path().join("second-repo");
+    let second_base = git_repo(&second_repository);
+    endpoint(home.path(), OTHER_DIRECTOR, OTHER_DIRECTOR, server.port, 0);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        DIRECTOR,
+        OTHER_DIRECTOR,
+        &first_repository,
+        false,
+        false,
+    )));
+    sim.lock()
+        .unwrap()
+        .threads
+        .get_mut(OTHER_DIRECTOR)
+        .unwrap()
+        .cwd = second_repository.clone();
+    server.answer_fn(native_responder(sim));
+
+    let barrier = Arc::new(Barrier::new(3));
+    let first_barrier = Arc::clone(&barrier);
+    let first_home = home.path().to_path_buf();
+    let first_first_base = first_base.clone();
+    let first = std::thread::spawn(move || {
+        let mut mcp = Mcp::start(&first_home);
+        first_barrier.wait();
+        let response = mcp.call(
+            2,
+            json!({
+                "owner": "cross-repository-first",
+                "requestId": "cross-repository-first",
+                "base": first_first_base,
+                "assignment": assignment("first cross-repository child")
+            }),
+            Some(json!({"threadId": DIRECTOR})),
+        );
+        (
+            mcp,
+            response,
+            DIRECTOR.to_owned(),
+            first_first_base,
+            "cross-repository-first",
+        )
+    });
+    let second_home = home.path().to_path_buf();
+    let second_barrier = Arc::clone(&barrier);
+    let second_second_base = second_base.clone();
+    let second = std::thread::spawn(move || {
+        let mut mcp = Mcp::start(&second_home);
+        second_barrier.wait();
+        let response = mcp.call(
+            3,
+            json!({
+                "owner": "cross-repository-second",
+                "requestId": "cross-repository-second",
+                "base": second_second_base,
+                "assignment": assignment("second cross-repository child")
+            }),
+            Some(json!({"threadId": OTHER_DIRECTOR})),
+        );
+        (
+            mcp,
+            response,
+            OTHER_DIRECTOR.to_owned(),
+            second_second_base,
+            "cross-repository-second",
+        )
+    });
+    barrier.wait();
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+    let first_admitted = first.1["result"]["isError"] == false;
+    let second_admitted = second.1["result"]["isError"] == false;
+    assert!(
+        first_admitted ^ second_admitted,
+        "exactly one cross-repository dispatch must consume the single allowance: first={} second={}",
+        first.1,
+        second.1
+    );
+    let (winner_mcp, winner, mut loser_mcp, mut loser, loser_thread, loser_base, loser_owner) =
+        if first_admitted {
+            (
+                first.0, first.1, second.0, second.1, second.2, second.3, second.4,
+            )
+        } else {
+            (
+                second.0, second.1, first.0, first.1, first.2, first.3, first.4,
+            )
+        };
+    assert_eq!(result(&winner)["role"], "executor", "{winner}");
+    if loser["result"]["structuredContent"]["state"] == "busy" {
+        loser = loser_mcp.call(
+            4,
+            json!({
+                "owner": format!("{loser_owner}-retry"),
+                "requestId": format!("{loser_owner}-retry"),
+                "base": loser_base,
+                "assignment": assignment("retry the refused cross-repository child")
+            }),
+            Some(json!({"threadId": loser_thread})),
+        );
+    }
+    assert!(
+        tool_error(&loser).contains("installation-wide executor admission is full: 1 of 1"),
+        "{loser}"
+    );
+    assert_eq!(server.requests_for("thread/start").len(), 1);
+    let occupied: Vec<_> = [&first_repository, &second_repository]
+        .into_iter()
+        .flat_map(|repository| task_worktree::task_inventory(home.path(), repository, 6).unwrap())
+        .filter(|slot| slot.state != task_worktree::TaskState::Free)
+        .collect();
+    assert_eq!(occupied.len(), 1, "{occupied:?}");
+    assert_eq!(
+        occupied[0].owner.as_deref(),
+        result(&winner)["run"].as_str()
+    );
+
+    winner_mcp.finish();
+    loser_mcp.finish();
 }
 
 #[test]

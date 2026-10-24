@@ -1695,6 +1695,22 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
     if let Some(sandbox) = director_thread["sandbox"].as_str() {
         plan.sandbox = Some(sandbox.to_owned());
     }
+    if let Err(error) = plan.declare_workspace_roots(
+        prepared
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.checkout.clone()),
+    ) {
+        let _ = update_request(
+            &request_path,
+            &mut request_value,
+            "failed",
+            None,
+            None,
+            Some(&error.to_string()),
+        );
+        return Err(prepared.release(error));
+    }
 
     if let Err(error) = update_request(
         &request_path,
@@ -1875,6 +1891,7 @@ fn lead_dispatch(operation: &Operation) -> io::Result<Value> {
         "prompt": prepared.prompt,
         "title": prepared.title,
         "workspaces": workspace_receipt,
+        "workspaceRoots": plan.workspace_roots,
         "primaryCwd": prepared.checkout,
         "slot": prepared.slot,
         "source": prepared.source,
