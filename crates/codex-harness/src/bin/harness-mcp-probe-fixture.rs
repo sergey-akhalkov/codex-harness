@@ -83,6 +83,71 @@ mod windows {
         std::thread::sleep(Duration::from_secs(45));
     }
 
+    fn sleep_server() -> io::Result<()> {
+        let mut initialized = false;
+        for line in io::stdin().lock().lines() {
+            let request: Value = serde_json::from_str(&line?)?;
+            let method = request["method"].as_str().unwrap_or_default();
+            match method {
+                "initialize" => {
+                    assert!(!initialized);
+                    initialized = true;
+                    let protocol = request["params"]["protocolVersion"]
+                        .as_str()
+                        .unwrap_or("2025-06-18");
+                    emit(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":protocol,"capabilities":{"tools":{}},"serverInfo":{"name":"harness-mcp-probe-fixture","version":"0.0.0"}}}),
+                        false,
+                    )?;
+                }
+                "notifications/initialized" => assert!(initialized),
+                "ping" => emit(
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":{}}),
+                    false,
+                )?,
+                "tools/list" => {
+                    assert!(initialized);
+                    emit(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[{"name":"sleep","description":"Sleep for the requested seconds before returning.","inputSchema":{"type":"object","properties":{"seconds":{"type":"integer","minimum":0}},"required":["seconds"]}}]}}),
+                        false,
+                    )?;
+                }
+                "tools/call" => {
+                    assert!(initialized);
+                    assert_eq!(request["params"]["name"], "sleep");
+                    let seconds = request["params"]["arguments"]["seconds"]
+                        .as_u64()
+                        .expect("sleep seconds argument");
+                    eprintln!("sleep start seconds={seconds}");
+                    std::thread::sleep(Duration::from_secs(seconds));
+                    eprintln!("sleep end seconds={seconds}");
+                    emit(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":{"content":[{"type":"text","text":format!("slept {seconds}s")}],"structuredContent":{"sleptSeconds":seconds},"isError":false}}),
+                        false,
+                    )?;
+                }
+                "resources/list" => emit(
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":{"resources":[]}}),
+                    false,
+                )?,
+                "resources/templates/list" => emit(
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":{"resourceTemplates":[]}}),
+                    false,
+                )?,
+                "prompts/list" => emit(
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":{"prompts":[]}}),
+                    false,
+                )?,
+                method if method.starts_with("notifications/") => {}
+                other => emit(
+                    json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32601,"message":format!("unsupported method {other}")}}),
+                    false,
+                )?,
+            }
+        }
+        Ok(())
+    }
+
     pub fn run() -> io::Result<()> {
         if std::env::args().nth(1).as_deref() == Some("--probe") {
             let digest = std::env::args()
@@ -99,6 +164,9 @@ mod windows {
         if std::env::args().nth(1).as_deref() == Some("--linger") {
             linger();
             return Ok(());
+        }
+        if std::env::args().nth(1).as_deref() == Some("--mcp-sleep") {
+            return sleep_server();
         }
         let executable = std::env::current_exe()?;
         let config: Value = serde_json::from_slice(&fs::read(executable.with_extension("json"))?)?;

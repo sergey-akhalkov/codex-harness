@@ -9,7 +9,7 @@ Source inspection established the following reuse points:
 - [executor_mcp.rs](../../../crates/codex-harness/src/executor_mcp.rs): `DEFAULT_WAIT_MS` is 30,000, `MAX_WAIT_MS` is 55,000, and `wait` observes retained state at bounded intervals. `observe_executor` checks the accepted turn and reads the current native result, so completion before a call already works for ordinary positive timeouts. `wait_base` embeds `run_summary`, causing unchanged timeout payloads to repeat the run card.
 - [mcp_session.rs](../../../crates/harness-core/src/mcp_session.rs) creates operations with a 60-second deadline. [mcp_stdio.rs](../../../crates/harness-core/src/mcp_stdio.rs) owns operation execution, cancellation and connection cleanup. Their budgets must remain coherent with the longer observation.
 - [executor_mcp tests](../../../crates/codex-harness/tests/executor_mcp.rs) already cover completion between calls, repeated result reads, stale turns, pending questions, observation failures and authority. Extend these fixtures instead of adding a second harness.
-- [the plugin manifest](../../../.agents/plugins/executors/.mcp.json) currently declares only the command and arguments. [OpenAI MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) documents a 60-second default and `tool_timeout_sec` for configured servers, but does not establish that the installed plugin route accepts the same setting. The inspected CLI is 0.164.0; verify the effective target version during implementation.
+- [the plugin manifest](../../../.agents/plugins/executors/.mcp.json) currently declares only the command and arguments. [OpenAI MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) documents a 60-second default and `tool_timeout_sec` for configured servers. The installed plugin route is verified separately below for the target `codex-cli` 0.164.0.
 
 The everyday sequence is dispatch, useful independent lead work, then one wait across owned runs. A worker can finish before that wait, several can finish together, and a question can arrive from a different worker. A connection may disappear after the server writes a result. These cases determine the design, not merely the nominal timeout.
 
@@ -25,9 +25,26 @@ The everyday sequence is dispatch, useful independent lead work, then one wait a
 
 Set the ordinary wait bound to 1,800,000 ms and support shorter explicit waits. Coordinate three budgets: the observation bound, a harness operation deadline that also permits bounded setup/response work, and a client timeout with sufficient outer margin. Extend the operation policy for this tool without turning every MCP operation into a 30-minute request. Polling native state inside that operation does not call the model; unchanged observations stay inside the tool.
 
-First establish how the actual Codex plugin client obtains its effective timeout, using the installed schema/source and a focused call that crosses the current 60-second boundary. Use an isolated owned fixture plugin through the same installed discovery/transport route for this probe, adapting the existing native MCP fixture only as needed: the unchanged executor wait itself rejects bounds above 55 seconds. A configuration value being accepted syntactically is insufficient. Then exercise the full default interval through the implemented, installed executor plugin. The implementation must stop dependent work and report a capability blocker if the plugin client cannot support it through the existing lifecycle. This plan does not authorize replacing the plugin, patching Codex, adding a service or silently shortening waits. Such a finding needs a separate scoped decision.
+The isolated probe below established how the installed Codex plugin client obtains its effective timeout, including a call that crossed the former 60-second boundary; syntactic acceptance of a setting was not treated as sufficient. The full 1,800-second interval through the implemented, installed executor plugin remains task 3.3. If that later exercise cannot use the existing lifecycle, stop dependent work and report the capability blocker. This plan does not authorize replacing the plugin, patching Codex, adding a service or silently shortening waits; such a finding needs a separate scoped decision.
 
 Client yields that retain the same operation are acceptable; repeated model-issued MCP calls to renew 55-second waits do not meet the contract. Progress notifications are not assumed to extend client deadlines. Keep existing read/cancellation bounds, and verify that neither a shared connection nor receipt ownership prevents questions or cancellation from being processed during a wait. Change scheduling only if that concrete path requires it.
+
+### Verified installed plugin timeout (Codex 0.164.0)
+
+The installed `codex-cli` 0.164.0 route takes the MCP call timeout from the plugin server's own `.mcp.json` entry: `mcpServers.<name>.tool_timeout_sec`. The ordinary `[mcp_servers.*]` configuration is not the owner for plugin servers, and app-server supplies no per-call timeout. In this version an omitted value defaults to 300 seconds (`DEFAULT_TOOL_TIMEOUT`), not 60 seconds. The inspected Codex path applies no cap to the configured value.
+
+Source evidence from upstream tag `rust-v0.164.0` (commit `6aaac694803004a63c6f393d153c96d22521a6b9`), matching installed `@openai/codex` 0.164.0:
+
+- `codex-rs/core-plugins/src/loader.rs` discovers the legacy plugin's `.mcp.json` (`DEFAULT_MCP_CONFIG_FILE`) and parses it with `parse_plugin_mcp_config`.
+- `codex-rs/codex-mcp/src/plugin_config.rs` deserializes the server declaration into `McpServerConfig`; `codex-rs/config/src/mcp_types.rs` owns `tool_timeout_sec: Option<Duration>`.
+- `codex-rs/codex-mcp/src/connection_manager.rs` resolves `tool_timeout_sec` with `DEFAULT_TOOL_TIMEOUT` and passes the effective value into `tools/call`; the default is 300 seconds in `codex-rs/codex-mcp/src/rmcp_client.rs`. `codex-rs/app-server/src/request_processors/mcp_processor.rs` routes `mcpServer/tool/call` through that path.
+
+Observed through the installed app-server rather than a standalone client. A fresh `%TEMP%\codex-mcp-timeout-probe-<run>` root held an isolated `CODEX_HOME` and a local-marketplace plugin at `marketplace-root\plugins\probe`; the real `CODEX_HOME` and installed plugins were not used. The plugin declared `"tool_timeout_sec":90` and served one `sleep(seconds)` stdio tool. `codex mcp list --json` reported `"tool_timeout_sec": 90.0` for `probe_sleep`. The probe then ran `codex app-server --stdio` and this JSON-RPC sequence: `initialize` with experimental API, `initialized`, `thread/start` (ephemeral), `mcpServerStatus/list`, `mcpServer/tool/call` for `probe_sleep/sleep`.
+
+- `sleep(65)` returned `isError:false` with `sleptSeconds:65` after 65,004 ms.
+- `sleep(95)` returned `timed out awaiting tools/call after 90s` after 90,019 ms.
+
+This verifies >60-second plugin calls and that the plugin-declared value is the effective client boundary. For the 1,800,000 ms wait, the executor plugin must set `tool_timeout_sec` above the harness operation deadline; the 300-second default cannot cover it. The exact outer margin belongs to task 1.2, and a full 1,800-second installed wait remains task 3.3, not established by this probe.
 
 ### Read current state before sleeping
 
@@ -59,7 +76,7 @@ Update the tool schema/descriptions and existing guidance in [global lead role](
 
 ## Risks / Trade-offs
 
-- Plugin timeout support is unverified: settle the exact configured runtime boundary first; refuse an unsupported route rather than hiding 55-second renewal loops.
+- Plugin timeout support is verified for 0.164.0 through an isolated fixture; the full 1,800-second installed exercise remains task 3.3. The plugin entry must set `tool_timeout_sec` above the operation bound because the 300-second default is too short.
 - A long operation can expose serialized connection starvation: exercise executor questions and cancellation through the actual installed communication path before delivery.
 - Delivery can be duplicated after a lost response: stable result identity and idempotent acknowledgement favor safe replay over loss. This is not exactly-once delivery.
 - Default scope, timeout and response shape change: update owned callers, fixtures and guidance together, preserving explicit run authority and existing terminal/error distinctions.
@@ -68,7 +85,7 @@ Update the tool schema/descriptions and existing guidance in [global lead role](
 
 ## Migration Plan
 
-1. Confirm the installed plugin timeout mechanism and the required deadline margins; preserve the previous supported installation and unresolved work.
+1. Use the confirmed installed plugin timeout mechanism and settle the required deadline margins; preserve the previous supported installation and unresolved work.
 2. Implement the scoped operation budget, current-state all-run observation, receipt acknowledgement and compact envelopes with existing native fixtures. Keep unrelated tool deadlines intact.
 3. Update the installed plugin and owned guidance through the normal kit lifecycle. Start a fresh consumer session outside the checkout and verify the effective artifact, not just source configuration.
 4. Exercise early/late completion, multiple results, a question during waiting, cancellation, reconnect/retry and one full 1800-second quiet wait. Use bounded owned fixture work for elapsed waiting rather than artificial model generation. Reconcile actual result identities and call counts; retain private raw evidence locally.

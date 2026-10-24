@@ -16,6 +16,16 @@ use std::{
 
 const QUEUE_LIMIT: usize = 64;
 const PROTOCOL: &str = "2024-11-05";
+const TOOL_DEADLINE: Duration = Duration::from_secs(60);
+const EXECUTOR_WAIT_DEADLINE: Duration = Duration::from_secs(1860);
+
+fn operation_deadline(name: &str) -> io::Result<Deadline> {
+    Deadline::after(if name == "executor_wait" {
+        EXECUTOR_WAIT_DEADLINE
+    } else {
+        TOOL_DEADLINE
+    })
+}
 
 #[derive(PartialEq, Eq)]
 enum Phase {
@@ -210,7 +220,7 @@ impl Session {
                     name: name.into(),
                     arguments,
                     metadata: params.get("_meta").cloned().unwrap_or(Value::Null),
-                    deadline: Deadline::after(Duration::from_secs(60))?,
+                    deadline: operation_deadline(name)?,
                     cancellation: Cancellation::default(),
                 });
                 Ok(None)
@@ -328,6 +338,11 @@ mod tests {
     fn call(id: Value) -> Message {
         message(
             json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"echo","arguments":{"text":"кириллица 日本"}}}),
+        )
+    }
+    fn call_named(id: Value, name: &str) -> Message {
+        message(
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}}),
         )
     }
     fn fresh() -> Session {
@@ -449,6 +464,36 @@ mod tests {
                 .is_none()
         );
         assert!(session.is_idle());
+    }
+
+    #[test]
+    fn executor_wait_gets_the_long_operation_budget_only() {
+        let mut session = Session::new(
+            "owned-test",
+            vec![
+                json!({"name":"echo","description":"unchanged","inputSchema":{"type":"object","properties":{}}}),
+                json!({"name":"executor_wait","description":"wait","inputSchema":{"type":"object","properties":{}}}),
+            ],
+        )
+        .unwrap();
+        session
+            .receive(message(json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}})))
+            .unwrap();
+        session
+            .receive(message(
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            ))
+            .unwrap();
+
+        session
+            .receive(call_named(json!(1), "executor_wait"))
+            .unwrap();
+        let wait = session.next_operation().unwrap();
+        assert!(session.queue.is_empty() && wait.deadline.remaining() >= Duration::from_secs(1859));
+        session.complete(&wait.id, json!({"content":[]})).unwrap();
+
+        session.receive(call_named(json!(2), "echo")).unwrap();
+        assert!(session.queue.front().unwrap().deadline.remaining() <= TOOL_DEADLINE);
     }
 
     #[test]

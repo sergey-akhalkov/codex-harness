@@ -82,6 +82,10 @@ impl Mcp {
 
     fn request(&mut self, value: Value) -> Value {
         self.send(value);
+        self.read()
+    }
+
+    fn read(&mut self) -> Value {
         let mut line = String::new();
         let read = self.stdout.read_line(&mut line).unwrap();
         if read == 0 {
@@ -209,8 +213,15 @@ fn assert_no_effects(home: &Path, server: &Server) {
 
 fn tool_error(response: &Value) -> String {
     assert_eq!(response["result"]["isError"], true, "{response}");
-    response["result"]["structuredContent"]["error"]
+    let structured = &response["result"]["structuredContent"];
+    structured["error"]
         .as_str()
+        .or_else(|| structured["result"]["error"].as_str())
+        .or_else(|| {
+            structured["results"]
+                .as_array()
+                .and_then(|results| results.iter().find_map(|result| result["error"].as_str()))
+        })
         .unwrap_or_else(|| panic!("tool error missing: {response}"))
         .to_owned()
 }
@@ -1098,6 +1109,22 @@ fn mcp_tools_declare_closed_schemas_with_scoped_run_selection() {
     ] {
         assert!(names.contains(&required), "{listed}");
     }
+    let wait = tools
+        .iter()
+        .find(|tool| tool["name"] == "executor_wait")
+        .unwrap();
+    assert_eq!(
+        wait["inputSchema"]["properties"]["timeoutMs"]["maximum"],
+        1_800_000
+    );
+    assert_eq!(
+        wait["inputSchema"]["properties"]["timeoutMs"]["default"],
+        1_800_000
+    );
+    assert_eq!(
+        wait["inputSchema"]["properties"]["acknowledge"]["items"]["type"],
+        "string"
+    );
     for tool in tools {
         assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{tool}");
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();
@@ -1319,9 +1346,9 @@ fn wait_returns_a_pending_question_and_a_terminal_result_separately() {
         waited["pendingRequests"][0]["kind"], "reply-request",
         "{waited}"
     );
-    assert_eq!(waited["result"]["state"], "completed", "{waited}");
+    assert_eq!(waited["results"][0]["state"], "completed", "{waited}");
     assert_eq!(
-        waited["result"]["finalMessage"],
+        waited["results"][0]["finalMessage"],
         "result while question is open"
     );
 
@@ -1413,6 +1440,9 @@ fn wait_times_out_without_model_work_and_refuses_an_executor_caller() {
     let waited = result(&waited);
     assert_eq!(waited["state"], "timeout", "{waited}");
     assert!(waited["result"].is_null(), "{waited}");
+    let timeout_bytes = serde_json::to_string(waited).unwrap();
+    println!("quiet timeout response bytes={}", timeout_bytes.len());
+    assert!(timeout_bytes.len() < 128, "{waited}");
     assert!(
         started.elapsed() >= Duration::from_millis(100),
         "the wait returned before its bounded interval: {:?}",
@@ -1435,10 +1465,7 @@ fn wait_times_out_without_model_work_and_refuses_an_executor_caller() {
         json!({"timeoutMs": 100}),
         Some(json!({"threadId": EXECUTOR})),
     );
-    assert!(
-        tool_error(&denied).contains("calling lead thread"),
-        "{denied}"
-    );
+    assert!(tool_error(&denied).contains("verified lead"), "{denied}");
 
     drop(run);
     executor.finish();
@@ -1471,13 +1498,14 @@ fn wait_returns_the_exact_current_final_message_and_keeps_a_native_locator() {
     let waited = mcp.call_tool(
         2,
         "executor_wait",
-        json!({"timeoutMs": 1000}),
+        json!({"run": format!("mcp-test-{EXECUTOR}"), "timeoutMs": 1000}),
         Some(json!({"threadId": LEAD})),
     );
     completion.join().unwrap();
     let waited = result(&waited);
-    assert_eq!(waited["state"], "completed", "{waited}");
-    assert_eq!(waited["outcome"], "completed", "{waited}");
+    assert_eq!(waited["state"], "result", "{waited}");
+    assert_eq!(waited["result"]["state"], "completed", "{waited}");
+    assert_eq!(waited["result"]["outcome"], "completed", "{waited}");
     assert_eq!(
         waited["result"]["finalMessage"], "done\n\u{2603}",
         "{waited}"
@@ -1504,7 +1532,7 @@ fn wait_returns_the_exact_current_final_message_and_keeps_a_native_locator() {
     let repeated = mcp.call_tool(
         4,
         "executor_wait",
-        json!({"timeoutMs": 1000}),
+        json!({"run": format!("mcp-test-{EXECUTOR}"), "timeoutMs": 1000}),
         Some(json!({"threadId": LEAD})),
     );
     assert_eq!(
@@ -1545,9 +1573,9 @@ fn wait_distinguishes_empty_output_from_provider_and_read_failures() {
     );
     let empty_error = tool_error(&empty_response);
     let empty = structured(&empty_response);
-    assert_eq!(empty["state"], "output-defect", "{empty}");
-    assert_eq!(empty["outcome"], "empty-output", "{empty}");
-    assert!(empty["result"]["finalMessage"].is_null(), "{empty}");
+    assert_eq!(empty["results"][0]["state"], "output-defect", "{empty}");
+    assert_eq!(empty["results"][0]["outcome"], "empty-output", "{empty}");
+    assert!(empty["results"][0]["finalMessage"].is_null(), "{empty}");
     assert!(
         empty_error.contains("empty final assistant message"),
         "{empty}"
@@ -1565,9 +1593,12 @@ fn wait_distinguishes_empty_output_from_provider_and_read_failures() {
         "{failed_response}"
     );
     let failed = structured(&failed_response);
-    assert_eq!(failed["state"], "failed", "{failed}");
-    assert_eq!(failed["outcome"], "failed", "{failed}");
-    assert_eq!(failed["error"], "provider route failed", "{failed}");
+    assert_eq!(failed["results"][0]["state"], "failed", "{failed}");
+    assert_eq!(failed["results"][0]["outcome"], "failed", "{failed}");
+    assert_eq!(
+        failed["results"][0]["error"], "provider route failed",
+        "{failed}"
+    );
 
     sim.lock().unwrap().read_error = Some("native thread read rejected".into());
     let started = Instant::now();
@@ -1595,6 +1626,343 @@ fn wait_distinguishes_empty_output_from_provider_and_read_failures() {
     );
 
     drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn wait_across_owned_runs_returns_results_and_acknowledges_receipt() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let first = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let second = synthetic_run(home.path(), LEAD, OTHER_EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        first._checkout.path(),
+        false,
+        false,
+    )));
+    sim.lock().unwrap().threads.insert(
+        OTHER_EXECUTOR.to_owned(),
+        SimThread::active(OTHER_EXECUTOR, second._checkout.path(), "initial-turn"),
+    );
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    complete_turn(&sim, EXECUTOR, "initial-turn", "first done");
+    complete_turn(&sim, OTHER_EXECUTOR, "initial-turn", "second done");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let waited = mcp.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 0}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let waited = result(&waited);
+    assert_eq!(waited["state"], "result", "{waited}");
+    let results = waited["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{waited}");
+    assert!(results.iter().all(|result| result["run"].is_string()));
+    assert!(results.iter().all(|result| result["resultId"].is_string()));
+    let first_id = results
+        .iter()
+        .find(|result| result["run"] == format!("mcp-test-{EXECUTOR}"))
+        .unwrap()["resultId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_id = results
+        .iter()
+        .find(|result| result["run"] == format!("mcp-test-{OTHER_EXECUTOR}"))
+        .unwrap()["resultId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let one = mcp.call_tool(
+        3,
+        "executor_wait",
+        json!({"timeoutMs": 0, "acknowledge": [first_id]}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let one = result(&one);
+    assert_eq!(one["results"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(one["results"][0]["resultId"], second_id, "{one}");
+
+    let settled = mcp.call_tool(
+        4,
+        "executor_wait",
+        json!({"timeoutMs": 0, "acknowledge": [second_id]}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&settled)["state"], "idle", "{settled}");
+
+    let retry = mcp.call_tool(
+        5,
+        "executor_wait",
+        json!({"timeoutMs": 0, "acknowledge": [first_id, second_id]}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&retry)["state"], "idle", "{retry}");
+    mcp.finish();
+
+    let mut reconnected = Mcp::start(home.path());
+    let quiet = reconnected.call_tool(
+        6,
+        "executor_wait",
+        json!({"timeoutMs": 0}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&quiet)["state"], "idle", "{quiet}");
+
+    let reread = reconnected.call_tool(
+        7,
+        "executor_wait",
+        json!({"run": format!("mcp-test-{EXECUTOR}"), "timeoutMs": 0}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let reread = result(&reread);
+    assert_eq!(reread["state"], "result", "{reread}");
+    assert_eq!(reread["result"]["resultId"], first_id, "{reread}");
+
+    drop(first);
+    drop(second);
+    reconnected.finish();
+}
+
+#[test]
+fn wait_across_runs_returns_another_runs_question_without_waiting() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let first = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let second = synthetic_run(home.path(), LEAD, OTHER_EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        first._checkout.path(),
+        false,
+        false,
+    )));
+    sim.lock().unwrap().threads.insert(
+        OTHER_EXECUTOR.to_owned(),
+        SimThread::active(OTHER_EXECUTOR, second._checkout.path(), "initial-turn"),
+    );
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    complete_turn(&sim, EXECUTOR, "initial-turn", "first done");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let started = Instant::now();
+
+    let (waited, request_id) = std::thread::scope(|scope| {
+        let question = scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut executor = Mcp::start(home.path());
+            let asked = executor.call_tool(
+                2,
+                "executor_ask_lead",
+                json!({"text": "which result should I use?", "clientMessageId": "all-run-question"}),
+                Some(json!({"threadId": OTHER_EXECUTOR})),
+            );
+            let id = result(&asked)["requestId"].as_str().unwrap().to_owned();
+            executor.finish();
+            id
+        });
+        let waited = mcp.call_tool(
+            3,
+            "executor_wait",
+            json!({"timeoutMs": 3000}),
+            Some(json!({"threadId": LEAD})),
+        );
+        (waited, question.join().unwrap())
+    });
+
+    let waited = result(&waited);
+    assert_eq!(waited["state"], "question", "{waited}");
+    assert_eq!(
+        waited["pendingRequests"][0]["run"],
+        format!("mcp-test-{OTHER_EXECUTOR}"),
+        "{waited}"
+    );
+    assert_eq!(
+        waited["pendingRequests"][0]["requestId"], request_id,
+        "{waited}"
+    );
+    assert!(
+        waited["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["run"] == format!("mcp-test-{EXECUTOR}")),
+        "{waited}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "another run's question did not interrupt the wait: {:?}",
+        started.elapsed()
+    );
+
+    drop(first);
+    drop(second);
+    mcp.finish();
+}
+
+#[test]
+fn invalid_acknowledgement_has_no_effect_and_a_later_turn_is_not_hidden() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    complete_turn(&sim, EXECUTOR, "initial-turn", "first result");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let waited = mcp.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 0}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let result_id = result(&waited)["results"][0]["resultId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert!(before["waitAcknowledgements"].is_null(), "{before}");
+
+    let invalid = mcp.call_tool(
+        3,
+        "executor_wait",
+        json!({"timeoutMs": 0, "acknowledge": ["wait-result-000000000000000000000000"]}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&invalid).contains("not exactly one current terminal result"),
+        "{invalid}"
+    );
+    let after: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert!(after["waitAcknowledgements"].is_null(), "{after}");
+
+    let acknowledged = mcp.call_tool(
+        4,
+        "executor_wait",
+        json!({"timeoutMs": 0, "acknowledge": [result_id]}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&acknowledged)["state"], "idle", "{acknowledged}");
+
+    {
+        let mut sim = sim.lock().unwrap();
+        let thread = sim.threads.get_mut(EXECUTOR).unwrap();
+        thread.turns.push(json!({
+            "id": "later-turn",
+            "status": "inProgress",
+            "items": []
+        }));
+    }
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    receipt["turnId"] = json!("later-turn");
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+    let pending = mcp.call_tool(
+        5,
+        "executor_wait",
+        json!({"timeoutMs": 0}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert_eq!(result(&pending)["state"], "timeout", "{pending}");
+
+    complete_turn(&sim, EXECUTOR, "later-turn", "later result");
+    let later = mcp.call_tool(
+        6,
+        "executor_wait",
+        json!({"timeoutMs": 1000}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let later = result(&later);
+    assert_eq!(later["state"], "result", "{later}");
+    assert_eq!(later["results"][0]["finalMessage"], "later result");
+    assert_ne!(later["results"][0]["resultId"], result_id);
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn a_pending_wait_is_cancelled_without_executor_effects() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+    let before = turn_requests(&server);
+
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 40,
+        "method": "tools/call",
+        "params": {
+            "name": "executor_wait",
+            "arguments": {"timeoutMs": 1_800_000},
+            "_meta": {"threadId": LEAD}
+        }
+    }));
+    std::thread::sleep(Duration::from_millis(250));
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": 40}
+    }));
+    std::thread::sleep(Duration::from_millis(250));
+    mcp.send(json!({"jsonrpc":"2.0","id":41,"method":"ping"}));
+    let reply = mcp.read();
+    assert_eq!(reply["id"], 41, "{reply}");
+    assert_eq!(reply["result"], json!({}), "{reply}");
+    assert_eq!(turn_requests(&server), before);
+    assert!(server.requests_for("turn/interrupt").is_empty());
+    assert_eq!(sim.lock().unwrap().threads[EXECUTOR].state(), "active");
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn wait_reports_idle_without_owned_runs_and_rejects_an_over_limit_bound() {
+    let home = home();
+    let mut mcp = Mcp::start(home.path());
+    let idle = mcp.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 0}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let idle = result(&idle);
+    assert_eq!(idle["state"], "idle", "{idle}");
+    let idle_bytes = serde_json::to_string(idle).unwrap();
+    println!("quiet idle response bytes={}", idle_bytes.len());
+    assert!(idle_bytes.len() <= 32, "{idle}");
+
+    let over = mcp.call_tool(
+        3,
+        "executor_wait",
+        json!({"timeoutMs": 1_800_001}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(tool_error(&over).contains("limit is 1800000"), "{over}");
     mcp.finish();
 }
 
@@ -1648,9 +2016,9 @@ fn an_older_completion_cannot_settle_newer_work_or_change_a_timeout_boundary() {
         Some(json!({"threadId": LEAD})),
     );
     let later = result(&later);
-    assert_eq!(later["state"], "completed", "{later}");
-    assert_eq!(later["result"]["finalMessage"], "the newer result");
-    assert_ne!(later["result"]["finalMessage"], "an older result");
+    assert_eq!(later["state"], "result", "{later}");
+    assert_eq!(later["results"][0]["finalMessage"], "the newer result");
+    assert_ne!(later["results"][0]["finalMessage"], "an older result");
 
     drop(run);
     mcp.finish();
@@ -2155,13 +2523,13 @@ fn above_one_mebibyte_native_record_is_reread_after_interruption_and_reconnect()
         Some(json!({"threadId": LEAD})),
     );
     let reread = result(&reread);
-    assert_eq!(reread["state"], "completed");
+    assert_eq!(reread["state"], "result");
     assert_eq!(
-        reread["result"]["finalMessageBytes"].as_u64(),
+        reread["results"][0]["finalMessageBytes"].as_u64(),
         Some(record.len() as u64)
     );
-    assert_eq!(reread["result"]["finalMessageTruncated"], true);
-    assert!(reread["result"]["finalMessage"].as_str().unwrap().len() <= 32 * 1024);
+    assert_eq!(reread["results"][0]["finalMessageTruncated"], true);
+    assert!(reread["results"][0]["finalMessage"].as_str().unwrap().len() <= 32 * 1024);
     assert_eq!(
         turn_requests(&server),
         before_reconnect,

@@ -218,16 +218,21 @@ resolved request or an established mistake; no status-only nudges, hurry demands
 or repeats without new facts. Improvement observations remain board feedback
 tasks, and durable decisions go on the bd issue.
 
-`executor_wait` is the blocking observation: name the exact run when more than
-one exists, use a timeout within its published bound, and resume that same wait
-after a short tool yield instead of polling. It returns promptly when the run
-holds a question, naming each `requestId`; answer with `executor_reply` and the
-exact request id, or use `executor_message` with `requestId` to resolve it. A
-stable timeout means the run is still working, not failed or stopped. A terminal
-wait result carries the bounded final message and exact state; it is the
-executor's report, not verified acceptance. `/agents` shows the same threads and
-does not need to be opened to receive a wait result; navigating it is not a
-lifecycle event.
+`executor_wait` is the blocking observation across the lead's eligible runs.
+Omit `run` for the ordinary default: it observes every eligible unreleased run,
+returns any run's question or current unacknowledged terminal results promptly,
+and otherwise stays pending up to 1800 seconds without model-side renewal.
+Supply `run` only to target one verified run; that read still returns its result
+after acknowledgement. Pass result ids from a received response in
+`acknowledge` on the next call: acknowledgement is retry-safe receipt only and
+does not accept, release or resolve anything, while acknowledged results stop
+waking default all-run waits. A stable timeout means work is still pending, not
+failed or stopped. A terminal wait result carries the bounded final message and
+exact state; it is the executor's report, not verified acceptance. Answer a
+question with `executor_reply` and its exact `requestId`, or use
+`executor_message` with `requestId` to resolve it. `/agents` shows the same
+threads and does not need to be opened to receive a wait result; navigating it
+is not a lifecycle event.
 
 Stop a run with `executor_stop` only for an explicit cancellation request or a
 concrete necessity such as a demonstrated wrong direction or a run that cannot

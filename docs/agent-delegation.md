@@ -348,12 +348,21 @@ no per-executor terminal tab, console host or relay in the ordinary workflow;
 opening or closing the native view is not a lifecycle event.
 
 `executor_status` reports the bounded state and pending questions for runs owned
-by the verified calling thread. `executor_wait` blocks for one exact run,
-returning immediately for an actionable question, otherwise returning the
-current terminal result, a stable timeout, or an explicit observation failure.
-It starts no model turn and needs no picker navigation. Use one pending wait and
-resume that call after a short tool yield instead of polling process ids,
-rollout files or window pixels.
+by the verified calling thread. `executor_wait` blocks across the lead's
+eligible unreleased runs by default and returns immediately for an actionable
+question, otherwise returning current unacknowledged terminal results, an idle
+state, a stable timeout, or an explicit observation failure. Supply `run` to
+target one verified run; that read still returns its result after
+acknowledgement. The default and maximum bound is 1800 seconds
+(`1800000` ms): a timeout means work is still pending, not failed or stopped,
+and needs no model-side renewal loop. Pass result ids from a received response
+in `acknowledge` on the next call; acknowledgement is retry-safe receipt only,
+does not accept work, release a slot or resolve a question, and acknowledged
+results stop waking default all-run waits. A targeted response carries `result`;
+an all-run response carries `results` and `pendingRequests` with each entry's
+`run` and `resultId` or `requestId`. It starts no model turn and needs no picker
+navigation. Use one pending wait and resume that call after a short tool yield
+instead of polling process ids, rollout files or window pixels.
 
 A completed native turn with a nonempty final assistant message is the executor
 report. A completed turn with empty or missing output is an output defect, not

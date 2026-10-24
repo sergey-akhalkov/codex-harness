@@ -2,7 +2,8 @@
   "mcpServers": {
     "executors": {
       "command": "codex-harness",
-      "args": ["mcp", "executors"]
+      "args": ["mcp", "executors"],
+      "tool_timeout_sec": 1860
     }
   }
 }

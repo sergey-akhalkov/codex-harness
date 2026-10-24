@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
@@ -49,9 +49,11 @@ const MAX_RECEIPTS: usize = 256;
 const MAX_STATUS_RUNS: usize = 8;
 const MAX_STATUS_REQUESTS: usize = 16;
 const MAX_PROGRESS_BYTES: usize = 4 * 1024;
-const DEFAULT_WAIT_MS: u64 = 30_000;
-const MAX_WAIT_MS: u64 = 55_000;
+const DEFAULT_WAIT_MS: u64 = 1_800_000;
+const MAX_WAIT_MS: u64 = 1_800_000;
 const WAIT_POLL: Duration = Duration::from_millis(100);
+const WAIT_POLL_MAX: Duration = Duration::from_secs(1);
+const MAX_RESULT_ACKS: usize = 8;
 const MAX_WAIT_MESSAGE_BYTES: usize = 32 * 1024;
 const MAX_WAIT_TURN_PAGES: usize = 64;
 
@@ -167,20 +169,27 @@ fn status_tool_definition() -> Value {
 fn wait_tool_definition() -> Value {
     json!({
         "name": WAIT_TOOL,
-        "description": "Wait up to timeoutMs for one verified lead-owned executor run. A pending question returns immediately with its exact request id. Otherwise this reads the exact native thread at a bounded interval and returns its current terminal result, a stable timeout, or an observation failure. It starts no model turn and requires no picker navigation.",
+        "description": "Wait up to timeoutMs across the calling lead's eligible unreleased runs. Omitted run observes all of them; an explicit run reads one. A pending question returns immediately with its exact request id. Otherwise this reads retained native state at a bounded interval and returns current terminal results, idle, a stable timeout, or an observation failure. Pass result ids in acknowledge only after receiving them; acknowledgement records receipt, not acceptance, release or question resolution. It starts no model turn and requires no picker navigation.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "run": {
                     "type": "string",
-                    "description": "Optional exact run id returned by executor_status. It is resolved only among the calling lead's verified runs."
+                    "description": "Optional exact run id returned by executor_status. Omit to observe every eligible run owned by the calling lead; an explicit run reads only that verified run."
                 },
                 "timeoutMs": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": MAX_WAIT_MS,
-                    "description": "Maximum wait in milliseconds. Omitted uses 30000."
+                    "default": DEFAULT_WAIT_MS,
+                    "description": "Maximum wait in milliseconds. Omitted uses and caps at 1800000."
+                },
+                "acknowledge": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": MAX_RESULT_ACKS,
+                    "description": "Result ids returned by a previous executor_wait call. Acknowledges receipt only; retry-safe and never accepts work, releases a slot or resolves a question."
                 }
             }
         }
@@ -346,6 +355,11 @@ fn tool_response(result: io::Result<Value>, operation: &Operation) -> Value {
             let is_error = value.get("error").is_some()
                 || value.get("resolutionError").is_some()
                 || value.get("cancellationError").is_some()
+                || value.get("result").is_some_and(result_is_error)
+                || value
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .is_some_and(|results| results.iter().any(result_is_error))
                 || matches!(
                     value["outcome"].as_str(),
                     Some("partial") | Some("unsupported") | Some("error")
@@ -372,6 +386,14 @@ fn tool_response(result: io::Result<Value>, operation: &Operation) -> Value {
         "structuredContent": structured,
         "isError": is_error
     })
+}
+
+fn result_is_error(result: &Value) -> bool {
+    result.get("error").is_some()
+        || matches!(
+            result["outcome"].as_str(),
+            Some("partial") | Some("unsupported") | Some("error")
+        )
 }
 
 /// A bounded owner for a caller that did not choose one. The caller's last
@@ -408,6 +430,8 @@ struct WaitArgs {
     run: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    acknowledge: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1137,6 +1161,12 @@ fn wait(operation: &Operation) -> io::Result<Value> {
             "executor_wait timeoutMs is {timeout_ms}; the limit is {MAX_WAIT_MS}. No wait was started"
         )));
     }
+    if args.acknowledge.len() > MAX_RESULT_ACKS {
+        return Err(invalid(format!(
+            "executor_wait acknowledge has {} ids; the limit is {MAX_RESULT_ACKS}. No wait was started",
+            args.acknowledge.len()
+        )));
+    }
     let total = Duration::from_millis(timeout_ms);
     let operation_budget = operation.deadline.remaining();
     if operation_budget < total.saturating_add(Duration::from_secs(1)) {
@@ -1146,28 +1176,28 @@ fn wait(operation: &Operation) -> io::Result<Value> {
         )));
     }
     let home = native_launcher::codex_home()?;
-    let mut run = match args.run.as_deref() {
-        Some(run) => lead_run_by_id(&home, &caller, run)?,
-        None => single_run(&home, &caller, RunRole::Lead)?,
+    let targeted = args.run.is_some();
+    let mut runs = match args.run.as_deref() {
+        Some(run) => vec![lead_run_for_wait(&home, &caller, run)?],
+        None => lead_runs_for_wait(&home, &caller)?,
     };
-    if run.role != RunRole::Lead {
-        return Err(invalid(
-            "executor_wait is available only to the verified lead of the exact run",
-        ));
+    if runs.is_empty() {
+        return Ok(json!({"state":"idle"}));
     }
-    if let Err(error) = ensure_cache_guard(&home, &run) {
-        eprintln!(
-            "codex-harness: cache guard for exact run {} could not start ({error}); no stop was attempted",
-            run.run
-        );
+    for run in &runs {
+        if let Err(error) = ensure_cache_guard(&home, run) {
+            eprintln!(
+                "codex-harness: cache guard for exact run {} could not start ({error}); no stop was attempted",
+                run.run
+            );
+        }
     }
     let started = Instant::now();
     let deadline = started.checked_add(total).unwrap_or(started);
-    // A read never starts unless its bound fits before the caller's deadline.
-    // The last bounded interval is returned as a timeout instead of extending
-    // the wait or being mistaken for a failed observation.
-    let read_bound = WAIT_POLL.min(total / 2).max(Duration::from_millis(1));
-    let mut conversation: Option<Conversation> = None;
+    let mut conversations = BTreeMap::new();
+    let mut pending_acks = (!args.acknowledge.is_empty()).then_some(args.acknowledge);
+    let mut acknowledged_this_call = BTreeSet::new();
+    let mut poll = WAIT_POLL;
     loop {
         if operation.cancellation.is_cancelled() {
             return Err(io::Error::new(
@@ -1175,93 +1205,363 @@ fn wait(operation: &Operation) -> io::Result<Value> {
                 "executor_wait was cancelled; no model work was started",
             ));
         }
-        run = match refresh_run(&home, &run) {
-            Ok(run) => run,
-            Err(error) => {
-                return Ok(wait_failure(
-                    &caller,
-                    &run,
-                    timeout_ms,
-                    elapsed_ms(started),
-                    error.to_string(),
-                ));
-            }
-        };
-        let (pending, pending_truncated) = pending_requests(&run);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let can_read = !remaining.is_zero() && remaining >= read_bound;
-        let mut observation = None;
-        let mut observation_error = None;
-        if can_read {
-            if conversation.is_none() {
-                match run.endpoint.as_ref() {
-                    Some(endpoint) => match Conversation::attach(endpoint, read_bound) {
-                        Ok(attached) => conversation = Some(attached),
-                        Err(error) => {
-                            observation_error = Some(format!(
-                                "the verified run endpoint could not be read: {error}"
-                            ));
-                        }
-                    },
-                    None => {
-                        observation_error = Some(format!(
-                            "the originating lead has no verified live endpoint ({})",
-                            run.endpoint_unavailable
-                                .as_deref()
-                                .unwrap_or("not recorded")
-                        ));
+        let mut refreshed = Vec::with_capacity(runs.len());
+        for run in runs.drain(..) {
+            match refresh_run_for(&home, &run, RunView::Status) {
+                Ok(current) => {
+                    if !targeted && !current.value["release"].is_null() {
+                        continue;
                     }
+                    refreshed.push(current);
                 }
-            }
-            if observation_error.is_none()
-                && let Some(conversation) = conversation.as_mut()
-            {
-                match observe_executor(conversation, &run) {
-                    Ok(result) => observation = result,
-                    Err(error) => observation_error = Some(error.to_string()),
+                Err(error) => {
+                    return Ok(wait_observation_error(&run.run, error.to_string()));
                 }
             }
         }
-        let elapsed = elapsed_ms(started);
-        if !pending.is_empty() {
-            let mut response = wait_base(&caller, &run, timeout_ms, elapsed);
-            response["state"] = Value::String("question".into());
-            response["pendingRequests"] = Value::Array(pending);
-            response["pendingRequestsTruncated"] = Value::Bool(pending_truncated);
-            if let Some(result) = observation {
-                response["result"] = result;
-            }
-            if let Some(error) = observation_error {
-                response["observationError"] = Value::String(error);
-            }
-            return Ok(response);
+        runs = refreshed;
+        if runs.is_empty() {
+            return Ok(json!({"state":"idle"}));
         }
-        if let Some(error) = observation_error {
-            return Ok(wait_failure(&caller, &run, timeout_ms, elapsed, error));
-        }
-        if let Some(result) = observation {
-            let mut response = wait_base(&caller, &run, timeout_ms, elapsed);
-            response["state"] = result["state"].clone();
-            response["outcome"] = result["outcome"].clone();
-            if let Some(error) = result.get("error") {
-                response["error"] = error.clone();
+        let mut observed = Vec::with_capacity(runs.len());
+        let mut pending = Vec::new();
+        let mut pending_truncated = false;
+        let mut in_progress = false;
+        for run in &runs {
+            let observation = match observe_wait_run(&mut conversations, run) {
+                Ok(observation) => observation,
+                Err(error) => return Ok(wait_observation_error(&run.run, error.to_string())),
+            };
+            pending_truncated |= observation.pending_truncated;
+            for mut entry in observation.pending {
+                if !targeted {
+                    entry["run"] = json!(run.run);
+                }
+                pending.push(entry);
             }
-            response["result"] = result;
-            return Ok(response);
+            in_progress |= observation.in_progress;
+            observed.push((run.run.clone(), observation.result));
+        }
+        if let Some(ids) = pending_acks.take() {
+            let terminal: Vec<(&VerifiedRun, String, String)> = observed
+                .iter()
+                .filter_map(|(run_id, result)| {
+                    let result = result.as_ref()?;
+                    let run = runs.iter().find(|run| &run.run == run_id)?;
+                    Some((
+                        run,
+                        result["resultId"].as_str()?.to_owned(),
+                        result["turnId"].as_str().unwrap_or_default().to_owned(),
+                    ))
+                })
+                .collect();
+            for id in &ids {
+                if id.is_empty() || id.len() > 256 {
+                    return Err(invalid(
+                        "executor_wait acknowledge contains an empty or oversized result id; no acknowledgement was written",
+                    ));
+                }
+                let matches = terminal
+                    .iter()
+                    .filter(|(_, current, _)| current == id)
+                    .count();
+                if matches != 1 {
+                    return Err(invalid(format!(
+                        "executor_wait acknowledge id {id:?} is not exactly one current terminal result for the calling lead; no acknowledgement was written"
+                    )));
+                }
+            }
+            for id in &ids {
+                let (run, _, turn_id) = terminal
+                    .iter()
+                    .find(|(_, current, _)| current == id)
+                    .expect("validated acknowledgement");
+                acknowledge_result(run, &caller, id, turn_id)?;
+                acknowledged_this_call.insert(id.clone());
+            }
+        }
+        let results: Vec<Value> = observed
+            .into_iter()
+            .filter_map(|(run_id, result)| {
+                let result = result?;
+                if targeted {
+                    return Some(result);
+                }
+                let run = runs.iter().find(|run| run.run == run_id)?;
+                let result_id = result["resultId"].as_str().unwrap_or_default();
+                let turn_id = result["turnId"].as_str().unwrap_or_default();
+                if acknowledged_this_call.contains(result_id)
+                    || is_acknowledged(run, result_id, turn_id)
+                {
+                    return None;
+                }
+                Some(result)
+            })
+            .collect();
+        if !pending.is_empty() || !results.is_empty() {
+            return Ok(wait_event_response(
+                targeted,
+                timeout_ms,
+                elapsed_ms(started),
+                &runs,
+                results,
+                pending,
+                pending_truncated,
+            ));
+        }
+        if !targeted && !in_progress {
+            return Ok(json!({"state":"idle"}));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(wait_timeout(&caller, &run, timeout_ms, elapsed_ms(started)));
+            return Ok(wait_timeout_response(targeted, &runs, timeout_ms));
         }
-        if remaining < read_bound {
-            std::thread::sleep(remaining);
-            return Ok(wait_timeout(&caller, &run, timeout_ms, elapsed_ms(started)));
+        std::thread::sleep(poll.min(remaining));
+        poll = (poll * 2).min(WAIT_POLL_MAX);
+    }
+}
+
+struct WaitObservation {
+    result: Option<Value>,
+    pending: Vec<Value>,
+    pending_truncated: bool,
+    in_progress: bool,
+}
+
+fn observe_wait_run(
+    conversations: &mut BTreeMap<String, Conversation>,
+    run: &VerifiedRun,
+) -> io::Result<WaitObservation> {
+    let (pending, pending_truncated) = pending_requests(run);
+    let endpoint = run.endpoint.as_ref().ok_or_else(|| {
+        invalid(format!(
+            "the originating lead has no verified live endpoint ({})",
+            run.endpoint_unavailable
+                .as_deref()
+                .unwrap_or("not recorded")
+        ))
+    })?;
+    let conversation = conversation_for(conversations, endpoint)?;
+    let result = observe_executor(conversation, run)?.map(|mut result| {
+        add_result_identity(run, &mut result);
+        result
+    });
+    Ok(WaitObservation {
+        in_progress: result.is_none(),
+        result,
+        pending,
+        pending_truncated,
+    })
+}
+
+fn conversation_for<'a>(
+    conversations: &'a mut BTreeMap<String, Conversation>,
+    endpoint: &Endpoint,
+) -> io::Result<&'a mut Conversation> {
+    let key = format!("{}:{}", endpoint.port(), endpoint.token());
+    if !conversations.contains_key(&key) {
+        conversations.insert(key.clone(), Conversation::attach(endpoint, WAIT_POLL_MAX)?);
+    }
+    Ok(conversations
+        .get_mut(&key)
+        .expect("the endpoint conversation was inserted"))
+}
+
+fn add_result_identity(run: &VerifiedRun, result: &mut Value) {
+    let result_id = result_identity(run, result);
+    result["run"] = json!(run.run);
+    result["resultId"] = json!(result_id);
+}
+
+fn result_identity(run: &VerifiedRun, result: &Value) -> String {
+    let turn = result["turnId"]
+        .as_str()
+        .filter(|turn| !turn.is_empty())
+        .unwrap_or("unknown");
+    let status = result["status"].as_str().unwrap_or("unknown");
+    let outcome = result["outcome"].as_str().unwrap_or("unknown");
+    digest_id(
+        "wait-result-",
+        &[&run.run, &run.executor_thread, turn, status, outcome],
+    )
+}
+
+fn is_acknowledged(run: &VerifiedRun, result_id: &str, turn_id: &str) -> bool {
+    run.value["waitAcknowledgements"]
+        .as_array()
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["resultId"].as_str() == Some(result_id)
+                    && entry["turnId"].as_str() == Some(turn_id)
+            })
+        })
+}
+
+fn acknowledge_result(
+    run: &VerifiedRun,
+    caller: &str,
+    result_id: &str,
+    turn_id: &str,
+) -> io::Result<()> {
+    executor_message::update_receipt_document(&run.receipt, |document| {
+        if document["run"].as_str() != Some(run.run.as_str())
+            || document["leadThreadId"].as_str() != Some(caller)
+            || document["executorThreadId"].as_str() != Some(run.executor_thread.as_str())
+            || document["slot"].as_u64() != Some(u64::from(run.slot))
+            || document["turnId"].as_str().unwrap_or_default() != turn_id
+        {
+            return Err(invalid(
+                "the MCP run receipt changed before its wait acknowledgement could be recorded; no acknowledgement was written",
+            ));
         }
-        std::thread::sleep(WAIT_POLL.min(remaining));
+        let mut acknowledgements = document["waitAcknowledgements"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !acknowledgements
+            .iter()
+            .any(|entry| entry["resultId"].as_str() == Some(result_id))
+        {
+            acknowledgements.push(json!({
+                "resultId": result_id,
+                "turnId": turn_id,
+                "acknowledgedMs": executor_message_now()
+            }));
+        }
+        if acknowledgements.len() > MAX_RESULT_ACKS {
+            acknowledgements.drain(..acknowledgements.len() - MAX_RESULT_ACKS);
+        }
+        document["waitAcknowledgements"] = Value::Array(acknowledgements);
+        Ok(())
+    })
+}
+
+fn wait_event_response(
+    targeted: bool,
+    timeout_ms: u64,
+    elapsed_ms: u64,
+    runs: &[VerifiedRun],
+    mut results: Vec<Value>,
+    mut pending: Vec<Value>,
+    pending_truncated: bool,
+) -> Value {
+    let pending_truncated = pending_truncated || pending.len() > MAX_STATUS_REQUESTS;
+    pending.truncate(MAX_STATUS_REQUESTS);
+    let state = if pending.is_empty() {
+        "result"
+    } else {
+        "question"
+    };
+    if targeted {
+        let result = if results.is_empty() {
+            Value::Null
+        } else {
+            results.remove(0)
+        };
+        json!({
+            "state": state,
+            "run": runs.first().map(|run| run.run.clone()).unwrap_or_default(),
+            "timeoutMs": timeout_ms,
+            "elapsedMs": elapsed_ms,
+            "result": result,
+            "pendingRequests": pending,
+            "pendingRequestsTruncated": pending_truncated
+        })
+    } else {
+        let results_truncated = results.len() > MAX_STATUS_RUNS;
+        results.truncate(MAX_STATUS_RUNS);
+        json!({
+            "state": state,
+            "timeoutMs": timeout_ms,
+            "elapsedMs": elapsed_ms,
+            "results": results,
+            "resultsTruncated": results_truncated,
+            "pendingRequests": pending,
+            "pendingRequestsTruncated": pending_truncated
+        })
+    }
+}
+
+fn wait_timeout_response(targeted: bool, runs: &[VerifiedRun], timeout_ms: u64) -> Value {
+    if targeted {
+        json!({
+            "state": "timeout",
+            "timeoutMs": timeout_ms,
+            "run": runs.first().map(|run| run.run.clone()).unwrap_or_default()
+        })
+    } else {
+        json!({"state":"timeout","timeoutMs":timeout_ms})
+    }
+}
+
+fn wait_observation_error(run: &str, error: String) -> Value {
+    json!({
+        "state": "observation-error",
+        "run": run,
+        "error": format!("executor observation failed: {error}"),
+        "detail": "the native thread, accepted turn or retained authority could not be read reliably; no completion, empty queue or normal timeout is claimed. Retry after the recorded run and lead endpoint are available."
+    })
+}
+
+fn lead_runs_for_wait(home: &Path, caller: &str) -> io::Result<Vec<VerifiedRun>> {
+    let receipts = read_receipts(home)?;
+    let executor_only = receipts
+        .iter()
+        .any(|receipt| receipt.value["executorThreadId"].as_str() == Some(caller));
+    let mut runs = Vec::new();
+    for receipt in receipts {
+        if receipt.value["leadThreadId"].as_str() != Some(caller)
+            || !receipt.value["release"].is_null()
+        {
+            continue;
+        }
+        runs.push(verify_run_for(home, receipt, caller, RunView::Status)?);
+    }
+    if runs.is_empty() && executor_only {
+        return Err(invalid(
+            "executor_wait is available only to the verified lead of the exact run",
+        ));
+    }
+    Ok(runs)
+}
+
+fn lead_run_for_wait(home: &Path, caller: &str, run_id: &str) -> io::Result<VerifiedRun> {
+    if !valid_run_id(run_id) {
+        return Err(invalid(format!(
+            "run {run_id:?} is malformed; refusing before any run lookup or wait"
+        )));
+    }
+    let matches: Vec<RunReceipt> = read_receipts(home)?
+        .into_iter()
+        .filter(|receipt| {
+            receipt.value["leadThreadId"].as_str() == Some(caller)
+                && receipt.value["run"].as_str() == Some(run_id)
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => Err(invalid(format!(
+            "no recorded MCP executor run {run_id:?} is owned by the calling lead; no wait was started"
+        ))),
+        [receipt] => verify_run_for(
+            home,
+            RunReceipt {
+                path: receipt.path.clone(),
+                value: receipt.value.clone(),
+            },
+            caller,
+            RunView::Status,
+        ),
+        _ => Err(invalid(format!(
+            "run {run_id:?} matches more than one recorded run for the calling lead; refusing an ambiguous target"
+        ))),
     }
 }
 
 fn refresh_run(home: &Path, previous: &VerifiedRun) -> io::Result<VerifiedRun> {
+    refresh_run_for(home, previous, RunView::Live)
+}
+
+fn refresh_run_for(home: &Path, previous: &VerifiedRun, view: RunView) -> io::Result<VerifiedRun> {
     let bytes = fs::read(&previous.receipt).map_err(|error| {
         invalid(format!(
             "the MCP run receipt {} could not be refreshed: {error}",
@@ -1274,13 +1574,14 @@ fn refresh_run(home: &Path, previous: &VerifiedRun) -> io::Result<VerifiedRun> {
             previous.receipt.display()
         ))
     })?;
-    verify_run(
+    verify_run_for(
         home,
         RunReceipt {
             path: previous.receipt.clone(),
             value,
         },
         &previous.lead_thread,
+        view,
     )
 }
 
@@ -1502,43 +1803,6 @@ fn bounded_wait_text(text: &str) -> (String, bool, usize) {
         end -= 1;
     }
     (text[..end].to_owned(), true, bytes)
-}
-
-fn wait_base(caller: &str, run: &VerifiedRun, timeout_ms: u64, elapsed_ms: u64) -> Value {
-    json!({
-        "callerThreadId": caller,
-        "role": "lead",
-        "run": run_summary(run),
-        "state": Value::Null,
-        "result": Value::Null,
-        "pendingRequests": [],
-        "pendingRequestsTruncated": false,
-        "timeoutMs": timeout_ms,
-        "elapsedMs": elapsed_ms
-    })
-}
-
-fn wait_timeout(caller: &str, run: &VerifiedRun, timeout_ms: u64, elapsed_ms: u64) -> Value {
-    let mut response = wait_base(caller, run, timeout_ms, elapsed_ms);
-    response["state"] = Value::String("timeout".into());
-    response["detail"] = Value::String(
-        "no pending question or terminal result was observed before the caller's deadline; the executor was not stopped or replayed"
-            .into(),
-    );
-    response
-}
-
-fn wait_failure(
-    caller: &str,
-    run: &VerifiedRun,
-    timeout_ms: u64,
-    elapsed_ms: u64,
-    error: String,
-) -> Value {
-    let mut response = wait_base(caller, run, timeout_ms, elapsed_ms);
-    response["state"] = Value::String("observation-error".into());
-    response["error"] = Value::String(format!("executor observation failed: {error}"));
-    response
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

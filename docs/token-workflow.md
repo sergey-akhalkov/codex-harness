@@ -140,10 +140,12 @@ Orchestrated work applies the same accounting instead of a second budget:
   inspected in `/agents`; `executor_resume` is an explicit exact or fresh
   continuation. Neither leaves a separate terminal conversation to re-read or
   replays uncertain external effects.
-- Waiting uses one pending `executor_wait` instead of model-side polling, and
-  lane worktrees are reset and reused after an accepted merge so the next task
-  starts from a warm build cache. Both save wall-clock and spend rather than
-  tokens inside a turn.
+- Waiting uses one pending `executor_wait` across eligible owned runs for up to
+  1800 seconds instead of model-side polling or repeated short renewals; pass
+  received result ids back in `acknowledge` so acknowledged results stop waking
+  default all-run waits. Lane worktrees are reset and reused after an accepted
+  merge so the next task starts from a warm build cache. Both save wall-clock
+  and spend rather than tokens inside a turn.
 - Pacing lowers new-work concurrency, the triage batch size and the reasoning
   effort ceiling when fresh scoped observations show pressure, and leaves a
   healthy executor untouched. Unknown telemetry is neither zero nor unlimited,
