@@ -996,6 +996,22 @@ pub fn endpoint_process_live(process: &EndpointProcess) -> bool {
     )
 }
 
+/// Whether the exact process identity in a prior endpoint record has ended.
+/// This is used only to decide whether another endpoint may adopt the same
+/// lead thread; it does not authorize connecting to or terminating a process.
+pub fn endpoint_process_ended(process: &EndpointProcess) -> io::Result<bool> {
+    if process.pid == 0 || process.creation_time == 0 {
+        return Err(io::Error::other(
+            "the recorded endpoint process has no usable identity",
+        ));
+    }
+    harness_core::process_service::ServiceProcess::identity_live(ProcessIdentity {
+        pid: process.pid,
+        creation_time: process.creation_time,
+    })
+    .map(|live| !live)
+}
+
 /// Publishes one managed lead session's verified endpoint under its exact
 /// thread id, replacing an earlier record of that thread in one step. Refusing
 /// a thread without an identity keeps an unaddressable record out of the

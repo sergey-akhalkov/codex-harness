@@ -356,6 +356,16 @@ thread is visible in `/agents` with its title, conversation and state. There is
 no per-executor terminal tab, console host or relay in the ordinary workflow;
 opening or closing the native view is not a lifecycle event.
 
+Resuming the same lead thread on a new app-server does not create a new run.
+On the next authorized MCP operation, an ended recorded app-server process is
+reconciled with the live registered endpoint only when that endpoint still
+names the same lead thread. The receipt's process identity is updated under its
+own lock and retains a bounded `appServerRebind` record; the run, executor
+thread, slot, checkout, base and profile stay unchanged. If the old process is
+still live or its end cannot be proved, the operation fails before native work
+because two runtimes must not control one run. Do not edit the receipt by hand
+to bypass this refusal.
+
 `executor_status` reports the bounded state and pending questions for runs owned
 by the verified calling thread. `executor_wait` blocks across the lead's
 eligible unreleased runs by default and returns immediately for an actionable

@@ -32,6 +32,15 @@ struct Mcp {
     root: tempfile::TempDir,
 }
 
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl Mcp {
     fn start(home: &Path) -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -1297,6 +1306,120 @@ fn status_is_bounded_to_the_verified_calling_thread_and_rejects_forged_arguments
     drop(run);
     drop(second_run);
     drop(ambiguous);
+    mcp.finish();
+}
+
+#[test]
+fn status_rebinds_an_ended_app_server_for_the_same_lead_thread() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+
+    let endpoint_path = home
+        .path()
+        .join("harness/lead-endpoints")
+        .join(format!("{LEAD}.json"));
+    let endpoint: Value = serde_json::from_slice(&fs::read(&endpoint_path).unwrap()).unwrap();
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    let previous = json!({
+        "pid": 1,
+        "creationTime": 1,
+        "program": endpoint["process"]["program"]
+    });
+    receipt["lease"]["appServer"] = previous.clone();
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+    let mut mcp = Mcp::start(home.path());
+    let status = mcp.call_tool(
+        2,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let status = result(&status);
+    assert_eq!(status["role"], "lead");
+    assert_eq!(status["runs"][0]["run"], receipt["run"]);
+    assert_eq!(status["runs"][0]["executorThreadId"], EXECUTOR);
+    assert_eq!(status["runs"][0]["slot"], receipt["slot"]);
+
+    let rebound: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    assert_eq!(rebound["lease"]["appServer"], endpoint["process"]);
+    assert_eq!(rebound["appServerRebind"]["from"], previous);
+    assert_eq!(rebound["appServerRebind"]["to"], endpoint["process"]);
+    for field in [
+        "run",
+        "leadThreadId",
+        "executorThreadId",
+        "slot",
+        "checkout",
+        "base",
+        "profile",
+    ] {
+        assert_eq!(rebound[field], receipt[field], "{field} changed");
+    }
+    assert!(server.requests_for("turn/start").is_empty());
+    assert!(server.requests_for("turn/steer").is_empty());
+
+    drop(run);
+    mcp.finish();
+}
+
+#[test]
+fn status_refuses_a_live_previous_app_server_before_native_effects() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+
+    let program = PathBuf::from(r"C:\Windows\System32\ping.exe");
+    let previous = ChildGuard(
+        Command::new(&program)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let identity = ServiceProcess::observe(
+        previous.0.id(),
+        &program,
+        0,
+        &harness_core::process_service::current_user().unwrap(),
+    )
+    .unwrap()
+    .identity();
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    receipt["lease"]["appServer"] = json!({
+        "pid": identity.pid,
+        "creationTime": identity.creation_time,
+        "program": program
+    });
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let before = fs::read(&run.receipt).unwrap();
+
+    let mut mcp = Mcp::start(home.path());
+    let refused = mcp.call_tool(
+        2,
+        "executor_status",
+        json!({}),
+        Some(json!({"threadId": LEAD})),
+    );
+    assert!(
+        tool_error(&refused).contains("is still live but differs"),
+        "{refused}"
+    );
+    assert_eq!(fs::read(&run.receipt).unwrap(), before);
+    assert_eq!(server.connections(), 0);
+    assert!(server.requests().is_empty());
+
+    drop(run);
     mcp.finish();
 }
 
@@ -2756,12 +2879,7 @@ fn two_questions_correlate_and_stale_or_sibling_identities_fail_before_send() {
     assert_eq!(server.requests_for("turn/steer").len(), before_sibling);
 
     let mut receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
-    receipt["lease"]["appServer"]["creationTime"] = json!(
-        receipt["lease"]["appServer"]["creationTime"]
-            .as_u64()
-            .unwrap()
-            + 1
-    );
+    receipt["lease"]["appServer"]["pid"] = json!(0);
     fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     let stale = mcp.call_tool(
         12,
@@ -2770,7 +2888,7 @@ fn two_questions_correlate_and_stale_or_sibling_identities_fail_before_send() {
         Some(json!({"threadId": LEAD})),
     );
     assert!(
-        tool_error(&stale).contains("no longer matches the exact run lease"),
+        tool_error(&stale).contains("could not be proved ended"),
         "{stale}"
     );
     assert_eq!(server.requests_for("turn/steer").len(), before_sibling);

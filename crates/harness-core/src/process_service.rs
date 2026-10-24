@@ -593,6 +593,20 @@ impl ServiceProcess {
         Self::inspect_with(identity, program, expected_user, true)
     }
 
+    /// Reports whether the exact pid and creation time still identify a live
+    /// process. This observes identity only and grants no image, account,
+    /// endpoint or termination authority.
+    pub fn identity_live(identity: ProcessIdentity) -> io::Result<bool> {
+        let process = match Self::open(identity.pid) {
+            Ok(process) => process,
+            Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(process.identity == identity && process.is_running()?)
+    }
+
     fn inspect_with(
         identity: ProcessIdentity,
         program: &Path,
@@ -1334,7 +1348,7 @@ impl ServiceGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::nested_cpu_percent;
+    use super::{ProcessIdentity, ServiceProcess, current_user, nested_cpu_percent};
 
     #[test]
     fn nested_cpu_percent_preserves_host_relative_meaning() {
@@ -1350,5 +1364,28 @@ mod tests {
         assert_eq!(nested_cpu_percent(None, 7500), None);
         assert_eq!(nested_cpu_percent(Some(f64::NAN), 7500), None);
         assert_eq!(nested_cpu_percent(Some(0.0), 7500), None);
+    }
+
+    #[test]
+    fn exact_identity_liveness_rejects_reused_or_invalid_identity() {
+        let program = std::env::current_exe().unwrap();
+        let process =
+            ServiceProcess::observe(std::process::id(), &program, 0, &current_user().unwrap())
+                .unwrap();
+        let identity = process.identity();
+        assert!(ServiceProcess::identity_live(identity).unwrap());
+
+        let reused = ProcessIdentity {
+            creation_time: identity.creation_time.wrapping_add(1),
+            ..identity
+        };
+        assert!(!ServiceProcess::identity_live(reused).unwrap());
+        assert!(
+            !ServiceProcess::identity_live(ProcessIdentity {
+                pid: u32::MAX,
+                creation_time: identity.creation_time,
+            })
+            .unwrap()
+        );
     }
 }

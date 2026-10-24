@@ -889,6 +889,7 @@ fn verify_run_for(
     caller: &str,
     view: RunView,
 ) -> io::Result<VerifiedRun> {
+    let mut receipt = receipt;
     let value = &receipt.value;
     if value["schema"].as_u64() != Some(1) {
         return Err(invalid(format!(
@@ -999,19 +1000,6 @@ fn verify_run_for(
             record.path.display()
         )));
     }
-    let (endpoint, endpoint_unavailable) = match control::registered_lead(home, &lead_thread) {
-        RegisteredLead::Live(endpoint) => {
-            if endpoint.thread_id.as_deref() != Some(lead_thread.as_str())
-                || endpoint.process.as_ref() != Some(&lease.app_server)
-            {
-                return Err(invalid(
-                    "the registered lead endpoint no longer matches the exact run lease; the run was replaced, resumed elsewhere or is stale, and no operation was performed",
-                ));
-            }
-            (Some(*endpoint), None)
-        }
-        RegisteredLead::Unavailable(reason) => (None, Some(reason)),
-    };
     let identity = if value["profile"].is_null() {
         None
     } else {
@@ -1022,6 +1010,66 @@ fn verify_run_for(
                 ))
             })?,
         )
+    };
+    let (endpoint, endpoint_unavailable) = match control::registered_lead(home, &lead_thread) {
+        RegisteredLead::Live(endpoint) => {
+            if endpoint.thread_id.as_deref() != Some(lead_thread.as_str()) {
+                return Err(invalid(
+                    "the registered lead endpoint belongs to another conversation; no operation was performed",
+                ));
+            }
+            let current_process = endpoint.process.clone().ok_or_else(|| {
+                invalid(
+                    "the registered lead endpoint records no app-server process; no operation was performed",
+                )
+            })?;
+            if endpoint.process.as_ref() != Some(&lease.app_server) {
+                let same_process = current_process.pid == lease.app_server.pid
+                    && current_process.creation_time == lease.app_server.creation_time;
+                if !same_process {
+                    match control::endpoint_process_ended(&lease.app_server) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(invalid(format!(
+                                "the recorded app-server process for run {run} is still live but differs from the registered endpoint; refusing to reattach one run to two runtimes and no operation was performed"
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(invalid(format!(
+                                "the recorded app-server process for run {run} could not be proved ended ({error}); the lease was not changed and no operation was performed"
+                            )));
+                        }
+                    }
+                }
+                receipt.value = reconcile_app_server_lease(
+                    &receipt.path,
+                    &run,
+                    &lead_thread,
+                    &executor_thread,
+                    slot,
+                    &checkout,
+                    &lease.app_server,
+                    &current_process,
+                )?;
+                match control::registered_lead(home, &lead_thread) {
+                    RegisteredLead::Live(after)
+                        if after.thread_id.as_deref() == Some(lead_thread.as_str())
+                            && after.process.as_ref() == Some(&current_process) => {}
+                    RegisteredLead::Live(_) => {
+                        return Err(invalid(
+                            "the registered lead endpoint changed while reconciling the app-server lease; the receipt was updated for the verified process, but this operation did not contact a native thread. Retry from the current lead endpoint",
+                        ));
+                    }
+                    RegisteredLead::Unavailable(reason) => {
+                        return Err(invalid(format!(
+                            "the registered lead endpoint became unavailable while reconciling the app-server lease ({reason}); this operation did not contact a native thread. Retry after the current lead endpoint is available"
+                        )));
+                    }
+                }
+            }
+            (Some(*endpoint), None)
+        }
+        RegisteredLead::Unavailable(reason) => (None, Some(reason)),
     };
     Ok(VerifiedRun {
         receipt: receipt.path,
@@ -1039,6 +1087,56 @@ fn verify_run_for(
         identity,
         endpoint,
         endpoint_unavailable,
+    })
+}
+
+fn reconcile_app_server_lease(
+    receipt: &Path,
+    run: &str,
+    lead_thread: &str,
+    executor_thread: &str,
+    slot: u32,
+    checkout: &Path,
+    previous: &EndpointProcess,
+    current: &EndpointProcess,
+) -> io::Result<Value> {
+    executor_message::update_receipt_document(receipt, |document| {
+        if document["schema"].as_u64() != Some(1)
+            || document["run"].as_str() != Some(run)
+            || document["leadThreadId"].as_str() != Some(lead_thread)
+            || document["executorThreadId"].as_str() != Some(executor_thread)
+            || document["slot"].as_u64() != Some(u64::from(slot))
+        {
+            return Err(invalid(
+                "the MCP run receipt changed identity while reconciling its app-server lease; no lease was updated",
+            ));
+        }
+        let lease: Lease = serde_json::from_value(document["lease"].clone()).map_err(|error| {
+            invalid(format!(
+                "the MCP run receipt has no exact lease during reconciliation: {error}"
+            ))
+        })?;
+        if lease.owner != run || lease.slot != slot || !same_path(&lease.checkout, checkout) {
+            return Err(invalid(
+                "the MCP run lease changed while reconciling its app-server process; no lease was updated",
+            ));
+        }
+        if &lease.app_server == current {
+            return Ok(document.clone());
+        }
+        if &lease.app_server != previous {
+            return Err(invalid(
+                "the MCP run lease changed concurrently; no app-server process was adopted",
+            ));
+        }
+        document["lease"]["appServer"] = serde_json::to_value(current)
+            .map_err(|error| io::Error::other(format!("new app-server identity: {error}")))?;
+        document["appServerRebind"] = json!({
+            "schema": 1,
+            "from": previous,
+            "to": current
+        });
+        Ok(document.clone())
     })
 }
 
