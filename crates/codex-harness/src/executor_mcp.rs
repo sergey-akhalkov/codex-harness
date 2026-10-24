@@ -670,6 +670,12 @@ fn active_requests(home: &Path) -> io::Result<Vec<ActiveRequest>> {
         if !receipt.value["release"].is_null() {
             continue;
         }
+        // Legacy root/Executor receipts keep their pool slot but are not
+        // children of the new Director hierarchy; counting them would let old
+        // acceptance runs permanently consume the new parent allowances.
+        if receipt.value["parentThreadId"].is_null() && receipt.value["requestId"].is_null() {
+            continue;
+        }
         let parent = receipt.value["parentThreadId"]
             .as_str()
             .or_else(|| receipt.value["leadThreadId"].as_str());
