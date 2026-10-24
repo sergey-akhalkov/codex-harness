@@ -558,7 +558,11 @@ impl ServiceProcess {
                 "service process identity mismatch; preserving process",
             ));
         }
-        process.validate(program, expected_user)?;
+        // current_exe() can name the launcher symlink used at launch. After a
+        // deploy retargets that symlink, a long-lived process still runs the
+        // previous verified build; accept the same sibling-build alias rule
+        // used for recorded endpoints.
+        process.validate_endpoint(program, expected_user)?;
         if !process.is_running()? {
             return Err(io::Error::other(
                 "service exited before identity validation",
