@@ -3438,6 +3438,57 @@ fn wait_times_out_without_model_work_and_refuses_an_executor_caller() {
 }
 
 #[test]
+fn wait_does_not_repeat_a_reply_that_was_already_delivered() {
+    let home = home();
+    let server = Server::start(Bearer::Value(TOKEN.to_owned()));
+    let run = synthetic_run(home.path(), LEAD, EXECUTOR, &server);
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&run.receipt).unwrap()).unwrap();
+    receipt["leadMessages"] = json!([{
+        "schema": 1,
+        "id": "answered-request",
+        "kind": "reply-request",
+        "status": "delivered",
+        "contentId": "answered"
+    }]);
+    receipt["messages"] = json!([{
+        "schema": 1,
+        "id": "reply-attempt",
+        "replyTo": "answered-request",
+        "status": "queued"
+    }]);
+    fs::write(&run.receipt, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let sim = Arc::new(Mutex::new(NativeSim::new(
+        LEAD,
+        EXECUTOR,
+        run._checkout.path(),
+        false,
+        false,
+    )));
+    seed_active_turn(&sim, EXECUTOR, "initial-turn");
+    complete_turn(&sim, EXECUTOR, "initial-turn", "completed after the reply");
+    server.answer_fn(native_responder(Arc::clone(&sim)));
+    let mut mcp = Mcp::start(home.path());
+
+    let waited = mcp.call_tool(
+        2,
+        "executor_wait",
+        json!({"timeoutMs": 200}),
+        Some(json!({"threadId": LEAD})),
+    );
+    let waited = result(&waited);
+    assert_ne!(waited["state"], "question", "{waited}");
+    assert!(
+        waited["pendingRequests"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{waited}"
+    );
+
+    mcp.finish();
+    drop(run);
+}
+
+#[test]
 fn wait_returns_the_exact_current_final_message_and_keeps_a_native_locator() {
     let home = home();
     let server = Server::start(Bearer::Value(TOKEN.to_owned()));

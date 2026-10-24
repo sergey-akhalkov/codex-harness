@@ -2537,6 +2537,25 @@ fn pending_requests(run: &VerifiedRun) -> (Vec<Value>, bool) {
     (pending, truncated)
 }
 
+fn actionable_requests(run: &VerifiedRun) -> (Vec<Value>, bool) {
+    let (pending, truncated) = pending_requests(run);
+    let answered: BTreeSet<&str> = run.value["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message["replyTo"].as_str())
+        .collect();
+    let actionable = pending
+        .into_iter()
+        .filter(|request| {
+            request["requestId"]
+                .as_str()
+                .is_none_or(|id| !answered.contains(id))
+        })
+        .collect();
+    (actionable, truncated)
+}
+
 fn wait(operation: &Operation) -> io::Result<Value> {
     let caller = caller_thread(&operation.metadata)?;
     let args: WaitArgs = serde_json::from_value(operation.arguments.clone())
@@ -2718,7 +2737,7 @@ fn observe_wait_run(
     conversations: &mut BTreeMap<String, Conversation>,
     run: &VerifiedRun,
 ) -> io::Result<WaitObservation> {
-    let (pending, pending_truncated) = pending_requests(run);
+    let (pending, pending_truncated) = actionable_requests(run);
     let endpoint = run.endpoint.as_ref().ok_or_else(|| {
         invalid(format!(
             "the originating lead has no verified live endpoint ({})",
